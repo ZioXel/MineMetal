@@ -65,6 +65,7 @@ public final class MetalRenderPass implements RenderPassBackend {
     private final long[] vertexBuffers = new long[MAX_VERTEX_SLOTS];
     private final long[] vertexOffsets = new long[MAX_VERTEX_SLOTS];
     private final @Nullable MetalGpuBuffer[] vertexBufferObjects = new MetalGpuBuffer[MAX_VERTEX_SLOTS];
+    private final long[] vertexLengths = new long[MAX_VERTEX_SLOTS];
     private static final String DEBUG_VERTICES = System.getProperty("minemetal.debugVertices", "");
     private static int debugVertexDumps;
     private long indexBuffer;
@@ -217,6 +218,7 @@ public final class MetalRenderPass implements RenderPassBackend {
                 this.vertexBuffers[slot] = buffer.handle();
                 this.vertexOffsets[slot] = vertexBuffer.offset();
                 this.vertexBufferObjects[slot] = buffer;
+                this.vertexLengths[slot] = vertexBuffer.length();
             }
             Native.passSetVertexBuffer(this.ctx, buffer.handle(), vertexBuffer.offset(), MetalRenderPipeline.VERTEX_BUFFER_BASE - slot);
         }
@@ -358,7 +360,7 @@ public final class MetalRenderPass implements RenderPassBackend {
             MetalGpuBuffer vb = this.vertexBufferObjects[0];
             StringBuilder sb = new StringBuilder();
             sb.append(this.override).append(": indexCount ").append(indexCount).append(" firstIndex ").append(firstIndex).append(" baseVertex ")
-                .append(vertexOffset).append(" vbOffset ").append(this.vertexOffsets[0]).append(" indexInt ").append(this.indexInt);
+                .append(vertexOffset).append(" vbOffset ").append(this.vertexOffsets[0]).append(" vbLength ").append(this.vertexLengths[0]).append(" indexInt ").append(this.indexInt);
             if (vb != null) {
                 long base = vb.contents() + this.vertexOffsets[0];
                 for (int stride : new int[]{36, 56}) {
