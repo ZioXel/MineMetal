@@ -1408,15 +1408,19 @@ MM_EXPORT void mm_surface_blit(void *p, void *surfacePtr, void *srcView, int cop
                 double ready = now + gpu + MM_GPU_MARGIN;
                 double k = ceil((ready - lp) / iv);
                 double target = lp + MAX(k, 1.0) * iv;
-                if (fabs(target - s->lastTargetVsync) < iv * 0.5) {
-                    present = NO;            // a frame is already queued for that refresh
-                } else if (ready + s->avgFrameTime < target - 0.001) {
-                    present = NO;            // the next frame will still make it and is newer
+                // One frame per refresh: if the previous frame already took this refresh, aim for the next one
+                // instead of dropping this frame (at low frame rates every frame must reach the screen).
+                if (target < s->lastTargetVsync + iv * 0.5) {
+                    target = s->lastTargetVsync + iv;
+                }
+                if (ready + s->avgFrameTime < target - 0.001) {
+                    present = NO;            // the next frame will still make that refresh and is newer
                 } else {
                     s->lastTargetVsync = target;
                 }
             }
-            if (present && atomic_load(&s->drawablesInFlight) >= (int)s.layer.maximumDrawableCount - 1) {
+            // Only drop for lack of drawables when all of them are queued (nextDrawable would block).
+            if (present && atomic_load(&s->drawablesInFlight) >= (int)s.layer.maximumDrawableCount) {
                 present = NO;
             }
             if (present) {
