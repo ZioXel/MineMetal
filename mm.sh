@@ -17,7 +17,7 @@ case "$cmd" in
     # Full shader-pack-on-Metal cycle: build MineMetal, build + install the MineMetal-Iris fork, run with -PirisMetal.
     # Also undoes Minecraft's "forced OpenGL after a crash" setting so the run really uses Metal.
     ./gradlew --no-configuration-cache copyReferenceLibs build 2>&1 | tee .reference/build.log || { echo "MineMetal BUILD FAILED"; exit 1; }
-    (cd ../MineMetal-Iris && ./metal.sh build) || { echo "Iris fork BUILD FAILED (log: .reference/iris-build.log)"; exit 1; }
+    (cd ../MineMetal-Iris && bash ./metal.sh build) || { echo "Iris fork BUILD FAILED (log: .reference/iris-build.log)"; exit 1; }
     [ -f run/options.txt ] && sed -i '' 's/^preferredGraphicsBackend:"opengl"/preferredGraphicsBackend:"default"/' run/options.txt
     mkdir -p .reference/logs
     stamp=$(date +%Y%m%d-%H%M%S)
