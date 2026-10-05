@@ -181,6 +181,9 @@ public final class MetalCommandEncoder implements CommandEncoderBackend {
                 viewHandles[i] = views.get(i);
             }
             this.currentRenderPass = new MetalRenderPass(this.device, area, width, height, viewHandles, depthView);
+            if (FrameTrace.active()) {
+                FrameTrace.event("pass '" + descriptor.label().get() + "' views " + java.util.Arrays.toString(viewHandles) + " depth " + depthView + " clear " + clearMask);
+            }
             return this.currentRenderPass;
         }
     }
@@ -199,6 +202,7 @@ public final class MetalCommandEncoder implements CommandEncoderBackend {
 
     @Override
     public void clearColorTexture(final GpuTexture colorTexture, final Vector4fc clearColor) {
+        FrameTrace.event("clearColorTexture " + colorTexture.getLabel());
         Native.clearColorTexture(this.ctx(), ((MetalTexture) colorTexture).handle(), clearColor.x(), clearColor.y(), clearColor.z(), clearColor.w());
     }
 
@@ -220,6 +224,7 @@ public final class MetalCommandEncoder implements CommandEncoderBackend {
 
     @Override
     public void clearDepthTexture(final GpuTexture depthTexture, final double clearDepth) {
+        FrameTrace.event("clearDepthTexture " + depthTexture.getLabel());
         Native.clearDepthTexture(this.ctx(), ((MetalTexture) depthTexture).handle(), clearDepthValue(clearDepth, standardDepth.getAsBoolean()));
     }
 

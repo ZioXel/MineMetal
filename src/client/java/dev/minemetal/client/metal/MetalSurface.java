@@ -89,6 +89,7 @@ public final class MetalSurface implements GpuSurfaceBackend {
 
     @Override
     public void present() {
+        FrameTrace.framePresented();
         // Presentation was scheduled on the command buffer in blitFromTexture ([MTLCommandBuffer presentDrawable:]),
         // so it happens when the frame's submit completes on the GPU.
         if (this.acquired) {

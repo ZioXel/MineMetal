@@ -787,6 +787,7 @@ public final class MetalGL {
     // =================================================================================================================
 
     public static void glClear(final int mask) {
+        dev.minemetal.client.metal.FrameTrace.event("glClear fb " + drawFramebuffer + " mask " + Integer.toHexString(mask));
         GlFramebufferObject fb = FRAMEBUFFERS.get(drawFramebuffer);
         if (fb == null) {
             return;
@@ -957,6 +958,10 @@ public final class MetalGL {
     }
 
     private static void draw(final int indexCount, final boolean indexed) {
+        if (dev.minemetal.client.metal.FrameTrace.active()) {
+            GlProgramObject tp = current();
+            dev.minemetal.client.metal.FrameTrace.event("glDraw " + (tp != null ? tp.debugName + "#" + tp.id : "none") + " fb " + drawFramebuffer);
+        }
         GlProgramObject program = current();
         GlFramebufferObject fb = FRAMEBUFFERS.get(drawFramebuffer);
         if (program == null || !program.linked || program.compiled == null || fb == null) {

@@ -281,6 +281,7 @@ public final class MetalRenderPass implements RenderPassBackend {
                 return false;
             }
             int n = ++c[0];
+            FrameTrace.event("draw " + ov + " -> " + target.colorViews().length + " views " + java.util.Arrays.toString(target.colorViews()));
             if (n == 1 || n == 10 || n == 100 || n == 1000 || n == 10000 || n == 100000) {
                 LOGGER.info("override draws: {} x{} (no target x{}), pass area {},{} {}x{}, output {}x{}, target views {}{}", ov, n, c[1], this.renderArea.x(),
                     this.renderArea.y(), this.renderArea.width(), this.renderArea.height(), this.outputWidth, this.outputHeight, target.colorViews().length,
