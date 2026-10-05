@@ -431,6 +431,11 @@ public final class GlOverridePipeline implements MetalRenderPass.OverridePipelin
     }
 
     @Override
+    public String toString() {
+        return this.name;
+    }
+
+    @Override
     public boolean isClosed() {
         return this.closed;
     }

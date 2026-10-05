@@ -64,6 +64,9 @@ public final class MetalRenderPass implements RenderPassBackend {
     private long activeDepthView;
     private final long[] vertexBuffers = new long[MAX_VERTEX_SLOTS];
     private final long[] vertexOffsets = new long[MAX_VERTEX_SLOTS];
+    private final @Nullable MetalGpuBuffer[] vertexBufferObjects = new MetalGpuBuffer[MAX_VERTEX_SLOTS];
+    private static final String DEBUG_VERTICES = System.getProperty("minemetal.debugVertices", "");
+    private static int debugVertexDumps;
     private long indexBuffer;
     private boolean indexInt;
     private boolean scissorEnabled;
@@ -213,6 +216,7 @@ public final class MetalRenderPass implements RenderPassBackend {
             if (slot < MAX_VERTEX_SLOTS) {
                 this.vertexBuffers[slot] = buffer.handle();
                 this.vertexOffsets[slot] = vertexBuffer.offset();
+                this.vertexBufferObjects[slot] = buffer;
             }
             Native.passSetVertexBuffer(this.ctx, buffer.handle(), vertexBuffer.offset(), MetalRenderPipeline.VERTEX_BUFFER_BASE - slot);
         }
@@ -349,6 +353,25 @@ public final class MetalRenderPass implements RenderPassBackend {
 
     @Override
     public void drawIndexed(final int indexCount, final int instanceCount, final int firstIndex, final int vertexOffset, final int firstInstance) {
+        if (this.override != null && !DEBUG_VERTICES.isEmpty() && debugVertexDumps < 6 && this.override.toString().contains(DEBUG_VERTICES)) {
+            debugVertexDumps++;
+            MetalGpuBuffer vb = this.vertexBufferObjects[0];
+            StringBuilder sb = new StringBuilder();
+            sb.append(this.override).append(": indexCount ").append(indexCount).append(" firstIndex ").append(firstIndex).append(" baseVertex ")
+                .append(vertexOffset).append(" vbOffset ").append(this.vertexOffsets[0]).append(" indexInt ").append(this.indexInt);
+            if (vb != null) {
+                long base = vb.contents() + this.vertexOffsets[0];
+                for (int stride : new int[]{36, 56}) {
+                    sb.append("\n  stride ").append(stride).append(':');
+                    for (int v = 0; v < 3; v++) {
+                        long at = base + (long) (vertexOffset + v) * stride;
+                        sb.append(" (").append(MemoryUtil.memGetFloat(at)).append(", ").append(MemoryUtil.memGetFloat(at + 4)).append(", ")
+                            .append(MemoryUtil.memGetFloat(at + 8)).append(')');
+                    }
+                }
+            }
+            LOGGER.info("debugVertices {}", sb);
+        }
         if (indexCount > 0 && instanceCount > 0 && this.prepareDraw()) {
             Native.passDrawIndexed(this.ctx, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
         }
