@@ -326,6 +326,13 @@ public final class GlOverridePipeline implements MetalRenderPass.OverridePipelin
             raster.put(5, (int) MetalEnums.compare(hasDepth && depth != null ? depth.depthTest()
                 : com.mojang.renderpearl.api.pipeline.CompareOp.ALWAYS_PASS));
             raster.put(6, hasDepth && depth != null && depth.writeDepth() ? 1 : 0);
+            String noDepth = System.getProperty("minemetal.debugNoDepth");
+            if (noDepth != null && !noDepth.isEmpty() && this.name.contains(noDepth)) {
+                // debugging aid: draw matching override pipelines without depth test/write
+                raster.put(5, (int) MetalEnums.compare(com.mojang.renderpearl.api.pipeline.CompareOp.ALWAYS_PASS));
+                raster.put(6, 0);
+                LOGGER.info("override {}: depth test disabled (minemetal.debugNoDepth)", this.name);
+            }
             FloatBuffer bias = stack.callocFloat(2);
             if (depth != null) {
                 bias.put(0, depth.depthBiasConstant());
