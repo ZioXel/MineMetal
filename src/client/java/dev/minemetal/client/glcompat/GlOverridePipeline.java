@@ -122,6 +122,7 @@ public final class GlOverridePipeline implements MetalRenderPass.OverridePipelin
         bindDefaultAttributes(ctx);
         MetalGL.bindLooseUniforms(p);
         long usedUnits = 0L;
+        int boundThisDraw = 0;
         for (int i = 0; i < descriptions.size(); i++) {
             Object value = values != null && i < values.length ? values[i] : null;
             if (value == null) {
@@ -136,6 +137,11 @@ public final class GlOverridePipeline implements MetalRenderPass.OverridePipelin
                     }
                     GpuBufferSlice slice = (GpuBufferSlice) value;
                     long handle = ((MetalGpuBuffer) slice.buffer()).handle();
+                    if (binding < GL_UBO_BINDINGS) {
+                        boundUbo[binding] = handle;
+                        boundUboOffset[binding] = slice.offset();
+                        boundThisDraw |= 1 << binding;
+                    }
                     for (int stage = 0; stage < 2; stage++) {
                         int index = p.bufferIndexForBinding(stage, binding);
                         if (index >= 0) {
@@ -171,6 +177,25 @@ public final class GlOverridePipeline implements MetalRenderPass.OverridePipelin
                             usedUnits |= 1L << unit;
                         }
                     }
+                }
+            }
+        }
+        // GL keeps uniform buffer bindings until rebound: a block this pipeline doesn't supply (e.g. Globals for
+        // entities) reads whatever was last bound to its binding point. Metal needs every buffer bound, so do the
+        // same, falling back to zeros for binding points never bound.
+        int pushBinding = pushConstants != null && pushConstants.remaining() > 0 ? this.hooks.pushConstantBinding() : -1;
+        for (int stage = 0; stage < 2; stage++) {
+            GlProgramCompiler.StageResult s = stage == 0 ? p.compiled.vertex() : p.compiled.fragment();
+            for (var e : s.extraBlocks.entrySet()) {
+                int blockIndex = p.blockNames.indexOf(e.getKey());
+                int binding = blockIndex >= 0 ? p.blockBindings[blockIndex] : -1;
+                if (binding >= 0 && (binding == pushBinding || (binding < GL_UBO_BINDINGS && (boundThisDraw & (1 << binding)) != 0))) {
+                    continue;
+                }
+                if (binding >= 0 && binding < GL_UBO_BINDINGS && boundUbo[binding] != 0L) {
+                    Native.passSetBuffer(ctx, 1 << stage, boundUbo[binding], boundUboOffset[binding], e.getValue());
+                } else {
+                    Native.passSetBuffer(ctx, 1 << stage, zeroUniforms(), 0L, e.getValue());
                 }
             }
         }
@@ -385,6 +410,21 @@ public final class GlOverridePipeline implements MetalRenderPass.OverridePipelin
                 MemoryUtil.memFree(fs);
             }
         }
+    }
+
+    private static final int GL_UBO_BINDINGS = 16;
+    private static final long[] boundUbo = new long[GL_UBO_BINDINGS];
+    private static final long[] boundUboOffset = new long[GL_UBO_BINDINGS];
+    private static @Nullable GpuBuffer zeroUniformBuffer;
+
+    private static long zeroUniforms() {
+        if (zeroUniformBuffer == null) {
+            MetalDevice device = MetalDevice.current();
+            ByteBuffer zeros = MemoryUtil.memCalloc(65536);
+            zeroUniformBuffer = device.createBuffer(() -> "MineMetal zero uniforms", GpuBuffer.USAGE_UNIFORM, zeros);
+            MemoryUtil.memFree(zeros);
+        }
+        return ((MetalGpuBuffer) zeroUniformBuffer).handle();
     }
 
     /** MTLVertexFormat Float / Int / UInt (stable Metal API values). */
