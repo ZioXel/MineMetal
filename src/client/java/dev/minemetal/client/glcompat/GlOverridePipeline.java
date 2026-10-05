@@ -1,6 +1,7 @@
 package dev.minemetal.client.glcompat;
 
 import com.mojang.renderpearl.api.GpuFormat;
+import com.mojang.renderpearl.api.buffers.GpuBuffer;
 import com.mojang.renderpearl.api.buffers.GpuBufferSlice;
 import com.mojang.renderpearl.api.pipeline.BindGroupLayout;
 import com.mojang.renderpearl.api.pipeline.ColorTargetState;
@@ -117,6 +118,7 @@ public final class GlOverridePipeline implements MetalRenderPass.OverridePipelin
         if (pipeline == 0L || !Native.passSetPipeline(ctx, pipeline)) {
             return false;
         }
+        bindDefaultAttributes(ctx);
         MetalGL.bindLooseUniforms(p);
         long usedUnits = 0L;
         for (int i = 0; i < descriptions.size(); i++) {
@@ -220,7 +222,7 @@ public final class GlOverridePipeline implements MetalRenderPass.OverridePipelin
             // Vertex layout: one Metal buffer per vertex format slot, attributes matched to the program inputs by name
             // ("iris_" + element name first, like Iris on GL).
             int slots = this.vertexFormats.size();
-            IntBuffer layouts = stack.callocInt(Math.max(slots, 1) * 3);
+            IntBuffer layouts = stack.callocInt((slots + 1) * 3);
             int layoutCount = 0;
             List<GlProgramCompiler.Interface> inputs = compiled.vertex().inputs;
             IntBuffer attribs = stack.callocInt(Math.max(inputs.size(), 1) * 4);
@@ -242,7 +244,7 @@ public final class GlOverridePipeline implements MetalRenderPass.OverridePipelin
                     if (in == null || attribCount >= inputs.size()) {
                         continue;
                     }
-                    long fmt = MetalEnums.vertexFormat(element.format());
+                    long fmt = MetalEnums.vertexFormat(matchSignedness(element.format(), in.baseType()));
                     if (fmt < 0) {
                         LOGGER.warn("{}: vertex element {} has no Metal format", this.name, element.name());
                         continue;
@@ -253,6 +255,34 @@ public final class GlOverridePipeline implements MetalRenderPass.OverridePipelin
                     attribs.put(attribCount * 4 + 3, (int) fmt);
                     attribCount++;
                 }
+            }
+            // GL reads (0,0,0,1) for attributes without an array; Metal needs every stage input in the descriptor:
+            // feed the missing ones from a constant zero buffer (components it lacks default to 0, w to 1).
+            boolean needsDefaults = false;
+            for (GlProgramCompiler.Interface in : inputs) {
+                boolean bound = false;
+                for (int i = 0; i < attribCount; i++) {
+                    if (attribs.get(i * 4) == in.location()) {
+                        bound = true;
+                        break;
+                    }
+                }
+                if (bound || attribCount >= attribs.capacity() / 4) {
+                    continue;
+                }
+                long scalar = GlProgramCompiler.isFloat(in.baseType()) ? MTL_FLOAT : in.baseType() == BASETYPE_UINT32 ? MTL_UINT : MTL_INT;
+                attribs.put(attribCount * 4, in.location());
+                attribs.put(attribCount * 4 + 1, DEFAULT_ATTRIBUTE_BUFFER);
+                attribs.put(attribCount * 4 + 2, 0);
+                attribs.put(attribCount * 4 + 3, (int) scalar);
+                attribCount++;
+                needsDefaults = true;
+            }
+            if (needsDefaults) {
+                layouts.put(layoutCount * 3, DEFAULT_ATTRIBUTE_BUFFER);
+                layouts.put(layoutCount * 3 + 1, 16);
+                layouts.put(layoutCount * 3 + 2, -1);
+                layoutCount++;
             }
             LongBuffer targets = stack.callocLong(Math.max(formats.length, 1) * 9);
             MetalGL.fillColorTargets(targets, formats, formats.length);
@@ -289,6 +319,48 @@ public final class GlOverridePipeline implements MetalRenderPass.OverridePipelin
                 MemoryUtil.memFree(fs);
             }
         }
+    }
+
+    /** MTLVertexFormat Float / Int / UInt (stable Metal API values). */
+    private static final long MTL_FLOAT = 28;
+    private static final long MTL_INT = 32;
+    private static final long MTL_UINT = 36;
+    private static final int BASETYPE_INT32 = 7;
+    private static final int BASETYPE_UINT32 = 8;
+    /** Metal buffer index of the constant zero buffer (between push constants at 20 and vertex buffers at 23..30). */
+    static final int DEFAULT_ATTRIBUTE_BUFFER = 21;
+    private static @Nullable GpuBuffer zeroBuffer;
+
+    /**
+     * GL converts integer vertex data to the shader's int/uint type (glVertexAttribIPointer); Metal requires the
+     * signedness to match, so pick the signed/unsigned variant of the element format the shader input asks for.
+     */
+    private static GpuFormat matchSignedness(final GpuFormat format, final int shaderBaseType) {
+        String n = format.name();
+        try {
+            if (shaderBaseType == BASETYPE_INT32 && n.endsWith("_UINT")) {
+                return GpuFormat.valueOf(n.substring(0, n.length() - 5) + "_SINT");
+            }
+            if (shaderBaseType == BASETYPE_UINT32 && n.endsWith("_SINT")) {
+                return GpuFormat.valueOf(n.substring(0, n.length() - 5) + "_UINT");
+            }
+        } catch (IllegalArgumentException ignored) {
+            // no such variant: keep the original
+        }
+        return format;
+    }
+
+    static void bindDefaultAttributes(final long ctx) {
+        MetalDevice device = MetalDevice.current();
+        if (device == null) {
+            return;
+        }
+        if (zeroBuffer == null) {
+            ByteBuffer zeros = MemoryUtil.memCalloc(64);
+            zeroBuffer = device.createBuffer(() -> "MineMetal default vertex attributes", GpuBuffer.USAGE_VERTEX, zeros);
+            MemoryUtil.memFree(zeros);
+        }
+        Native.passSetVertexBuffer(ctx, ((MetalGpuBuffer) zeroBuffer).handle(), 0L, DEFAULT_ATTRIBUTE_BUFFER);
     }
 
     private static GlProgramCompiler.@Nullable Interface findInput(final List<GlProgramCompiler.Interface> inputs, final String name) {

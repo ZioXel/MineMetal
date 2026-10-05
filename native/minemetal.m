@@ -1163,7 +1163,11 @@ MM_EXPORT void *mm_pipeline_create(void *p, const char *name, const char *vsSrc,
             for (int i = 0; i < layoutCount; i++) {
                 int idx = layouts[i * 3], stride = layouts[i * 3 + 1], step = layouts[i * 3 + 2];
                 vd.layouts[idx].stride = (NSUInteger)stride;
-                if (step > 0) {
+                if (step < 0) {
+                    // one value for every vertex (default values for attributes a GL program reads but the format lacks)
+                    vd.layouts[idx].stepFunction = MTLVertexStepFunctionConstant;
+                    vd.layouts[idx].stepRate = 0;
+                } else if (step > 0) {
                     vd.layouts[idx].stepFunction = MTLVertexStepFunctionPerInstance;
                     vd.layouts[idx].stepRate = (NSUInteger)step;
                 } else {
