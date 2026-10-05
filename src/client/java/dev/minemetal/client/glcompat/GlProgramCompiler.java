@@ -240,6 +240,19 @@ public final class GlProgramCompiler {
             // Uniform blocks: implicit loose-uniform block first at buffer 0, anything else after it.
             SpvcReflectedResource.Buffer ubos = list(resources, Spvc.SPVC_RESOURCE_TYPE_UNIFORM_BUFFER, context, stack);
             int nextBuffer = 1;
+            // Give every resource its own (set 0, binding n): GLSL blocks/samplers without explicit bindings can share
+            // binding 0 (e.g. the implicit loose-uniform block and the first named block), which SPIRV-Cross would
+            // turn into one aliased buffer argument and our per-resource slot assignment would silently collapse.
+            int uniqueBinding = 0;
+            for (int i = 0; i < ubos.capacity(); i++) {
+                Spvc.spvc_compiler_set_decoration(compiler, ubos.get(i).id(), DECORATION_DESCRIPTOR_SET, 0);
+                Spvc.spvc_compiler_set_decoration(compiler, ubos.get(i).id(), DECORATION_BINDING, uniqueBinding++);
+            }
+            SpvcReflectedResource.Buffer allSamplers = list(resources, Spvc.SPVC_RESOURCE_TYPE_SAMPLED_IMAGE, context, stack);
+            for (int i = 0; i < allSamplers.capacity(); i++) {
+                Spvc.spvc_compiler_set_decoration(compiler, allSamplers.get(i).id(), DECORATION_DESCRIPTOR_SET, 0);
+                Spvc.spvc_compiler_set_decoration(compiler, allSamplers.get(i).id(), DECORATION_BINDING, uniqueBinding++);
+            }
             for (int i = 0; i < ubos.capacity(); i++) {
                 SpvcReflectedResource r = ubos.get(i);
                 String blockName = Spvc.spvc_compiler_get_name(compiler, r.base_type_id());
