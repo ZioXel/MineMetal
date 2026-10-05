@@ -202,7 +202,9 @@ public final class MetalCommandEncoder implements CommandEncoderBackend {
 
     @Override
     public void clearColorTexture(final GpuTexture colorTexture, final Vector4fc clearColor) {
-        FrameTrace.event("clearColorTexture " + colorTexture.getLabel());
+        if (FrameTrace.active()) {
+            FrameTrace.event("clearColorTexture " + colorTexture.getLabel());
+        }
         Native.clearColorTexture(this.ctx(), ((MetalTexture) colorTexture).handle(), clearColor.x(), clearColor.y(), clearColor.z(), clearColor.w());
     }
 
@@ -224,7 +226,9 @@ public final class MetalCommandEncoder implements CommandEncoderBackend {
 
     @Override
     public void clearDepthTexture(final GpuTexture depthTexture, final double clearDepth) {
-        FrameTrace.event("clearDepthTexture " + depthTexture.getLabel());
+        if (FrameTrace.active()) {
+            FrameTrace.event("clearDepthTexture " + depthTexture.getLabel());
+        }
         Native.clearDepthTexture(this.ctx(), ((MetalTexture) depthTexture).handle(), clearDepthValue(clearDepth, standardDepth.getAsBoolean()));
     }
 

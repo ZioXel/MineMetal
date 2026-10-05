@@ -787,7 +787,9 @@ public final class MetalGL {
     // =================================================================================================================
 
     public static void glClear(final int mask) {
-        dev.minemetal.client.metal.FrameTrace.event("glClear fb " + drawFramebuffer + " mask " + Integer.toHexString(mask));
+        if (dev.minemetal.client.metal.FrameTrace.active()) {
+            dev.minemetal.client.metal.FrameTrace.event("glClear fb " + drawFramebuffer + " mask " + Integer.toHexString(mask));
+        }
         GlFramebufferObject fb = FRAMEBUFFERS.get(drawFramebuffer);
         if (fb == null) {
             return;
@@ -1154,10 +1156,28 @@ public final class MetalGL {
         return PROGRAMS.get(id);
     }
 
-    /** Loose-uniform blocks of both stages at buffer 0. */
+    /**
+     * Loose-uniform blocks of both stages at buffer 0. The blocks are copied to GPU memory once per change (and per
+     * submit, since transient memory is recycled) and the same slice is re-bound for every draw until then, instead
+     * of re-sending several KB of uniforms with every draw.
+     */
     static void bindLooseUniforms(final GlProgramObject program) {
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-            bindUniforms(device(), program, stack);
+        MetalDevice device = device();
+        long ctx = device.ctx();
+        long submit = Native.currentSubmitIndex(ctx);
+        for (int stage = 0; stage < 2; stage++) {
+            ByteBuffer block = program.blocks[stage];
+            if (block == null) {
+                continue;
+            }
+            if (program.uploadedVersion[stage] != program.uniformVersion || program.uploadedSubmit[stage] != submit) {
+                GpuBufferSlice slice = device.encoder().transientMemory().uploadGpu(block.duplicate().clear(), 256L, GpuBuffer.USAGE_UNIFORM);
+                program.uploadedHandle[stage] = ((MetalGpuBuffer) slice.buffer()).handle();
+                program.uploadedOffset[stage] = slice.offset();
+                program.uploadedVersion[stage] = program.uniformVersion;
+                program.uploadedSubmit[stage] = submit;
+            }
+            Native.passSetBuffer(ctx, stage == 0 ? 1 : 2, program.uploadedHandle[stage], program.uploadedOffset[stage], 0);
         }
     }
 

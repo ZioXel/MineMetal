@@ -37,6 +37,12 @@ final class GlProgramObject {
     final List<Slot> slots = new ArrayList<>();
     private final Object2IntOpenHashMap<String> slotByName = new Object2IntOpenHashMap<>();
     final ByteBuffer[] blocks = new ByteBuffer[2];
+    /** Bumped whenever a loose uniform changes; lets draws reuse the last GPU copy of the blocks. */
+    int uniformVersion;
+    final int[] uploadedVersion = {-1, -1};
+    final long[] uploadedSubmit = {-1L, -1L};
+    final long[] uploadedHandle = new long[2];
+    final long[] uploadedOffset = new long[2];
     final Object2LongOpenHashMap<String> pipelines = new Object2LongOpenHashMap<>();
     @Nullable String debugName;
 
@@ -127,6 +133,7 @@ final class GlProgramObject {
         if (slot == null || slot.type == null) {
             return;
         }
+        this.uniformVersion++;
         GlProgramCompiler.BlockMember t = slot.type;
         int element = location & 0xFF;
         for (int stage = 0; stage < 2; stage++) {
@@ -167,6 +174,7 @@ final class GlProgramObject {
         if (slot.type == null) {
             return;
         }
+        this.uniformVersion++;
         GlProgramCompiler.BlockMember t = slot.type;
         int element = location & 0xFF;
         for (int stage = 0; stage < 2; stage++) {
@@ -201,6 +209,7 @@ final class GlProgramObject {
         if (slot == null || slot.type == null) {
             return;
         }
+        this.uniformVersion++;
         GlProgramCompiler.BlockMember t = slot.type;
         int columns = Math.max(1, t.columns());
         int rows = Math.max(1, t.vecSize());

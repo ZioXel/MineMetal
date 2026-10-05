@@ -189,6 +189,7 @@ MM_EXPORT int64_t mm_enum(const char *kind, const char *name) {
 
 @interface MMContext : NSObject {
 @public
+    _Atomic double gpuFrameTime;  // smoothed GPU execution time of a submitted command buffer (s)
     int depthFlip;   // 1 = mirror depth compare ops (shader packs expect standard depth, Minecraft uses reversed Z)
     pthread_mutex_t completionMutex;
     pthread_cond_t completionCond;
@@ -418,6 +419,13 @@ MM_EXPORT uint64_t mm_submit(void *p) {
                         }
                     }
                 }
+            }
+            CFTimeInterval gs = cb.GPUStartTime, ge = cb.GPUEndTime;
+            if (ge > gs && gs > 0.0 && ge - gs < 0.25) {
+                double prevGpu = atomic_load(&weakCtx->gpuFrameTime);
+                double cur = ge - gs;
+                // React quickly to slower frames, slowly to faster ones (pacing must not under-estimate).
+                atomic_store(&weakCtx->gpuFrameTime, cur > prevGpu ? prevGpu * 0.6 + cur * 0.4 : prevGpu * 0.95 + cur * 0.05);
             }
             pthread_mutex_lock(&weakCtx->completionMutex);
             if (index > weakCtx->completedIndex) weakCtx->completedIndex = index;
@@ -1394,12 +1402,15 @@ MM_EXPORT void mm_surface_blit(void *p, void *surfacePtr, void *srcView, int cop
             double iv = atomic_load(&s->refreshInterval);
             BOOL present = YES;
             if (lp > 0.0 && iv > 0.0) {
-                // First refresh this frame could make once its GPU work completes.
-                double k = ceil((now + MM_GPU_MARGIN - lp) / iv);
+                // First refresh this frame could make once its GPU work completes: GPU time is measured
+                // (shader packs make it far larger than the old fixed margin) plus a compositor margin.
+                double gpu = atomic_load(&ctx->gpuFrameTime);
+                double ready = now + gpu + MM_GPU_MARGIN;
+                double k = ceil((ready - lp) / iv);
                 double target = lp + MAX(k, 1.0) * iv;
                 if (fabs(target - s->lastTargetVsync) < iv * 0.5) {
                     present = NO;            // a frame is already queued for that refresh
-                } else if (now + s->avgFrameTime + MM_GPU_MARGIN < target - 0.0005) {
+                } else if (ready + s->avgFrameTime < target - 0.001) {
                     present = NO;            // the next frame will still make it and is newer
                 } else {
                     s->lastTargetVsync = target;
