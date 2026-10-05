@@ -188,6 +188,20 @@ public final class GlOverridePipeline implements MetalRenderPass.OverridePipelin
         MetalGL.bindUnitSamplers(p, usedUnits);
         if (!this.loggedFirstDraw) {
             this.loggedFirstDraw = true;
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < descriptions.size(); i++) {
+                BindGroupLayout.UniformDescription d = descriptions.get(i);
+                Object value = values != null && i < values.length ? values[i] : null;
+                sb.append(' ').append(d.name()).append('(').append(d.type()).append(value == null ? ",null" : "");
+                if (d.type().name().equals("UNIFORM_BUFFER")) {
+                    int binding = this.hooks.uniformBinding(d.name());
+                    sb.append(",b").append(binding).append("->v").append(p.bufferIndexForBinding(0, binding)).append("/f").append(p.bufferIndexForBinding(1, binding));
+                }
+                sb.append(')');
+            }
+            sb.append(" blocks ").append(p.blockNames).append(" bindings ").append(java.util.Arrays.toString(p.blockBindings));
+            sb.append(" push ").append(pushConstants == null ? "none" : pushConstants.remaining() + "B");
+            LOGGER.info("override {}: resources{}", this.name, sb);
             LOGGER.info("override {}: first draw into {} color target(s){}, units from pass {}", this.name, target.colorViews().length,
                 target.depthView() != 0L ? " + depth" : "", Long.toBinaryString(usedUnits));
         }
@@ -340,11 +354,18 @@ public final class GlOverridePipeline implements MetalRenderPass.OverridePipelin
             }
             ByteBuffer err = stack.calloc(2048);
             ByteBuffer vs = MemoryUtil.memUTF8(compiled.vertex().msl);
-            ByteBuffer fs = MemoryUtil.memUTF8(compiled.fragment().msl);
+            String solid = System.getProperty("minemetal.debugSolid");
+            boolean debugSolid = solid != null && !solid.isEmpty() && this.name.contains(solid);
+            if (debugSolid) {
+                LOGGER.info("override {}: fragment shader replaced by solid magenta (minemetal.debugSolid)", this.name);
+            }
+            ByteBuffer fs = MemoryUtil.memUTF8(debugSolid
+                ? "#include <metal_stdlib>\nusing namespace metal;\nfragment float4 mmDebugSolid() { return float4(1.0, 0.0, 1.0, 1.0); }\n"
+                : compiled.fragment().msl);
             try {
                 long handle = Native.pipelineCreate(device.ctx(), MemoryUtil.memAddress(stack.UTF8(this.name)), MemoryUtil.memAddress(vs),
                     MemoryUtil.memAddress(stack.UTF8(compiled.vertex().entryPoint)), MemoryUtil.memAddress(fs),
-                    MemoryUtil.memAddress(stack.UTF8(compiled.fragment().entryPoint)), MemoryUtil.memAddress(layouts), layoutCount,
+                    MemoryUtil.memAddress(stack.UTF8(debugSolid ? "mmDebugSolid" : compiled.fragment().entryPoint)), MemoryUtil.memAddress(layouts), layoutCount,
                     MemoryUtil.memAddress(attribs), attribCount, MemoryUtil.memAddress(targets), formats.length, MemoryUtil.memAddress(raster),
                     MemoryUtil.memAddress(bias), hasDepth, MemoryUtil.memAddress(err), err.capacity());
                 if (handle == 0L) {
