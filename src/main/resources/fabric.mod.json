@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "minemetal",
+  "version": "${version}",
+  "name": "MineMetal",
+  "description": "Native Apple Metal rendering backend for Minecraft (macOS, Apple Silicon).",
+  "authors": ["ZioXel"],
+  "license": "CC0-1.0",
+  "icon": "assets/minemetal/icon.png",
+  "environment": "client",
+  "entrypoints": {
+    "client": ["dev.minemetal.client.MineMetalClient"]
+  },
+  "mixins": [
+    { "config": "minemetal.client.mixins.json", "environment": "client" }
+  ],
+  "depends": {
+    "fabricloader": ">=0.19.5",
+    "minecraft": "~26.3",
+    "java": ">=25"
+  }
+}

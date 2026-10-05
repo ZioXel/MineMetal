@@ -1,0 +1,1401 @@
+// MineMetal native bridge: a thin C ABI over Apple Metal, called from Java via FFM (java.lang.foreign).
+//
+// Conventions
+//  * Every Metal object handed to Java is retained (__bridge_retained) and must be freed with mm_release().
+//  * The MMContext owns the device, the queue and the *current* command buffer + encoder state.
+//    All mm_* calls that record commands must come from the render thread (same as the Java backend).
+//  * Enum values that cross the boundary are resolved by name once (mm_enum), so Java never hardcodes MTL numbers.
+//
+// Build: see compileMetalNative in build.gradle (clang -dynamiclib -fobjc-arc ...).
+
+#import <Foundation/Foundation.h>
+#import <Metal/Metal.h>
+#import <QuartzCore/QuartzCore.h>
+#import <CoreGraphics/CoreGraphics.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <math.h>
+#include <string.h>
+#include <stdint.h>
+
+#define MM_EXPORT __attribute__((visibility("default")))
+
+static int64_t mm_now_ns(void) {
+    return (int64_t)clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+}
+
+#define MM_STAGE_VERTEX   1
+#define MM_STAGE_FRAGMENT 2
+
+static void mm_copy_error(char *buf, int len, NSString *msg) {
+    if (buf == NULL || len <= 0) return;
+    const char *utf8 = msg != nil ? [msg UTF8String] : "unknown error";
+    strncpy(buf, utf8 != NULL ? utf8 : "unknown error", (size_t)len - 1);
+    buf[len - 1] = 0;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Enum lookup by name
+// ---------------------------------------------------------------------------------------------------------------------
+
+static NSDictionary<NSString *, NSNumber *> *mm_pixel_formats(void) {
+    static NSDictionary *d;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        d = @{
+            @"R8_UNORM": @(MTLPixelFormatR8Unorm), @"R8_SNORM": @(MTLPixelFormatR8Snorm),
+            @"RG8_UNORM": @(MTLPixelFormatRG8Unorm), @"RG8_SNORM": @(MTLPixelFormatRG8Snorm),
+            @"RGBA8_UNORM": @(MTLPixelFormatRGBA8Unorm), @"RGBA8_SNORM": @(MTLPixelFormatRGBA8Snorm),
+            @"R16_UNORM": @(MTLPixelFormatR16Unorm), @"R16_SNORM": @(MTLPixelFormatR16Snorm),
+            @"RG16_UNORM": @(MTLPixelFormatRG16Unorm), @"RG16_SNORM": @(MTLPixelFormatRG16Snorm),
+            @"RGBA16_UNORM": @(MTLPixelFormatRGBA16Unorm), @"RGBA16_SNORM": @(MTLPixelFormatRGBA16Snorm),
+            @"R8_UINT": @(MTLPixelFormatR8Uint), @"R8_SINT": @(MTLPixelFormatR8Sint),
+            @"RG8_UINT": @(MTLPixelFormatRG8Uint), @"RG8_SINT": @(MTLPixelFormatRG8Sint),
+            @"RGBA8_UINT": @(MTLPixelFormatRGBA8Uint), @"RGBA8_SINT": @(MTLPixelFormatRGBA8Sint),
+            @"R16_UINT": @(MTLPixelFormatR16Uint), @"R16_SINT": @(MTLPixelFormatR16Sint),
+            @"RG16_UINT": @(MTLPixelFormatRG16Uint), @"RG16_SINT": @(MTLPixelFormatRG16Sint),
+            @"RGBA16_UINT": @(MTLPixelFormatRGBA16Uint), @"RGBA16_SINT": @(MTLPixelFormatRGBA16Sint),
+            @"R32_UINT": @(MTLPixelFormatR32Uint), @"R32_SINT": @(MTLPixelFormatR32Sint),
+            @"RG32_UINT": @(MTLPixelFormatRG32Uint), @"RG32_SINT": @(MTLPixelFormatRG32Sint),
+            @"RGBA32_UINT": @(MTLPixelFormatRGBA32Uint), @"RGBA32_SINT": @(MTLPixelFormatRGBA32Sint),
+            @"R16_FLOAT": @(MTLPixelFormatR16Float), @"RG16_FLOAT": @(MTLPixelFormatRG16Float),
+            @"RGBA16_FLOAT": @(MTLPixelFormatRGBA16Float),
+            @"R32_FLOAT": @(MTLPixelFormatR32Float), @"RG32_FLOAT": @(MTLPixelFormatRG32Float),
+            @"RGBA32_FLOAT": @(MTLPixelFormatRGBA32Float),
+            @"RGB10A2_UNORM": @(MTLPixelFormatRGB10A2Unorm), @"RGB10A2_UINT": @(MTLPixelFormatRGB10A2Uint),
+            @"RG11B10_FLOAT": @(MTLPixelFormatRG11B10Float),
+            @"D32_FLOAT": @(MTLPixelFormatDepth32Float),
+            @"D32_FLOAT_S8_UINT": @(MTLPixelFormatDepth32Float_Stencil8),
+            // Apple GPUs have no D24S8; the closest lossless substitute is D32F_S8.
+            @"D24_UNORM_S8_UINT": @(MTLPixelFormatDepth32Float_Stencil8),
+            @"D16_UNORM": @(MTLPixelFormatDepth16Unorm),
+            @"S8_UINT": @(MTLPixelFormatStencil8),
+            // 3-component texture formats do not exist in Metal (RGB8/RGB16/RGB32): intentionally absent.
+            @"BGRA8_UNORM": @(MTLPixelFormatBGRA8Unorm),
+        };
+    });
+    return d;
+}
+
+static NSDictionary<NSString *, NSNumber *> *mm_vertex_formats(void) {
+    static NSDictionary *d;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        d = @{
+            @"R8_UNORM": @(MTLVertexFormatUCharNormalized), @"R8_SNORM": @(MTLVertexFormatCharNormalized),
+            @"RG8_UNORM": @(MTLVertexFormatUChar2Normalized), @"RG8_SNORM": @(MTLVertexFormatChar2Normalized),
+            @"RGB8_UNORM": @(MTLVertexFormatUChar3Normalized), @"RGB8_SNORM": @(MTLVertexFormatChar3Normalized),
+            @"RGBA8_UNORM": @(MTLVertexFormatUChar4Normalized), @"RGBA8_SNORM": @(MTLVertexFormatChar4Normalized),
+            @"R16_UNORM": @(MTLVertexFormatUShortNormalized), @"R16_SNORM": @(MTLVertexFormatShortNormalized),
+            @"RG16_UNORM": @(MTLVertexFormatUShort2Normalized), @"RG16_SNORM": @(MTLVertexFormatShort2Normalized),
+            @"RGB16_UNORM": @(MTLVertexFormatUShort3Normalized), @"RGB16_SNORM": @(MTLVertexFormatShort3Normalized),
+            @"RGBA16_UNORM": @(MTLVertexFormatUShort4Normalized), @"RGBA16_SNORM": @(MTLVertexFormatShort4Normalized),
+            @"R8_UINT": @(MTLVertexFormatUChar), @"R8_SINT": @(MTLVertexFormatChar),
+            @"RG8_UINT": @(MTLVertexFormatUChar2), @"RG8_SINT": @(MTLVertexFormatChar2),
+            @"RGB8_UINT": @(MTLVertexFormatUChar3), @"RGB8_SINT": @(MTLVertexFormatChar3),
+            @"RGBA8_UINT": @(MTLVertexFormatUChar4), @"RGBA8_SINT": @(MTLVertexFormatChar4),
+            @"R16_UINT": @(MTLVertexFormatUShort), @"R16_SINT": @(MTLVertexFormatShort),
+            @"RG16_UINT": @(MTLVertexFormatUShort2), @"RG16_SINT": @(MTLVertexFormatShort2),
+            @"RGB16_UINT": @(MTLVertexFormatUShort3), @"RGB16_SINT": @(MTLVertexFormatShort3),
+            @"RGBA16_UINT": @(MTLVertexFormatUShort4), @"RGBA16_SINT": @(MTLVertexFormatShort4),
+            @"R32_UINT": @(MTLVertexFormatUInt), @"R32_SINT": @(MTLVertexFormatInt),
+            @"RG32_UINT": @(MTLVertexFormatUInt2), @"RG32_SINT": @(MTLVertexFormatInt2),
+            @"RGB32_UINT": @(MTLVertexFormatUInt3), @"RGB32_SINT": @(MTLVertexFormatInt3),
+            @"RGBA32_UINT": @(MTLVertexFormatUInt4), @"RGBA32_SINT": @(MTLVertexFormatInt4),
+            @"R16_FLOAT": @(MTLVertexFormatHalf), @"RG16_FLOAT": @(MTLVertexFormatHalf2),
+            @"RGB16_FLOAT": @(MTLVertexFormatHalf3), @"RGBA16_FLOAT": @(MTLVertexFormatHalf4),
+            @"R32_FLOAT": @(MTLVertexFormatFloat), @"RG32_FLOAT": @(MTLVertexFormatFloat2),
+            @"RGB32_FLOAT": @(MTLVertexFormatFloat3), @"RGBA32_FLOAT": @(MTLVertexFormatFloat4),
+            @"RGB10A2_UNORM": @(MTLVertexFormatUInt1010102Normalized),
+            @"RG11B10_FLOAT": @(MTLVertexFormatFloatRG11B10),
+        };
+    });
+    return d;
+}
+
+static NSDictionary<NSString *, NSNumber *> *mm_misc_enums(void) {
+    static NSDictionary *d;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        d = @{
+            // CompareOp
+            @"compare.ALWAYS_PASS": @(MTLCompareFunctionAlways), @"compare.LESS_THAN": @(MTLCompareFunctionLess),
+            @"compare.LESS_THAN_OR_EQUAL": @(MTLCompareFunctionLessEqual), @"compare.EQUAL": @(MTLCompareFunctionEqual),
+            @"compare.NOT_EQUAL": @(MTLCompareFunctionNotEqual),
+            @"compare.GREATER_THAN_OR_EQUAL": @(MTLCompareFunctionGreaterEqual),
+            @"compare.GREATER_THAN": @(MTLCompareFunctionGreater), @"compare.NEVER_PASS": @(MTLCompareFunctionNever),
+            // BlendFactor
+            @"blend.CONSTANT_ALPHA": @(MTLBlendFactorBlendAlpha), @"blend.CONSTANT_COLOR": @(MTLBlendFactorBlendColor),
+            @"blend.DST_ALPHA": @(MTLBlendFactorDestinationAlpha), @"blend.DST_COLOR": @(MTLBlendFactorDestinationColor),
+            @"blend.ONE": @(MTLBlendFactorOne),
+            @"blend.ONE_MINUS_CONSTANT_ALPHA": @(MTLBlendFactorOneMinusBlendAlpha),
+            @"blend.ONE_MINUS_CONSTANT_COLOR": @(MTLBlendFactorOneMinusBlendColor),
+            @"blend.ONE_MINUS_DST_ALPHA": @(MTLBlendFactorOneMinusDestinationAlpha),
+            @"blend.ONE_MINUS_DST_COLOR": @(MTLBlendFactorOneMinusDestinationColor),
+            @"blend.ONE_MINUS_SRC_ALPHA": @(MTLBlendFactorOneMinusSourceAlpha),
+            @"blend.ONE_MINUS_SRC_COLOR": @(MTLBlendFactorOneMinusSourceColor),
+            @"blend.SRC_ALPHA": @(MTLBlendFactorSourceAlpha),
+            @"blend.SRC_ALPHA_SATURATE": @(MTLBlendFactorSourceAlphaSaturated),
+            @"blend.SRC_COLOR": @(MTLBlendFactorSourceColor), @"blend.ZERO": @(MTLBlendFactorZero),
+            // BlendOp
+            @"blendop.ADD": @(MTLBlendOperationAdd), @"blendop.SUBTRACT": @(MTLBlendOperationSubtract),
+            @"blendop.REVERSE_SUBTRACT": @(MTLBlendOperationReverseSubtract),
+            @"blendop.MIN": @(MTLBlendOperationMin), @"blendop.MAX": @(MTLBlendOperationMax),
+        };
+    });
+    return d;
+}
+
+/** Resolves an enum by kind ("pixel", "vertex", "misc") and name. Returns -1 when unsupported. */
+MM_EXPORT int64_t mm_enum(const char *kind, const char *name) {
+    @autoreleasepool {
+        NSString *k = [NSString stringWithUTF8String:kind];
+        NSString *n = [NSString stringWithUTF8String:name];
+        NSDictionary *dict = nil;
+        if ([k isEqualToString:@"pixel"]) dict = mm_pixel_formats();
+        else if ([k isEqualToString:@"vertex"]) dict = mm_vertex_formats();
+        else dict = mm_misc_enums();
+        NSNumber *v = dict[n];
+        return v != nil ? (int64_t)[v longLongValue] : -1;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Pipeline object
+// ---------------------------------------------------------------------------------------------------------------------
+
+@interface MMPipeline : NSObject
+@property(nonatomic, strong) MTLRenderPipelineDescriptor *descriptor;
+@property(nonatomic, strong) id<MTLRenderPipelineState> withDepth;
+@property(nonatomic, strong) id<MTLRenderPipelineState> withoutDepth;
+@property(nonatomic, strong) id<MTLDepthStencilState> depthState;   // nil when the pipeline has no depth state
+@property(nonatomic) MTLPrimitiveType primitiveType;
+@property(nonatomic) BOOL skipDraws;                                  // topology Metal cannot express (TRIANGLE_FAN)
+@property(nonatomic) MTLCullMode cullMode;
+@property(nonatomic) MTLWinding winding;
+@property(nonatomic) MTLTriangleFillMode fillMode;
+@property(nonatomic) float depthBiasConstant;
+@property(nonatomic) float depthBiasSlope;
+@property(nonatomic, copy) NSString *name;
+@end
+
+@implementation MMPipeline
+@end
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Context
+// ---------------------------------------------------------------------------------------------------------------------
+
+@interface MMContext : NSObject {
+@public
+    pthread_mutex_t completionMutex;
+    pthread_cond_t completionCond;
+    uint64_t completedIndex;
+    uint64_t submitIndex;
+    // Redundant-state filter for the open render encoder ([stage][index]; stage 0 = vertex, 1 = fragment).
+    void *boundBuffer[2][31];
+    uint64_t boundOffset[2][31];
+    void *boundTexture[2][32];
+    void *boundSampler[2][16];
+    int scissor[4];
+    void *boundDepthState;
+    int boundCull;
+    int boundWinding;
+    int boundFill;
+    float boundBias[2];
+@public
+    int gpuDebug;
+}
+@property(nonatomic, strong) id<MTLDevice> device;
+@property(nonatomic, strong) id<MTLCommandQueue> queue;
+@property(nonatomic, strong) id<MTLCommandBuffer> cmd;
+@property(nonatomic, strong) id<MTLRenderCommandEncoder> render;
+@property(nonatomic, strong) id<MTLBlitCommandEncoder> blit;
+// render pass state
+@property(nonatomic, strong) id<MTLBuffer> indexBuffer;
+@property(nonatomic) MTLIndexType indexType;
+@property(nonatomic) NSUInteger indexSize;
+@property(nonatomic, strong) MMPipeline *pipeline;
+@property(nonatomic) BOOL passHasDepth;
+@property(nonatomic) NSUInteger passWidth;
+@property(nonatomic) NSUInteger passHeight;
+// built-in helpers
+@property(nonatomic, strong) id<MTLLibrary> helperLibrary;
+@property(nonatomic, strong) NSMutableDictionary<NSString *, id<MTLRenderPipelineState>> *helperPipelines;
+@property(nonatomic, strong) id<MTLDepthStencilState> depthDisabled;
+@property(nonatomic, strong) id<MTLDepthStencilState> depthAlwaysWrite;
+@end
+
+@implementation MMContext
+- (instancetype)init {
+    if ((self = [super init])) {
+        pthread_mutex_init(&completionMutex, NULL);
+        pthread_cond_init(&completionCond, NULL);
+        completedIndex = 0;
+        submitIndex = 1;
+        _helperPipelines = [NSMutableDictionary dictionary];
+    }
+    return self;
+}
+- (void)dealloc {
+    pthread_cond_destroy(&completionCond);
+    pthread_mutex_destroy(&completionMutex);
+}
+@end
+
+static inline MMContext *CTX(void *p) { return (__bridge MMContext *)p; }
+
+static void mm_reset_bound_state(MMContext *ctx) {
+    memset(ctx->boundBuffer, 0, sizeof(ctx->boundBuffer));
+    memset(ctx->boundOffset, 0, sizeof(ctx->boundOffset));
+    memset(ctx->boundTexture, 0, sizeof(ctx->boundTexture));
+    memset(ctx->boundSampler, 0, sizeof(ctx->boundSampler));
+    ctx->scissor[0] = ctx->scissor[1] = ctx->scissor[2] = ctx->scissor[3] = -1;
+    ctx->boundDepthState = NULL;
+    ctx->boundCull = -1;
+    ctx->boundWinding = -1;
+    ctx->boundFill = -1;
+    ctx->boundBias[0] = NAN;
+    ctx->boundBias[1] = NAN;
+}
+
+static NSString *const kHelperSource =
+    @"#include <metal_stdlib>\n"
+     "using namespace metal;\n"
+     "struct MMClearOut { float4 pos [[position]]; };\n"
+     "vertex MMClearOut mm_clear_vs(uint vid [[vertex_id]], constant float &depth [[buffer(0)]]) {\n"
+     "  float2 p = float2((vid & 1) ? 1.0 : -1.0, (vid & 2) ? 1.0 : -1.0);\n"
+     "  MMClearOut o; o.pos = float4(p, depth, 1.0); return o;\n"
+     "}\n"
+     "fragment float4 mm_clear_fs(constant float4 &color [[buffer(0)]]) { return color; }\n"
+     "struct MMPresentOut { float4 pos [[position]]; };\n"
+     "vertex MMPresentOut mm_present_vs(uint vid [[vertex_id]]) {\n"
+     "  float2 p = float2(float((vid << 1) & 2), float(vid & 2));\n"
+     "  MMPresentOut o; o.pos = float4(p * 2.0 - 1.0, 0.0, 1.0); return o;\n"
+     "}\n"
+     // Game textures use the GL/Vulkan memory layout (row 0 = bottom of the image); the drawable is top-down.
+     "fragment float4 mm_present_fs(MMPresentOut in [[stage_in]], texture2d<float> src [[texture(0)]],\n"
+     "                              constant uint2 &size [[buffer(0)]]) {\n"
+     "  uint2 p = uint2(in.pos.xy);\n"
+     "  if (p.x >= size.x || p.y >= size.y) return float4(0.0, 0.0, 0.0, 1.0);\n"
+     "  float4 c = src.read(uint2(p.x, size.y - 1 - p.y));\n"
+     "  return float4(c.rgb, 1.0);\n"
+     "}\n";
+
+MM_EXPORT void *mm_create_context(char *err, int errLen) {
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (device == nil) {
+            mm_copy_error(err, errLen, @"MTLCreateSystemDefaultDevice returned nil");
+            return NULL;
+        }
+        if (![device supportsFamily:MTLGPUFamilyApple7] && ![device supportsFamily:MTLGPUFamilyMac2]) {
+            mm_copy_error(err, errLen, [NSString stringWithFormat:@"GPU %@ does not support a required Metal family", device.name]);
+            return NULL;
+        }
+        MMContext *ctx = [[MMContext alloc] init];
+        ctx.device = device;
+        ctx.queue = [device newCommandQueueWithMaxCommandBufferCount:16];
+        ctx.queue.label = @"MineMetal queue";
+
+        NSError *error = nil;
+        MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
+        ctx.helperLibrary = [device newLibraryWithSource:kHelperSource options:options error:&error];
+        if (ctx.helperLibrary == nil) {
+            mm_copy_error(err, errLen, [NSString stringWithFormat:@"helper shaders: %@", error.localizedDescription]);
+            return NULL;
+        }
+
+        MTLDepthStencilDescriptor *dd = [[MTLDepthStencilDescriptor alloc] init];
+        dd.depthCompareFunction = MTLCompareFunctionAlways;
+        dd.depthWriteEnabled = NO;
+        ctx.depthDisabled = [device newDepthStencilStateWithDescriptor:dd];
+        dd.depthWriteEnabled = YES;
+        ctx.depthAlwaysWrite = [device newDepthStencilStateWithDescriptor:dd];
+        return (__bridge_retained void *)ctx;
+    }
+}
+
+/** Enables per-encoder GPU error reporting (slower; for validation runs). */
+MM_EXPORT void mm_set_gpu_debug(void *p, int enabled) { CTX(p)->gpuDebug = enabled; }
+
+MM_EXPORT void mm_destroy_context(void *p) {
+    if (p == NULL) return;
+    MMContext *ctx = (__bridge_transfer MMContext *)p;
+    if (ctx.render != nil) { [ctx.render endEncoding]; ctx.render = nil; }
+    if (ctx.blit != nil) { [ctx.blit endEncoding]; ctx.blit = nil; }
+    if (ctx.cmd != nil) { [ctx.cmd commit]; [ctx.cmd waitUntilCompleted]; ctx.cmd = nil; }
+    ctx = nil;
+}
+
+/** out: [0]=maxBufferLength [1]=recommendedMaxWorkingSetSize [2]=hasUnifiedMemory [3]=registryID [4]=lowPower */
+MM_EXPORT void mm_context_info(void *p, char *name, int nameLen, int64_t *out) {
+    @autoreleasepool {
+        MMContext *ctx = CTX(p);
+        mm_copy_error(name, nameLen, ctx.device.name);
+        out[0] = (int64_t)ctx.device.maxBufferLength;
+        out[1] = (int64_t)ctx.device.recommendedMaxWorkingSetSize;
+        out[2] = ctx.device.hasUnifiedMemory ? 1 : 0;
+        out[3] = (int64_t)ctx.device.registryID;
+        out[4] = ctx.device.lowPower ? 1 : 0;
+    }
+}
+
+MM_EXPORT void mm_release(void *obj) {
+    if (obj != NULL) CFRelease(obj);
+}
+
+MM_EXPORT void mm_set_label(void *obj, const char *label) {
+    if (obj == NULL || label == NULL) return;
+    @autoreleasepool {
+        id o = (__bridge id)obj;
+        if ([o respondsToSelector:@selector(setLabel:)]) {
+            [o setLabel:[NSString stringWithUTF8String:label]];
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Command buffer / encoder management
+// ---------------------------------------------------------------------------------------------------------------------
+
+static id<MTLCommandBuffer> mm_cmd(MMContext *ctx) {
+    if (ctx.cmd == nil) {
+        if (ctx->gpuDebug) {
+            MTLCommandBufferDescriptor *d = [[MTLCommandBufferDescriptor alloc] init];
+            d.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
+            ctx.cmd = [ctx.queue commandBufferWithDescriptor:d];
+        } else {
+            ctx.cmd = [ctx.queue commandBuffer];
+        }
+        ctx.cmd.label = [NSString stringWithFormat:@"MineMetal submit %llu", ctx->submitIndex];
+    }
+    return ctx.cmd;
+}
+
+static void mm_end_encoders(MMContext *ctx) {
+    if (ctx.render != nil) { [ctx.render endEncoding]; ctx.render = nil; ctx.pipeline = nil; }
+    if (ctx.blit != nil) { [ctx.blit endEncoding]; ctx.blit = nil; }
+}
+
+static id<MTLBlitCommandEncoder> mm_blit(MMContext *ctx) {
+    if (ctx.render != nil) {
+        // Copies are not allowed inside a render pass; the frontend guarantees this never happens.
+        NSLog(@"[MineMetal] blit requested while a render pass is open; ending the pass");
+        [ctx.render endEncoding];
+        ctx.render = nil;
+    }
+    if (ctx.blit == nil) ctx.blit = [mm_cmd(ctx) blitCommandEncoder];
+    return ctx.blit;
+}
+
+/** Ends encoding and commits the current command buffer. Returns the submit index that just got committed. */
+MM_EXPORT uint64_t mm_submit(void *p) {
+    @autoreleasepool {
+        MMContext *ctx = CTX(p);
+        mm_end_encoders(ctx);
+        uint64_t index = ctx->submitIndex++;
+        id<MTLCommandBuffer> cmd = mm_cmd(ctx);  // creates an empty one if nothing was recorded
+        MMContext *weakCtx = ctx;  // the context outlives all command buffers (destroy waits)
+        [cmd addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+            if (cb.error != nil) {
+                NSLog(@"[MineMetal] command buffer %@ failed: %@", cb.label, cb.error);
+                id infos = cb.error.userInfo[MTLCommandBufferEncoderInfoErrorKey];
+                if ([infos isKindOfClass:[NSArray class]]) {
+                    for (id<MTLCommandBufferEncoderInfo> info in (NSArray *)infos) {
+                        if (info.errorState == MTLCommandEncoderErrorStateFaulted) {
+                            NSLog(@"[MineMetal]   faulted encoder: %@ (debug groups: %@)", info.label, info.debugSignposts);
+                        }
+                    }
+                }
+            }
+            pthread_mutex_lock(&weakCtx->completionMutex);
+            if (index > weakCtx->completedIndex) weakCtx->completedIndex = index;
+            pthread_cond_broadcast(&weakCtx->completionCond);
+            pthread_mutex_unlock(&weakCtx->completionMutex);
+        }];
+        [cmd commit];
+        ctx.cmd = nil;
+        return index;
+    }
+}
+
+MM_EXPORT uint64_t mm_current_submit_index(void *p) { return CTX(p)->submitIndex; }
+
+/** Waits until submit `index` has completed on the GPU. timeoutNs < 0 waits forever. Returns 1 when completed. */
+MM_EXPORT int mm_wait(void *p, uint64_t index, int64_t timeoutNs) {
+    MMContext *ctx = CTX(p);
+    pthread_mutex_lock(&ctx->completionMutex);
+    int done = ctx->completedIndex >= index;
+    if (!done && timeoutNs != 0) {
+        struct timespec deadline;
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        int64_t ns = timeoutNs < 0 ? (int64_t)3600 * 1000000000LL : timeoutNs;
+        deadline.tv_sec += ns / 1000000000LL;
+        deadline.tv_nsec += ns % 1000000000LL;
+        if (deadline.tv_nsec >= 1000000000L) { deadline.tv_sec += 1; deadline.tv_nsec -= 1000000000L; }
+        while (ctx->completedIndex < index) {
+            if (pthread_cond_timedwait(&ctx->completionCond, &ctx->completionMutex, &deadline) != 0) break;
+        }
+        done = ctx->completedIndex >= index;
+    }
+    pthread_mutex_unlock(&ctx->completionMutex);
+    return done;
+}
+
+MM_EXPORT uint64_t mm_completed_index(void *p) {
+    MMContext *ctx = CTX(p);
+    pthread_mutex_lock(&ctx->completionMutex);
+    uint64_t v = ctx->completedIndex;
+    pthread_mutex_unlock(&ctx->completionMutex);
+    return v;
+}
+
+MM_EXPORT void mm_wait_idle(void *p) {
+    @autoreleasepool {
+        MMContext *ctx = CTX(p);
+        uint64_t last = mm_submit(p);
+        mm_wait(p, last, -1);
+        (void)ctx;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Buffers
+// ---------------------------------------------------------------------------------------------------------------------
+
+MM_EXPORT void *mm_buffer_create(void *p, uint64_t size) {
+    @autoreleasepool {
+        MMContext *ctx = CTX(p);
+        // Apple Silicon has unified memory: shared storage is both CPU-mappable and full speed for the GPU.
+        // Round up to 16 bytes: MSL pads structs to their 16-byte alignment, so a 40-byte std140 block is a 48-byte
+        // MSL struct. Without the padding the validation layer (correctly) reports reads past the end of the buffer.
+        NSUInteger padded = (NSUInteger)(((size > 0 ? size : 4) + 15) & ~(uint64_t)15);
+        id<MTLBuffer> buf = [ctx.device newBufferWithLength:padded
+                                                    options:MTLResourceStorageModeShared | MTLResourceHazardTrackingModeTracked];
+        return buf != nil ? (__bridge_retained void *)buf : NULL;
+    }
+}
+
+MM_EXPORT void *mm_buffer_contents(void *buf) {
+    return [(__bridge id<MTLBuffer>)buf contents];
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Textures and samplers
+// ---------------------------------------------------------------------------------------------------------------------
+
+#define MM_TEX_USAGE_COPY_DST 1
+#define MM_TEX_USAGE_COPY_SRC 2
+#define MM_TEX_USAGE_TEXTURE_BINDING 4
+#define MM_TEX_USAGE_RENDER_ATTACHMENT 8
+#define MM_TEX_USAGE_CUBEMAP_COMPATIBLE 16
+
+MM_EXPORT void *mm_texture_create(void *p, int64_t pixelFormat, int width, int height, int layers, int mips, int usage) {
+    @autoreleasepool {
+        MMContext *ctx = CTX(p);
+        MTLTextureDescriptor *d = [[MTLTextureDescriptor alloc] init];
+        d.pixelFormat = (MTLPixelFormat)pixelFormat;
+        d.width = (NSUInteger)MAX(width, 1);
+        d.height = (NSUInteger)MAX(height, 1);
+        d.mipmapLevelCount = (NSUInteger)MAX(mips, 1);
+        if ((usage & MM_TEX_USAGE_CUBEMAP_COMPATIBLE) && layers == 6) {
+            d.textureType = MTLTextureTypeCube;
+        } else if (layers > 1) {
+            d.textureType = MTLTextureType2DArray;
+            d.arrayLength = (NSUInteger)layers;
+        } else {
+            d.textureType = MTLTextureType2D;
+        }
+        d.storageMode = MTLStorageModePrivate;
+        MTLTextureUsage u = MTLTextureUsageShaderRead;
+        if (usage & MM_TEX_USAGE_RENDER_ATTACHMENT) u |= MTLTextureUsageRenderTarget;
+        d.usage = u;
+        id<MTLTexture> tex = [ctx.device newTextureWithDescriptor:d];
+        return tex != nil ? (__bridge_retained void *)tex : NULL;
+    }
+}
+
+MM_EXPORT void *mm_texture_view(void *texPtr, int baseMip, int mips) {
+    @autoreleasepool {
+        id<MTLTexture> tex = (__bridge id<MTLTexture>)texPtr;
+        NSUInteger slices = tex.textureType == MTLTextureTypeCube ? 6 : tex.arrayLength;
+        id<MTLTexture> view = [tex newTextureViewWithPixelFormat:tex.pixelFormat
+                                                     textureType:tex.textureType
+                                                          levels:NSMakeRange((NSUInteger)baseMip, (NSUInteger)MAX(mips, 1))
+                                                          slices:NSMakeRange(0, MAX(slices, (NSUInteger)1))];
+        return view != nil ? (__bridge_retained void *)view : NULL;
+    }
+}
+
+MM_EXPORT void *mm_sampler_create(void *p, int repeatU, int repeatV, int minLinear, int magLinear, int mipLinear,
+                                  int maxAnisotropy, float lodMax) {
+    @autoreleasepool {
+        MMContext *ctx = CTX(p);
+        MTLSamplerDescriptor *d = [[MTLSamplerDescriptor alloc] init];
+        d.sAddressMode = repeatU ? MTLSamplerAddressModeRepeat : MTLSamplerAddressModeClampToEdge;
+        d.tAddressMode = repeatV ? MTLSamplerAddressModeRepeat : MTLSamplerAddressModeClampToEdge;
+        d.rAddressMode = MTLSamplerAddressModeClampToEdge;
+        d.minFilter = minLinear ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
+        d.magFilter = magLinear ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
+        d.mipFilter = mipLinear ? MTLSamplerMipFilterLinear : MTLSamplerMipFilterNearest;
+        d.maxAnisotropy = (NSUInteger)MAX(1, MIN(maxAnisotropy, 16));
+        d.lodMinClamp = 0.0f;
+        d.lodMaxClamp = lodMax;
+        id<MTLSamplerState> s = [ctx.device newSamplerStateWithDescriptor:d];
+        return s != nil ? (__bridge_retained void *)s : NULL;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Copies
+// ---------------------------------------------------------------------------------------------------------------------
+
+MM_EXPORT void mm_copy_buffer(void *p, void *src, uint64_t srcOffset, void *dst, uint64_t dstOffset, uint64_t size) {
+    if (size == 0) return;
+    @autoreleasepool {
+        [mm_blit(CTX(p)) copyFromBuffer:(__bridge id<MTLBuffer>)src sourceOffset:srcOffset
+                               toBuffer:(__bridge id<MTLBuffer>)dst destinationOffset:dstOffset size:size];
+    }
+}
+
+MM_EXPORT void mm_copy_buffer_to_texture(void *p, void *buf, uint64_t offset, uint64_t bytesPerRow, uint64_t bytesPerImage,
+                                         void *tex, int slice, int mip, int x, int y, int w, int h) {
+    if (w <= 0 || h <= 0) return;
+    @autoreleasepool {
+        [mm_blit(CTX(p)) copyFromBuffer:(__bridge id<MTLBuffer>)buf sourceOffset:offset sourceBytesPerRow:bytesPerRow
+                      sourceBytesPerImage:bytesPerImage sourceSize:MTLSizeMake((NSUInteger)w, (NSUInteger)h, 1)
+                                toTexture:(__bridge id<MTLTexture>)tex destinationSlice:(NSUInteger)slice
+                         destinationLevel:(NSUInteger)mip destinationOrigin:MTLOriginMake((NSUInteger)x, (NSUInteger)y, 0)];
+    }
+}
+
+MM_EXPORT void mm_copy_texture_to_buffer(void *p, void *tex, int slice, int mip, int x, int y, int w, int h,
+                                         void *buf, uint64_t offset, uint64_t bytesPerRow, uint64_t bytesPerImage) {
+    if (w <= 0 || h <= 0) return;
+    @autoreleasepool {
+        [mm_blit(CTX(p)) copyFromTexture:(__bridge id<MTLTexture>)tex sourceSlice:(NSUInteger)slice sourceLevel:(NSUInteger)mip
+                            sourceOrigin:MTLOriginMake((NSUInteger)x, (NSUInteger)y, 0) sourceSize:MTLSizeMake((NSUInteger)w, (NSUInteger)h, 1)
+                                toBuffer:(__bridge id<MTLBuffer>)buf destinationOffset:offset
+                  destinationBytesPerRow:bytesPerRow destinationBytesPerImage:bytesPerImage];
+    }
+}
+
+MM_EXPORT void mm_copy_texture_to_texture(void *p, void *src, void *dst, int mip, int srcX, int srcY, int dstX, int dstY, int w, int h) {
+    if (w <= 0 || h <= 0) return;
+    @autoreleasepool {
+        [mm_blit(CTX(p)) copyFromTexture:(__bridge id<MTLTexture>)src sourceSlice:0 sourceLevel:(NSUInteger)mip
+                            sourceOrigin:MTLOriginMake((NSUInteger)srcX, (NSUInteger)srcY, 0) sourceSize:MTLSizeMake((NSUInteger)w, (NSUInteger)h, 1)
+                               toTexture:(__bridge id<MTLTexture>)dst destinationSlice:0 destinationLevel:(NSUInteger)mip
+                       destinationOrigin:MTLOriginMake((NSUInteger)dstX, (NSUInteger)dstY, 0)];
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Clears
+// ---------------------------------------------------------------------------------------------------------------------
+
+static BOOL mm_is_depth_format(MTLPixelFormat f) {
+    return f == MTLPixelFormatDepth32Float || f == MTLPixelFormatDepth16Unorm || f == MTLPixelFormatDepth32Float_Stencil8 ||
+           f == MTLPixelFormatStencil8;
+}
+
+static NSUInteger mm_slices(id<MTLTexture> t) {
+    return t.textureType == MTLTextureTypeCube ? 6 : MAX(t.arrayLength, (NSUInteger)1);
+}
+
+/** Clears every mip level and slice of a color texture. */
+MM_EXPORT void mm_clear_color_texture(void *p, void *texPtr, float r, float g, float b, float a) {
+    @autoreleasepool {
+        MMContext *ctx = CTX(p);
+        mm_end_encoders(ctx);
+        id<MTLTexture> tex = (__bridge id<MTLTexture>)texPtr;
+        for (NSUInteger level = 0; level < tex.mipmapLevelCount; level++) {
+            for (NSUInteger slice = 0; slice < mm_slices(tex); slice++) {
+                MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+                rp.colorAttachments[0].texture = tex;
+                rp.colorAttachments[0].level = level;
+                rp.colorAttachments[0].slice = slice;
+                rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+                rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+                rp.colorAttachments[0].clearColor = MTLClearColorMake(r, g, b, a);
+                id<MTLRenderCommandEncoder> enc = [mm_cmd(ctx) renderCommandEncoderWithDescriptor:rp];
+                enc.label = @"MineMetal clear color";
+                [enc endEncoding];
+            }
+        }
+    }
+}
+
+MM_EXPORT void mm_clear_depth_texture(void *p, void *texPtr, double depth) {
+    @autoreleasepool {
+        MMContext *ctx = CTX(p);
+        mm_end_encoders(ctx);
+        id<MTLTexture> tex = (__bridge id<MTLTexture>)texPtr;
+        BOOL hasStencil = tex.pixelFormat == MTLPixelFormatDepth32Float_Stencil8;
+        for (NSUInteger level = 0; level < tex.mipmapLevelCount; level++) {
+            for (NSUInteger slice = 0; slice < mm_slices(tex); slice++) {
+                MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+                rp.depthAttachment.texture = tex;
+                rp.depthAttachment.level = level;
+                rp.depthAttachment.slice = slice;
+                rp.depthAttachment.loadAction = MTLLoadActionClear;
+                rp.depthAttachment.storeAction = MTLStoreActionStore;
+                rp.depthAttachment.clearDepth = depth;
+                if (hasStencil) {
+                    rp.stencilAttachment.texture = tex;
+                    rp.stencilAttachment.level = level;
+                    rp.stencilAttachment.slice = slice;
+                    rp.stencilAttachment.loadAction = MTLLoadActionClear;
+                    rp.stencilAttachment.storeAction = MTLStoreActionStore;
+                }
+                id<MTLRenderCommandEncoder> enc = [mm_cmd(ctx) renderCommandEncoderWithDescriptor:rp];
+                enc.label = @"MineMetal clear depth";
+                [enc endEncoding];
+            }
+        }
+    }
+}
+
+static id<MTLRenderPipelineState> mm_helper_pipeline(MMContext *ctx, NSString *vs, NSString *fs, MTLPixelFormat color,
+                                                     MTLPixelFormat depth, BOOL writeColor) {
+    NSString *key = [NSString stringWithFormat:@"%@/%@/%lu/%lu/%d", vs, fs, (unsigned long)color, (unsigned long)depth, writeColor];
+    id<MTLRenderPipelineState> pso = ctx.helperPipelines[key];
+    if (pso != nil) return pso;
+    MTLRenderPipelineDescriptor *d = [[MTLRenderPipelineDescriptor alloc] init];
+    d.label = key;
+    d.vertexFunction = [ctx.helperLibrary newFunctionWithName:vs];
+    d.fragmentFunction = [ctx.helperLibrary newFunctionWithName:fs];
+    d.colorAttachments[0].pixelFormat = color;
+    d.colorAttachments[0].writeMask = writeColor ? MTLColorWriteMaskAll : MTLColorWriteMaskNone;
+    d.depthAttachmentPixelFormat = depth;
+    NSError *error = nil;
+    pso = [ctx.device newRenderPipelineStateWithDescriptor:d error:&error];
+    if (pso == nil) {
+        NSLog(@"[MineMetal] helper pipeline %@ failed: %@", key, error);
+        return nil;
+    }
+    ctx.helperPipelines[key] = pso;
+    return pso;
+}
+
+/** Clears a rectangle (framebuffer coordinates, top-left origin) of a color + depth target pair at one mip level. */
+MM_EXPORT void mm_clear_region(void *p, void *colorTex, void *depthTex, int mip, float r, float g, float b, float a, double depth,
+                               int x, int y, int w, int h) {
+    @autoreleasepool {
+        MMContext *ctx = CTX(p);
+        mm_end_encoders(ctx);
+        id<MTLTexture> color = (__bridge id<MTLTexture>)colorTex;
+        id<MTLTexture> depthT = (__bridge id<MTLTexture>)depthTex;
+        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        rp.colorAttachments[0].texture = color;
+        rp.colorAttachments[0].level = (NSUInteger)mip;
+        rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
+        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        if (depthT != nil) {
+            rp.depthAttachment.texture = depthT;
+            rp.depthAttachment.level = (NSUInteger)mip;
+            rp.depthAttachment.loadAction = MTLLoadActionLoad;
+            rp.depthAttachment.storeAction = MTLStoreActionStore;
+        }
+        NSUInteger tw = MAX(color.width >> mip, (NSUInteger)1), th = MAX(color.height >> mip, (NSUInteger)1);
+        int x0 = MAX(x, 0), y0 = MAX(y, 0);
+        int x1 = MIN(x + w, (int)tw), y1 = MIN(y + h, (int)th);
+        if (x1 <= x0 || y1 <= y0) return;
+        id<MTLRenderPipelineState> pso = mm_helper_pipeline(ctx, @"mm_clear_vs", @"mm_clear_fs", color.pixelFormat,
+                                                            depthT != nil ? depthT.pixelFormat : MTLPixelFormatInvalid, YES);
+        if (pso == nil) return;
+        id<MTLRenderCommandEncoder> enc = [mm_cmd(ctx) renderCommandEncoderWithDescriptor:rp];
+        enc.label = @"MineMetal clear region";
+        [enc setRenderPipelineState:pso];
+        [enc setDepthStencilState:depthT != nil ? ctx.depthAlwaysWrite : ctx.depthDisabled];
+        [enc setScissorRect:(MTLScissorRect){(NSUInteger)x0, (NSUInteger)y0, (NSUInteger)(x1 - x0), (NSUInteger)(y1 - y0)}];
+        float d = (float)depth;
+        float c[4] = {r, g, b, a};
+        [enc setVertexBytes:&d length:sizeof(d) atIndex:0];
+        [enc setFragmentBytes:c length:sizeof(c) atIndex:0];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+        [enc endEncoding];
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Render passes
+// ---------------------------------------------------------------------------------------------------------------------
+
+/**
+ * Begins a render pass.
+ * colorViews: array of `count` texture pointers (NULL = unused slot).
+ * clearMask: bit i set = clear color attachment i with clearColors[i*4..i*4+3]; bit 31 = clear depth.
+ */
+MM_EXPORT int mm_pass_begin(void *p, void **colorViews, int count, int clearMask, const float *clearColors,
+                            void *depthView, double clearDepth, int ax, int ay, int aw, int ah, const char *label) {
+    @autoreleasepool {
+        MMContext *ctx = CTX(p);
+        mm_end_encoders(ctx);
+        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        NSUInteger width = 0, height = 0;
+        for (int i = 0; i < count; i++) {
+            if (colorViews[i] == NULL) continue;
+            id<MTLTexture> t = (__bridge id<MTLTexture>)colorViews[i];
+            rp.colorAttachments[i].texture = t;
+            rp.colorAttachments[i].storeAction = MTLStoreActionStore;
+            if (clearMask & (1 << i)) {
+                rp.colorAttachments[i].loadAction = MTLLoadActionClear;
+                rp.colorAttachments[i].clearColor =
+                    MTLClearColorMake(clearColors[i * 4], clearColors[i * 4 + 1], clearColors[i * 4 + 2], clearColors[i * 4 + 3]);
+            } else {
+                rp.colorAttachments[i].loadAction = MTLLoadActionLoad;
+            }
+            width = t.width;
+            height = t.height;
+        }
+        if (depthView != NULL) {
+            id<MTLTexture> t = (__bridge id<MTLTexture>)depthView;
+            rp.depthAttachment.texture = t;
+            rp.depthAttachment.storeAction = MTLStoreActionStore;
+            if (clearMask & (1 << 31)) {
+                rp.depthAttachment.loadAction = MTLLoadActionClear;
+                rp.depthAttachment.clearDepth = clearDepth;
+            } else {
+                rp.depthAttachment.loadAction = MTLLoadActionLoad;
+            }
+            if (t.pixelFormat == MTLPixelFormatDepth32Float_Stencil8) {
+                rp.stencilAttachment.texture = t;
+                rp.stencilAttachment.loadAction = MTLLoadActionLoad;
+                rp.stencilAttachment.storeAction = MTLStoreActionStore;
+            }
+            if (width == 0) { width = t.width; height = t.height; }
+        }
+        if (width == 0 || height == 0) return 0;
+        id<MTLRenderCommandEncoder> enc = [mm_cmd(ctx) renderCommandEncoderWithDescriptor:rp];
+        if (enc == nil) return 0;
+        if (label != NULL) enc.label = [NSString stringWithUTF8String:label];
+        ctx.render = enc;
+        ctx.pipeline = nil;
+        mm_reset_bound_state(ctx);
+        ctx.passHasDepth = depthView != NULL;
+        ctx.passWidth = width;
+        ctx.passHeight = height;
+        [enc setViewport:(MTLViewport){0.0, 0.0, (double)width, (double)height, 0.0, 1.0}];
+        int x0 = MAX(ax, 0), y0 = MAX(ay, 0);
+        int x1 = MIN(ax + aw, (int)width), y1 = MIN(ay + ah, (int)height);
+        if (x1 < x0) x1 = x0;
+        if (y1 < y0) y1 = y0;
+        [enc setScissorRect:(MTLScissorRect){(NSUInteger)x0, (NSUInteger)y0, (NSUInteger)(x1 - x0), (NSUInteger)(y1 - y0)}];
+        ctx->scissor[0] = x0; ctx->scissor[1] = y0; ctx->scissor[2] = x1 - x0; ctx->scissor[3] = y1 - y0;
+        return 1;
+    }
+}
+
+MM_EXPORT void mm_pass_end(void *p) {
+    MMContext *ctx = CTX(p);
+    if (ctx.render != nil) {
+        [ctx.render endEncoding];
+        ctx.render = nil;
+    }
+    ctx.pipeline = nil;
+    ctx.indexBuffer = nil;
+}
+
+MM_EXPORT void mm_pass_push_debug(void *p, const char *label) {
+    @autoreleasepool {
+        MMContext *ctx = CTX(p);
+        if (ctx.render != nil && label != NULL) [ctx.render pushDebugGroup:[NSString stringWithUTF8String:label]];
+    }
+}
+
+MM_EXPORT void mm_pass_pop_debug(void *p) {
+    MMContext *ctx = CTX(p);
+    if (ctx.render != nil) [ctx.render popDebugGroup];
+}
+
+MM_EXPORT void mm_pass_set_scissor(void *p, int x, int y, int w, int h) {
+    MMContext *ctx = CTX(p);
+    if (ctx.render == nil) return;
+    int x0 = MAX(x, 0), y0 = MAX(y, 0);
+    int x1 = MIN(x + w, (int)ctx.passWidth), y1 = MIN(y + h, (int)ctx.passHeight);
+    if (x1 < x0) x1 = x0;
+    if (y1 < y0) y1 = y0;
+    if (ctx->scissor[0] == x0 && ctx->scissor[1] == y0 && ctx->scissor[2] == x1 - x0 && ctx->scissor[3] == y1 - y0) return;
+    ctx->scissor[0] = x0; ctx->scissor[1] = y0; ctx->scissor[2] = x1 - x0; ctx->scissor[3] = y1 - y0;
+    [ctx.render setScissorRect:(MTLScissorRect){(NSUInteger)x0, (NSUInteger)y0, (NSUInteger)(x1 - x0), (NSUInteger)(y1 - y0)}];
+}
+
+static id<MTLRenderPipelineState> mm_pipeline_variant(MMContext *ctx, MMPipeline *pl, BOOL depth) {
+    id<MTLRenderPipelineState> pso = depth ? pl.withDepth : pl.withoutDepth;
+    if (pso != nil) return pso;
+    MTLRenderPipelineDescriptor *d = [pl.descriptor copy];
+    d.depthAttachmentPixelFormat = depth ? MTLPixelFormatDepth32Float : MTLPixelFormatInvalid;
+    NSError *error = nil;
+    int64_t t0 = mm_now_ns();
+    pso = [ctx.device newRenderPipelineStateWithDescriptor:d error:&error];
+    NSLog(@"[MineMetal] compiled %s-depth variant of %@ on the render thread in %.1f ms", depth ? "with" : "without", pl.name,
+          (mm_now_ns() - t0) / 1e6);
+    if (pso == nil) {
+        NSLog(@"[MineMetal] pipeline %@ (depth=%d) failed: %@", pl.name, depth, error);
+        return nil;
+    }
+    if (depth) pl.withDepth = pso; else pl.withoutDepth = pso;
+    return pso;
+}
+
+/** Returns 0 when the pipeline cannot be used in this pass (draws will be skipped). */
+MM_EXPORT int mm_pass_set_pipeline(void *p, void *pipelinePtr) {
+    @autoreleasepool {
+        MMContext *ctx = CTX(p);
+        if (ctx.render == nil) return 0;
+        MMPipeline *pl = (__bridge MMPipeline *)pipelinePtr;
+        if (ctx.pipeline == pl) return 1;
+        id<MTLRenderPipelineState> pso = mm_pipeline_variant(ctx, pl, ctx.passHasDepth);
+        if (pso == nil) { ctx.pipeline = nil; return 0; }
+        id<MTLRenderCommandEncoder> enc = ctx.render;
+        [enc setRenderPipelineState:pso];
+        id<MTLDepthStencilState> dss = (ctx.passHasDepth && pl.depthState != nil) ? pl.depthState : ctx.depthDisabled;
+        void *dssRaw = (__bridge void *)dss;
+        // Metal's default depth state is "always, no write", identical to depthDisabled: skip the call in that case.
+        if (ctx->boundDepthState != dssRaw && !(ctx->boundDepthState == NULL && dss == ctx.depthDisabled)) {
+            [enc setDepthStencilState:dss];
+        }
+        ctx->boundDepthState = dssRaw;
+        if (ctx->boundCull != (int)pl.cullMode && !(ctx->boundCull == -1 && pl.cullMode == MTLCullModeNone)) {
+            [enc setCullMode:pl.cullMode];
+        }
+        ctx->boundCull = (int)pl.cullMode;
+        if (ctx->boundWinding != (int)pl.winding && !(ctx->boundWinding == -1 && pl.winding == MTLWindingClockwise)) {
+            [enc setFrontFacingWinding:pl.winding];
+        }
+        ctx->boundWinding = (int)pl.winding;
+        if (ctx->boundFill != (int)pl.fillMode && !(ctx->boundFill == -1 && pl.fillMode == MTLTriangleFillModeFill)) {
+            [enc setTriangleFillMode:pl.fillMode];
+        }
+        ctx->boundFill = (int)pl.fillMode;
+        BOOL biasDefault = isnan(ctx->boundBias[0]) && pl.depthBiasConstant == 0.0f && pl.depthBiasSlope == 0.0f;
+        if (!biasDefault && (ctx->boundBias[0] != pl.depthBiasConstant || ctx->boundBias[1] != pl.depthBiasSlope)) {
+            [enc setDepthBias:pl.depthBiasConstant slopeScale:pl.depthBiasSlope clamp:0.0f];
+        }
+        ctx->boundBias[0] = pl.depthBiasConstant;
+        ctx->boundBias[1] = pl.depthBiasSlope;
+        ctx.pipeline = pl;
+        return 1;
+    }
+}
+
+static inline void mm_bind_buffer(MMContext *ctx, int stage, id<MTLBuffer> b, void *raw, uint64_t offset, int index) {
+    if (index < 0 || index >= 31) return;
+    if (ctx->boundBuffer[stage][index] == raw) {
+        if (ctx->boundOffset[stage][index] == offset) return;
+        if (stage == 0) [ctx.render setVertexBufferOffset:offset atIndex:(NSUInteger)index];
+        else [ctx.render setFragmentBufferOffset:offset atIndex:(NSUInteger)index];
+    } else {
+        if (stage == 0) [ctx.render setVertexBuffer:b offset:offset atIndex:(NSUInteger)index];
+        else [ctx.render setFragmentBuffer:b offset:offset atIndex:(NSUInteger)index];
+        ctx->boundBuffer[stage][index] = raw;
+    }
+    ctx->boundOffset[stage][index] = offset;
+}
+
+MM_EXPORT void mm_pass_set_vertex_buffer(void *p, void *buf, uint64_t offset, int index) {
+    MMContext *ctx = CTX(p);
+    if (ctx.render == nil) return;
+    mm_bind_buffer(ctx, 0, (__bridge id<MTLBuffer>)buf, buf, offset, index);
+}
+
+MM_EXPORT void mm_pass_set_buffer(void *p, int stages, void *buf, uint64_t offset, int index) {
+    MMContext *ctx = CTX(p);
+    if (ctx.render == nil) return;
+    id<MTLBuffer> b = (__bridge id<MTLBuffer>)buf;
+    if (stages & MM_STAGE_VERTEX) mm_bind_buffer(ctx, 0, b, buf, offset, index);
+    if (stages & MM_STAGE_FRAGMENT) mm_bind_buffer(ctx, 1, b, buf, offset, index);
+}
+
+MM_EXPORT void mm_pass_set_bytes(void *p, int stages, const void *data, uint64_t length, int index) {
+    MMContext *ctx = CTX(p);
+    if (ctx.render == nil || length == 0) return;
+    if (index >= 0 && index < 31) { ctx->boundBuffer[0][index] = NULL; ctx->boundBuffer[1][index] = NULL; }
+    if (stages & MM_STAGE_VERTEX) [ctx.render setVertexBytes:data length:length atIndex:(NSUInteger)index];
+    if (stages & MM_STAGE_FRAGMENT) [ctx.render setFragmentBytes:data length:length atIndex:(NSUInteger)index];
+}
+
+static inline void mm_bind_texture(MMContext *ctx, int stage, id<MTLTexture> t, void *raw, int index) {
+    if (index < 0 || index >= 32 || ctx->boundTexture[stage][index] == raw) return;
+    ctx->boundTexture[stage][index] = raw;
+    if (stage == 0) [ctx.render setVertexTexture:t atIndex:(NSUInteger)index];
+    else [ctx.render setFragmentTexture:t atIndex:(NSUInteger)index];
+}
+
+MM_EXPORT void mm_pass_set_texture(void *p, int stages, void *tex, int index) {
+    MMContext *ctx = CTX(p);
+    if (ctx.render == nil) return;
+    id<MTLTexture> t = (__bridge id<MTLTexture>)tex;
+    if (stages & MM_STAGE_VERTEX) mm_bind_texture(ctx, 0, t, tex, index);
+    if (stages & MM_STAGE_FRAGMENT) mm_bind_texture(ctx, 1, t, tex, index);
+}
+
+MM_EXPORT void mm_pass_set_sampler(void *p, int stages, void *sampler, int index) {
+    MMContext *ctx = CTX(p);
+    if (ctx.render == nil || index < 0 || index >= 16) return;
+    id<MTLSamplerState> s = (__bridge id<MTLSamplerState>)sampler;
+    if ((stages & MM_STAGE_VERTEX) && ctx->boundSampler[0][index] != sampler) {
+        ctx->boundSampler[0][index] = sampler;
+        [ctx.render setVertexSamplerState:s atIndex:(NSUInteger)index];
+    }
+    if ((stages & MM_STAGE_FRAGMENT) && ctx->boundSampler[1][index] != sampler) {
+        ctx->boundSampler[1][index] = sampler;
+        [ctx.render setFragmentSamplerState:s atIndex:(NSUInteger)index];
+    }
+}
+
+/** Binds a typed view over a buffer range (GLSL samplerBuffer / MSL texture_buffer). */
+MM_EXPORT void mm_pass_set_texel_buffer(void *p, int stages, void *buf, uint64_t offset, uint64_t length, int64_t pixelFormat,
+                                        int bytesPerTexel, int index) {
+    @autoreleasepool {
+        MMContext *ctx = CTX(p);
+        if (ctx.render == nil || bytesPerTexel <= 0) return;
+        id<MTLBuffer> b = (__bridge id<MTLBuffer>)buf;
+        MTLPixelFormat fmt = (MTLPixelFormat)pixelFormat;
+        NSUInteger align = [ctx.device minimumTextureBufferAlignmentForPixelFormat:fmt];
+        if (align > 1 && (offset % align) != 0) {
+            static int warned = 0;
+            if (warned++ < 5) NSLog(@"[MineMetal] texel buffer offset %llu not aligned to %lu", offset, (unsigned long)align);
+            return;
+        }
+        NSUInteger texels = (NSUInteger)(length / (uint64_t)bytesPerTexel);
+        if (texels == 0) return;
+        MTLTextureDescriptor *d = [MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:fmt
+                                                                                          width:texels
+                                                                                resourceOptions:b.resourceOptions
+                                                                                          usage:MTLTextureUsageShaderRead];
+        NSUInteger bytesPerRow = texels * (NSUInteger)bytesPerTexel;
+        NSUInteger rowAlign = [ctx.device minimumLinearTextureAlignmentForPixelFormat:fmt];
+        if (rowAlign > 1) bytesPerRow = (bytesPerRow + rowAlign - 1) / rowAlign * rowAlign;
+        if (offset + bytesPerRow > b.length) {
+            // Not enough room for the padded row: shrink the view to what fits.
+            NSUInteger room = (NSUInteger)(b.length - offset);
+            bytesPerRow = room / rowAlign * rowAlign;
+            texels = MIN(texels, bytesPerRow / (NSUInteger)bytesPerTexel);
+            if (texels == 0) return;
+            d.width = texels;
+        }
+        id<MTLTexture> t = [b newTextureWithDescriptor:d offset:offset bytesPerRow:bytesPerRow];
+        if (t == nil) return;
+        void *raw = (__bridge void *)t;  // the encoder retains it for the rest of the pass
+        if (stages & MM_STAGE_VERTEX) mm_bind_texture(ctx, 0, t, raw, index);
+        if (stages & MM_STAGE_FRAGMENT) mm_bind_texture(ctx, 1, t, raw, index);
+    }
+}
+
+MM_EXPORT void mm_pass_set_index_buffer(void *p, void *buf, int is32) {
+    MMContext *ctx = CTX(p);
+    ctx.indexBuffer = (__bridge id<MTLBuffer>)buf;
+    ctx.indexType = is32 ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16;
+    ctx.indexSize = is32 ? 4 : 2;
+}
+
+static inline BOOL mm_can_draw(MMContext *ctx) {
+    return ctx.render != nil && ctx.pipeline != nil && !ctx.pipeline.skipDraws;
+}
+
+MM_EXPORT void mm_pass_draw(void *p, int vertexCount, int instanceCount, int firstVertex, int firstInstance) {
+    MMContext *ctx = CTX(p);
+    if (!mm_can_draw(ctx) || vertexCount <= 0 || instanceCount <= 0) return;
+    [ctx.render drawPrimitives:ctx.pipeline.primitiveType vertexStart:(NSUInteger)firstVertex vertexCount:(NSUInteger)vertexCount
+                 instanceCount:(NSUInteger)instanceCount baseInstance:(NSUInteger)firstInstance];
+}
+
+MM_EXPORT void mm_pass_draw_indexed(void *p, int indexCount, int instanceCount, int firstIndex, int baseVertex, int firstInstance) {
+    MMContext *ctx = CTX(p);
+    if (!mm_can_draw(ctx) || ctx.indexBuffer == nil || indexCount <= 0 || instanceCount <= 0) return;
+    [ctx.render drawIndexedPrimitives:ctx.pipeline.primitiveType indexCount:(NSUInteger)indexCount indexType:ctx.indexType
+                          indexBuffer:ctx.indexBuffer indexBufferOffset:(NSUInteger)firstIndex * ctx.indexSize
+                        instanceCount:(NSUInteger)instanceCount baseVertex:baseVertex baseInstance:(NSUInteger)firstInstance];
+}
+
+/** params: drawCount pairs of (firstVertex, vertexCount) — VkMultiDrawInfoEXT layout. */
+MM_EXPORT void mm_pass_multi_draw(void *p, const int32_t *params, int instanceCount, int firstInstance, int drawCount) {
+    MMContext *ctx = CTX(p);
+    if (!mm_can_draw(ctx) || instanceCount <= 0) return;
+    for (int i = 0; i < drawCount; i++) {
+        int32_t first = params[i * 2], count = params[i * 2 + 1];
+        if (count <= 0) continue;
+        [ctx.render drawPrimitives:ctx.pipeline.primitiveType vertexStart:(NSUInteger)first vertexCount:(NSUInteger)count
+                     instanceCount:(NSUInteger)instanceCount baseInstance:(NSUInteger)firstInstance];
+    }
+}
+
+/** params: drawCount triples of (firstIndex, indexCount, vertexOffset) — VkMultiDrawIndexedInfoEXT layout. */
+MM_EXPORT void mm_pass_multi_draw_indexed(void *p, const int32_t *params, int instanceCount, int firstInstance, int drawCount) {
+    MMContext *ctx = CTX(p);
+    if (!mm_can_draw(ctx) || ctx.indexBuffer == nil || instanceCount <= 0) return;
+    for (int i = 0; i < drawCount; i++) {
+        int32_t firstIndex = params[i * 3], indexCount = params[i * 3 + 1], vertexOffset = params[i * 3 + 2];
+        if (indexCount <= 0) continue;
+        [ctx.render drawIndexedPrimitives:ctx.pipeline.primitiveType indexCount:(NSUInteger)indexCount indexType:ctx.indexType
+                              indexBuffer:ctx.indexBuffer indexBufferOffset:(NSUInteger)firstIndex * ctx.indexSize
+                            instanceCount:(NSUInteger)instanceCount baseVertex:vertexOffset baseInstance:(NSUInteger)firstInstance];
+    }
+}
+
+/** VkDrawIndirectCommand == MTLDrawPrimitivesIndirectArguments (16 bytes). */
+MM_EXPORT void mm_pass_draw_indirect(void *p, void *buf, uint64_t offset, int drawCount) {
+    MMContext *ctx = CTX(p);
+    if (!mm_can_draw(ctx)) return;
+    id<MTLBuffer> b = (__bridge id<MTLBuffer>)buf;
+    for (int i = 0; i < drawCount; i++) {
+        [ctx.render drawPrimitives:ctx.pipeline.primitiveType indirectBuffer:b indirectBufferOffset:offset + (uint64_t)i * 16];
+    }
+}
+
+/** VkDrawIndexedIndirectCommand == MTLDrawIndexedPrimitivesIndirectArguments (20 bytes). */
+MM_EXPORT void mm_pass_draw_indexed_indirect(void *p, void *buf, uint64_t offset, int drawCount) {
+    MMContext *ctx = CTX(p);
+    if (!mm_can_draw(ctx) || ctx.indexBuffer == nil) return;
+    id<MTLBuffer> b = (__bridge id<MTLBuffer>)buf;
+    for (int i = 0; i < drawCount; i++) {
+        [ctx.render drawIndexedPrimitives:ctx.pipeline.primitiveType indexType:ctx.indexType indexBuffer:ctx.indexBuffer
+                        indexBufferOffset:0 indirectBuffer:b indirectBufferOffset:offset + (uint64_t)i * 20];
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Pipelines
+// ---------------------------------------------------------------------------------------------------------------------
+
+static int g_fastMath = 1;
+
+/** 1 = fast math (default), 0 = IEEE-safe math. Takes effect for pipelines compiled afterwards. */
+MM_EXPORT void mm_set_fast_math(int enabled) { g_fastMath = enabled; }
+
+static id<MTLFunction> mm_compile_function(MMContext *ctx, const char *src, const char *entry, NSString *what, char *err, int errLen) {
+    NSError *error = nil;
+    MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
+    options.languageVersion = MTLLanguageVersion2_4;
+    // Multi-pass rendering (e.g. translucency over terrain) relies on bit-identical positions between pipelines.
+    options.preserveInvariance = YES;
+    if (@available(macOS 15.0, *)) {
+        options.mathMode = g_fastMath ? MTLMathModeFast : MTLMathModeSafe;
+    } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        options.fastMathEnabled = g_fastMath ? YES : NO;
+#pragma clang diagnostic pop
+    }
+    id<MTLLibrary> lib = [ctx.device newLibraryWithSource:[NSString stringWithUTF8String:src] options:options error:&error];
+    if (lib == nil) {
+        mm_copy_error(err, errLen, [NSString stringWithFormat:@"%@ shader: %@", what, error.localizedDescription]);
+        return nil;
+    }
+    id<MTLFunction> fn = [lib newFunctionWithName:[NSString stringWithUTF8String:entry]];
+    if (fn == nil) {
+        mm_copy_error(err, errLen, [NSString stringWithFormat:@"%@ shader: entry point %s not found", what, entry]);
+    }
+    return fn;
+}
+
+/**
+ * Creates a pipeline.
+ *  layouts:  layoutCount * {metalBufferIndex, stride, stepRate}
+ *  attribs:  attribCount * {location, metalBufferIndex, offset, mtlVertexFormat}
+ *  targets:  targetCount * {mtlPixelFormat (0 = unused), writeMask(RGBA bits 1,2,4,8), blendEnabled,
+ *                           srcRGB, dstRGB, opRGB, srcA, dstA, opA}
+ *  raster:   {topology(PrimitiveTopology ordinal), cull, wireframe, frontFaceCCW, hasDepthState, depthCompare, depthWrite}
+ *  bias:     {constant, slope}
+ */
+MM_EXPORT void *mm_pipeline_create(void *p, const char *name, const char *vsSrc, const char *vsEntry, const char *fsSrc,
+                                   const char *fsEntry, const int32_t *layouts, int layoutCount, const int32_t *attribs,
+                                   int attribCount, const int64_t *targets, int targetCount, const int32_t *raster,
+                                   const float *bias, int eagerDepthVariant, char *err, int errLen) {
+    @autoreleasepool {
+        MMContext *ctx = CTX(p);
+        NSString *nm = [NSString stringWithUTF8String:name];
+        MTLRenderPipelineDescriptor *d = [[MTLRenderPipelineDescriptor alloc] init];
+        d.label = nm;
+        d.vertexFunction = mm_compile_function(ctx, vsSrc, vsEntry, @"vertex", err, errLen);
+        if (d.vertexFunction == nil) return NULL;
+        d.fragmentFunction = mm_compile_function(ctx, fsSrc, fsEntry, @"fragment", err, errLen);
+        if (d.fragmentFunction == nil) return NULL;
+
+        if (attribCount > 0) {
+            MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
+            for (int i = 0; i < layoutCount; i++) {
+                int idx = layouts[i * 3], stride = layouts[i * 3 + 1], step = layouts[i * 3 + 2];
+                vd.layouts[idx].stride = (NSUInteger)stride;
+                if (step > 0) {
+                    vd.layouts[idx].stepFunction = MTLVertexStepFunctionPerInstance;
+                    vd.layouts[idx].stepRate = (NSUInteger)step;
+                } else {
+                    vd.layouts[idx].stepFunction = MTLVertexStepFunctionPerVertex;
+                    vd.layouts[idx].stepRate = 1;
+                }
+            }
+            for (int i = 0; i < attribCount; i++) {
+                int loc = attribs[i * 4];
+                vd.attributes[loc].bufferIndex = (NSUInteger)attribs[i * 4 + 1];
+                vd.attributes[loc].offset = (NSUInteger)attribs[i * 4 + 2];
+                vd.attributes[loc].format = (MTLVertexFormat)attribs[i * 4 + 3];
+            }
+            d.vertexDescriptor = vd;
+        }
+
+        for (int i = 0; i < targetCount; i++) {
+            const int64_t *t = &targets[i * 9];
+            MTLRenderPipelineColorAttachmentDescriptor *ca = d.colorAttachments[i];
+            ca.pixelFormat = (MTLPixelFormat)t[0];
+            if (t[0] == 0) continue;
+            MTLColorWriteMask mask = MTLColorWriteMaskNone;
+            if (t[1] & 1) mask |= MTLColorWriteMaskRed;
+            if (t[1] & 2) mask |= MTLColorWriteMaskGreen;
+            if (t[1] & 4) mask |= MTLColorWriteMaskBlue;
+            if (t[1] & 8) mask |= MTLColorWriteMaskAlpha;
+            ca.writeMask = mask;
+            ca.blendingEnabled = t[2] != 0;
+            if (t[2]) {
+                ca.sourceRGBBlendFactor = (MTLBlendFactor)t[3];
+                ca.destinationRGBBlendFactor = (MTLBlendFactor)t[4];
+                ca.rgbBlendOperation = (MTLBlendOperation)t[5];
+                ca.sourceAlphaBlendFactor = (MTLBlendFactor)t[6];
+                ca.destinationAlphaBlendFactor = (MTLBlendFactor)t[7];
+                ca.alphaBlendOperation = (MTLBlendOperation)t[8];
+            }
+        }
+
+        MMPipeline *pl = [[MMPipeline alloc] init];
+        pl.name = nm;
+        pl.descriptor = d;
+        int topology = raster[0];
+        // PrimitiveTopology: LINES, DEBUG_LINES, DEBUG_LINE_STRIP, POINTS, TRIANGLES, TRIANGLE_STRIP, TRIANGLE_FAN, QUADS
+        switch (topology) {
+            case 1: pl.primitiveType = MTLPrimitiveTypeLine; d.inputPrimitiveTopology = MTLPrimitiveTopologyClassLine; break;
+            case 2: pl.primitiveType = MTLPrimitiveTypeLineStrip; d.inputPrimitiveTopology = MTLPrimitiveTopologyClassLine; break;
+            case 3: pl.primitiveType = MTLPrimitiveTypePoint; d.inputPrimitiveTopology = MTLPrimitiveTopologyClassPoint; break;
+            case 5: pl.primitiveType = MTLPrimitiveTypeTriangleStrip; d.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle; break;
+            case 6: pl.primitiveType = MTLPrimitiveTypeTriangle; pl.skipDraws = YES; break;  // no fans in Metal
+            default: pl.primitiveType = MTLPrimitiveTypeTriangle; d.inputPrimitiveTopology = MTLPrimitiveTopologyClassTriangle; break;
+        }
+        pl.cullMode = raster[1] ? MTLCullModeBack : MTLCullModeNone;
+        pl.fillMode = raster[2] ? MTLTriangleFillModeLines : MTLTriangleFillModeFill;
+        pl.winding = raster[3] ? MTLWindingCounterClockwise : MTLWindingClockwise;
+        if (raster[4]) {
+            MTLDepthStencilDescriptor *dd = [[MTLDepthStencilDescriptor alloc] init];
+            dd.depthCompareFunction = (MTLCompareFunction)raster[5];
+            dd.depthWriteEnabled = raster[6] != 0;
+            pl.depthState = [ctx.device newDepthStencilStateWithDescriptor:dd];
+        }
+        pl.depthBiasConstant = bias[0];
+        pl.depthBiasSlope = bias[1];
+
+        // Compile one variant now so shader/pipeline errors surface at load time, not mid-frame.
+        NSError *error = nil;
+        MTLRenderPipelineDescriptor *eager = [d copy];
+        eager.depthAttachmentPixelFormat = eagerDepthVariant ? MTLPixelFormatDepth32Float : MTLPixelFormatInvalid;
+        id<MTLRenderPipelineState> pso = [ctx.device newRenderPipelineStateWithDescriptor:eager error:&error];
+        if (pso == nil) {
+            mm_copy_error(err, errLen, [NSString stringWithFormat:@"pipeline state: %@", error.localizedDescription]);
+            return NULL;
+        }
+        if (eagerDepthVariant) pl.withDepth = pso; else pl.withoutDepth = pso;
+        return (__bridge_retained void *)pl;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Surface (CAMetalLayer)
+// ---------------------------------------------------------------------------------------------------------------------
+
+@interface MMSurface : NSObject {
+@public
+    _Atomic int drawablesInFlight;   // acquired and not yet presented (or dropped) by the compositor
+    int skippedFrames;
+    // statistics (read by mm_surface_stats)
+    int64_t statPresented;
+    int64_t statSkipped;
+    int64_t statForcedAcquires;
+    int64_t statAcquireNs;
+    int64_t statAcquireMaxNs;
+    // frame pacing (MM_PRESENT_PACED)
+    _Atomic double lastPresentedTime;   // CACurrentMediaTime() timebase, from presented handlers
+    _Atomic double refreshInterval;     // measured display refresh interval (s)
+    double lastBlitTime;
+    double avgFrameTime;
+    double lastTargetVsync;
+    int64_t statPacedSkips;
+}
+@property(nonatomic, strong) CAMetalLayer *layer;
+@property(nonatomic, strong) id<CAMetalDrawable> drawable;
+@property(nonatomic) BOOL vsync;
+@property(nonatomic) int mode;              // MM_PRESENT_*
+@end
+
+@implementation MMSurface
+@end
+
+#define MM_PRESENT_FIFO 0      // VSync on: block for a drawable every frame
+#define MM_PRESENT_PACED 1     // VSync off: render unlimited, present the newest frame once per refresh
+#define MM_PRESENT_IMMEDIATE 2 // VSync off, unpaced: present whenever a drawable is free (old behaviour)
+#define MM_GPU_MARGIN 0.0025   // time from commit to "on glass" budget (GPU work + compositor)
+
+MM_EXPORT void *mm_surface_create(void *p, void *layerPtr) {
+    @autoreleasepool {
+        MMContext *ctx = CTX(p);
+        CAMetalLayer *layer = (__bridge CAMetalLayer *)layerPtr;
+        if (layer == nil) return NULL;
+        layer.device = ctx.device;
+        layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+        layer.framebufferOnly = YES;
+        layer.maximumDrawableCount = 3;
+        // Tag output as sRGB so macOS colour-manages it like the OpenGL path (avoids oversaturation on P3 panels).
+        CGColorSpaceRef srgb = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+        layer.colorspace = srgb;
+        CGColorSpaceRelease(srgb);
+        MMSurface *s = [[MMSurface alloc] init];
+        s.layer = layer;
+        s.vsync = YES;
+        s.mode = MM_PRESENT_FIFO;
+        atomic_store(&s->refreshInterval, 1.0 / 60.0);
+        atomic_store(&s->lastPresentedTime, 0.0);
+        s->avgFrameTime = 1.0 / 60.0;
+        return (__bridge_retained void *)s;
+    }
+}
+
+MM_EXPORT void mm_surface_configure(void *surfacePtr, int width, int height, int mode) {
+    MMSurface *s = (__bridge MMSurface *)surfacePtr;
+    s.layer.drawableSize = CGSizeMake(MAX(width, 1), MAX(height, 1));
+    s.mode = mode;
+    s.vsync = mode == MM_PRESENT_FIFO;
+    // Paced mode presents at most once per refresh, so it can keep display sync on (no tearing) without blocking.
+    s.layer.displaySyncEnabled = mode != MM_PRESENT_IMMEDIATE;
+}
+
+static BOOL mm_surface_take_drawable(MMSurface *s) {
+    int64_t t0 = mm_now_ns();
+    id<CAMetalDrawable> d = [s.layer nextDrawable];
+    int64_t dt = mm_now_ns() - t0;
+    s->statAcquireNs += dt;
+    if (dt > s->statAcquireMaxNs) s->statAcquireMaxNs = dt;
+    if (d == nil) return NO;
+    atomic_fetch_add(&s->drawablesInFlight, 1);
+    __weak MMSurface *weakSurface = s;
+    [d addPresentedHandler:^(id<MTLDrawable> drawable) {
+        MMSurface *strong = weakSurface;
+        if (strong == nil) return;
+        atomic_fetch_sub(&strong->drawablesInFlight, 1);
+        CFTimeInterval t = drawable.presentedTime;
+        if (t > 0.0) {
+            double prev = atomic_load(&strong->lastPresentedTime);
+            double iv = atomic_load(&strong->refreshInterval);
+            double delta = t - prev;
+            // Consecutive refreshes only (skipped refreshes show up as multiples): 4 ms .. 1.5x current estimate.
+            if (prev > 0.0 && delta > 0.004 && delta < iv * 1.5) {
+                atomic_store(&strong->refreshInterval, iv * 0.9 + delta * 0.1);
+            }
+            atomic_store(&strong->lastPresentedTime, t);
+        }
+    }];
+    s.drawable = d;
+    return YES;
+}
+
+/**
+ * VSync on: blocks for the next drawable (classic FIFO pacing).
+ * VSync off: does nothing here; the drawable is taken late, in mm_surface_blit, and only if one is free,
+ * so rendering is never throttled by the compositor (frames that find no free drawable are not shown).
+ * Returns 1 on success.
+ */
+MM_EXPORT int mm_surface_acquire(void *surfacePtr) {
+    @autoreleasepool {
+        MMSurface *s = (__bridge MMSurface *)surfacePtr;
+        if (s.mode != MM_PRESENT_FIFO) return 1;
+        return mm_surface_take_drawable(s) ? 1 : 0;
+    }
+}
+
+/** Copies (1:1, vertically flipped) srcView into a drawable and schedules presentation on the current submit. */
+MM_EXPORT void mm_surface_blit(void *p, void *surfacePtr, void *srcView, int copyWidth, int copyHeight) {
+    @autoreleasepool {
+        MMContext *ctx = CTX(p);
+        MMSurface *s = (__bridge MMSurface *)surfacePtr;
+        if (s.drawable == nil && s.mode == MM_PRESENT_PACED) {
+            double now = CACurrentMediaTime();
+            double dt = now - s->lastBlitTime;
+            s->lastBlitTime = now;
+            if (dt > 0.0 && dt < 0.1) s->avgFrameTime = s->avgFrameTime * 0.9 + dt * 0.1;
+            double lp = atomic_load(&s->lastPresentedTime);
+            double iv = atomic_load(&s->refreshInterval);
+            BOOL present = YES;
+            if (lp > 0.0 && iv > 0.0) {
+                // First refresh this frame could make once its GPU work completes.
+                double k = ceil((now + MM_GPU_MARGIN - lp) / iv);
+                double target = lp + MAX(k, 1.0) * iv;
+                if (fabs(target - s->lastTargetVsync) < iv * 0.5) {
+                    present = NO;            // a frame is already queued for that refresh
+                } else if (now + s->avgFrameTime + MM_GPU_MARGIN < target - 0.0005) {
+                    present = NO;            // the next frame will still make it and is newer
+                } else {
+                    s->lastTargetVsync = target;
+                }
+            }
+            if (present && atomic_load(&s->drawablesInFlight) >= (int)s.layer.maximumDrawableCount - 1) {
+                present = NO;
+            }
+            if (present) {
+                mm_surface_take_drawable(s);
+            } else {
+                s->statPacedSkips++;
+                s->statSkipped++;
+            }
+        } else if (s.drawable == nil && s.mode == MM_PRESENT_IMMEDIATE) {
+            int limit = (int)s.layer.maximumDrawableCount - 1;
+            // Safety valve: if the in-flight counter ever gets stuck, fall back to a blocking acquire.
+            if (atomic_load(&s->drawablesInFlight) < limit || s->skippedFrames > 120) {
+                if (s->skippedFrames > 120) s->statForcedAcquires++;
+                s->skippedFrames = 0;
+                mm_surface_take_drawable(s);
+            } else {
+                s->skippedFrames++;
+                s->statSkipped++;
+            }
+        }
+        if (s.drawable == nil) return;
+        mm_end_encoders(ctx);
+        id<MTLRenderPipelineState> pso = mm_helper_pipeline(ctx, @"mm_present_vs", @"mm_present_fs", s.layer.pixelFormat,
+                                                            MTLPixelFormatInvalid, YES);
+        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        rp.colorAttachments[0].texture = s.drawable.texture;
+        rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+        rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        id<MTLRenderCommandEncoder> enc = [mm_cmd(ctx) renderCommandEncoderWithDescriptor:rp];
+        enc.label = @"MineMetal present";
+        if (pso != nil) {
+            uint32_t size[2] = {(uint32_t)MAX(copyWidth, 0), (uint32_t)MAX(copyHeight, 0)};
+            [enc setRenderPipelineState:pso];
+            [enc setFragmentTexture:(__bridge id<MTLTexture>)srcView atIndex:0];
+            [enc setFragmentBytes:size length:sizeof(size) atIndex:0];
+            [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        }
+        [enc endEncoding];
+        [mm_cmd(ctx) presentDrawable:s.drawable];
+        s->statPresented++;
+        s.drawable = nil;
+    }
+}
+
+/** out: [0]=presented [1]=skipped [2]=forcedBlockingAcquires [3]=acquireNsTotal [4]=acquireNsMax [5]=drawablesInFlight. Resets max. */
+MM_EXPORT void mm_surface_stats(void *surfacePtr, int64_t *out) {
+    MMSurface *s = (__bridge MMSurface *)surfacePtr;
+    out[0] = s->statPresented;
+    out[1] = s->statSkipped;
+    out[2] = s->statForcedAcquires;
+    out[3] = s->statAcquireNs;
+    out[4] = s->statAcquireMaxNs;
+    out[5] = atomic_load(&s->drawablesInFlight);
+    out[6] = (int64_t)(atomic_load(&s->refreshInterval) * 1e6);
+    out[7] = s.mode;
+    s->statAcquireMaxNs = 0;
+}
+
+MM_EXPORT void mm_surface_drop(void *surfacePtr) {
+    MMSurface *s = (__bridge MMSurface *)surfacePtr;
+    s.drawable = nil;
+}

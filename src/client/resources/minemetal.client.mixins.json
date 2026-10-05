@@ -1,0 +1,9 @@
+{
+  "required": true,
+  "package": "dev.minemetal.client.mixin",
+  "compatibilityLevel": "JAVA_25",
+  "client": [
+    "PreferredGraphicsApiMixin"
+  ],
+  "injectors": { "defaultRequire": 1 }
+}

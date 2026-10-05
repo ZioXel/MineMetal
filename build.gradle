@@ -1,0 +1,184 @@
+plugins {
+	id 'net.fabricmc.fabric-loom' version "${loom_version}"
+	id 'maven-publish'
+}
+
+repositories {
+	// Add repositories to retrieve artifacts from in here.
+	// You should only use this when depending on other mods because
+	// Loom adds the essential maven repositories to download Minecraft and libraries from automatically.
+	// See https://docs.gradle.org/current/userguide/declaring_repositories.html
+	// for more information about repositories.
+}
+
+loom {
+	splitEnvironmentSourceSets()
+
+	mods {
+		"minemetal" {
+			sourceSet sourceSets.main
+			sourceSet sourceSets.client
+		}
+	}
+}
+
+dependencies {
+	// To change the versions see the gradle.properties file
+	minecraft "com.mojang:minecraft:${project.minecraft_version}"
+	implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+
+	// Fabric API. This is technically optional, but you probably want it anyway.
+	implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+}
+
+processResources {
+	def version = project.version
+	inputs.property "version", version
+
+	filesMatching("fabric.mod.json") {
+		expand "version": version
+	}
+}
+
+tasks.withType(JavaCompile).configureEach {
+	it.options.release = 25
+}
+
+java {
+	// Loom will automatically attach sourcesJar to a RemapSourcesJar task and to the "build" task
+	// if it is present.
+	// If you remove this line, sources will not be generated.
+	withSourcesJar()
+
+	sourceCompatibility = JavaVersion.VERSION_25
+	targetCompatibility = JavaVersion.VERSION_25
+}
+
+jar {
+	def projectName = project.name
+	inputs.property "projectName", projectName
+
+	from("LICENSE") {
+		rename { "${it}_$projectName"}
+	}
+}
+
+// configure the maven publication
+publishing {
+	publications {
+		create("mavenJava", MavenPublication) {
+			from components.java
+		}
+	}
+
+	// See https://docs.gradle.org/current/userguide/publishing_maven.html for information on how to set up publishing.
+	repositories {
+		// Add repositories to publish to here.
+		// Notice: This block does NOT have the same function as the block in the top level.
+		// The repositories here will be used for publishing your artifact, not for
+		// retrieving dependencies.
+	}
+}
+
+// ---------------------------------------------------------------------------
+// MineMetal additions
+// ---------------------------------------------------------------------------
+
+loom {
+	runs {
+		client {
+			// Panama (FFM) downcalls into libminemetal.dylib
+			vmArg "--enable-native-access=ALL-UNNAMED"
+			// Extra game JVM flags: ./mm.sh run -PmmArgs="-Dminemetal.safeMath=true"
+			// Apple's Metal Performance HUD overlay: ./mm.sh run -PmetalHud
+			if (project.hasProperty('metalHud')) {
+				environmentVariable "MTL_HUD_ENABLED", "1"
+			}
+			// Metal API validation, logged instead of aborting: ./mm.sh run -PmetalValidation
+			if (project.hasProperty('metalValidation')) {
+				environmentVariable "MTL_DEBUG_LAYER", "1"
+				environmentVariable "MTL_DEBUG_LAYER_ERROR_MODE", "nslog"
+				environmentVariable "MTL_DEBUG_LAYER_WARNING_MODE", "nslog"
+				vmArg "-Dminemetal.gpuDebug=true"
+				vmArg "-Dminemetal.labels=true"
+			}
+			// Stage 0 shader-pack test: vanilla OpenGL + Iris/Sodium from run/mods-stage0 (./mm.sh run -PirisTest)
+			if (project.hasProperty('irisTest')) {
+				vmArg "-Dfabric.addMods=" + file('run/mods-stage0').absolutePath
+				programArgs "--graphicsBackend", "opengl"
+			}
+			if (project.hasProperty('mmArgs')) {
+				project.property('mmArgs').toString().split(' ').findAll { !it.isBlank() }.each { vmArg it }
+			}
+		}
+	}
+}
+
+// Native Objective-C bridge (Metal) -> build/native/natives/macos/libminemetal.dylib, packed into the client jar.
+def nativeOutDir = layout.buildDirectory.dir("native")
+tasks.register('compileMetalNative', Exec) {
+	def src = file('native/minemetal.m')
+	def outFile = nativeOutDir.get().file('natives/macos/libminemetal.dylib').asFile
+	inputs.file(src)
+	outputs.file(outFile)
+	onlyIf { System.getProperty('os.name').toLowerCase().contains('mac') }
+	doFirst { outFile.parentFile.mkdirs() }
+	commandLine 'xcrun', 'clang', '-dynamiclib', '-fobjc-arc', '-O2', '-Wall', '-Wno-unused-function',
+		'-arch', 'arm64', '-mmacosx-version-min=14.0',
+		'-framework', 'Metal', '-framework', 'QuartzCore', '-framework', 'CoreGraphics', '-framework', 'Foundation',
+		'-install_name', '@rpath/libminemetal.dylib',
+		'-o', outFile.absolutePath, src.absolutePath
+}
+processClientResources {
+	dependsOn 'compileMetalNative'
+	from(nativeOutDir)
+}
+
+// Copies the full compile classpath into .reference/classpath (used for offline compile checks and API study).
+tasks.register('copyReferenceLibs', Copy) {
+	from { configurations.clientCompileClasspath }
+	into layout.projectDirectory.dir('.reference/classpath')
+}
+
+// Stage 0 test kit: downloads Sodium + Iris for this Minecraft version and the BSL shader pack from Modrinth into
+// run/mods-stage0 and run/shaderpacks, and enables Iris debug output (patched shaders -> run/patched_shaders).
+tasks.register('fetchShaderTestKit') {
+	notCompatibleWithConfigurationCache("downloads at execution time")
+	doLast {
+		def mc = project.property('minecraft_version').toString()
+		def runDir = file('run')
+		def fetch = { String slug, String loader, String gameVersion, File dir ->
+			def q = "loaders=" + URLEncoder.encode("[\"${loader}\"]", 'UTF-8') +
+				(gameVersion ? "&game_versions=" + URLEncoder.encode("[\"${gameVersion}\"]", 'UTF-8') : "")
+			def conn = new URL("https://api.modrinth.com/v2/project/${slug}/version?${q}").openConnection()
+			conn.setRequestProperty('User-Agent', 'MineMetal-dev/0.1 (stage0 test kit)')
+			def versions = new groovy.json.JsonSlurper().parse(conn.inputStream)
+			if (versions.isEmpty()) {
+				throw new GradleException("Modrinth has no ${loader} build of ${slug} for ${gameVersion ?: 'any version'}")
+			}
+			def v = versions[0]
+			def f = v.files.find { it.primary } ?: v.files[0]
+			dir.mkdirs()
+			def out = new File(dir, f.filename)
+			if (!out.exists()) {
+				def dl = new URL(f.url).openConnection()
+				dl.setRequestProperty('User-Agent', 'MineMetal-dev/0.1 (stage0 test kit)')
+				out.withOutputStream { os -> dl.inputStream.withStream { is -> os << is } }
+			}
+			println "  ${slug}: ${v.version_number} -> ${dir.name}/${f.filename}"
+			return f.filename
+		}
+		fetch('sodium', 'fabric', mc, new File(runDir, 'mods-stage0'))
+		fetch('iris', 'fabric', mc, new File(runDir, 'mods-stage0'))
+		def pack = fetch('bsl-shaders', 'iris', null, new File(runDir, 'shaderpacks'))
+		def cfg = new File(runDir, 'config/iris.properties')
+		cfg.parentFile.mkdirs()
+		def props = new Properties()
+		if (cfg.exists()) { cfg.withInputStream { props.load(it) } }
+		props.setProperty('shaderPack', pack)
+		props.setProperty('enableShaders', 'true')
+		props.setProperty('enableDebugOptions', 'true')
+		cfg.withOutputStream { props.store(it, 'Iris config (MineMetal stage 0: debug output on)') }
+		println "  iris.properties: shaderPack=${pack}, debug on"
+	}
+}
