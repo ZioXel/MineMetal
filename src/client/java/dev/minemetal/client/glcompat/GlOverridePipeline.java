@@ -290,6 +290,30 @@ public final class GlOverridePipeline implements MetalRenderPass.OverridePipelin
                 layouts.put(layoutCount * 3 + 2, -1);
                 layoutCount++;
             }
+            if (LOGGER.isInfoEnabled()) {
+                StringBuilder sb = new StringBuilder();
+                for (int slot = 0; slot < slots; slot++) {
+                    VertexFormat format = this.vertexFormats.get(slot);
+                    if (format == null) {
+                        continue;
+                    }
+                    sb.append(" slot").append(slot).append("[stride ").append(format.getVertexSize()).append(':');
+                    for (VertexFormatElement e : format.getElements()) {
+                        sb.append(' ').append(e.name()).append('=').append(e.format()).append('@').append(e.offset());
+                    }
+                    sb.append(']');
+                }
+                sb.append(" | inputs:");
+                for (GlProgramCompiler.Interface in : inputs) {
+                    sb.append(' ').append(in.name()).append('#').append(in.location()).append('/').append(in.baseType()).append('x').append(in.vecSize());
+                }
+                sb.append(" | attribs:");
+                for (int i = 0; i < attribCount; i++) {
+                    sb.append(' ').append(attribs.get(i * 4)).append("<-b").append(attribs.get(i * 4 + 1)).append('+').append(attribs.get(i * 4 + 2))
+                        .append(" f").append(attribs.get(i * 4 + 3));
+                }
+                LOGGER.info("override {} vertex layout:{}", this.name, sb);
+            }
             LongBuffer targets = stack.callocLong(Math.max(formats.length, 1) * 9);
             MetalGL.fillColorTargets(targets, formats, formats.length);
             DepthStencilState depth = this.info.depthStencilState();
