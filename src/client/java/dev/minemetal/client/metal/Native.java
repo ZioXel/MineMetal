@@ -79,7 +79,7 @@ public final class Native {
         PASS_BEGIN, PASS_END, PASS_PUSH_DEBUG, PASS_POP_DEBUG, PASS_SET_SCISSOR, PASS_SET_PIPELINE, PASS_SET_VERTEX_BUFFER, PASS_SET_BUFFER,
         PASS_SET_BYTES, PASS_SET_TEXTURE, PASS_SET_SAMPLER, PASS_SET_TEXEL_BUFFER, PASS_SET_INDEX_BUFFER, PASS_DRAW, PASS_DRAW_INDEXED,
         PASS_MULTI_DRAW, PASS_MULTI_DRAW_INDEXED, PASS_DRAW_INDIRECT, PASS_DRAW_INDEXED_INDIRECT, PIPELINE_CREATE, SURFACE_CREATE,
-        SURFACE_CONFIGURE, SURFACE_ACQUIRE, SURFACE_BLIT, SURFACE_DROP, SET_FAST_MATH, SET_GPU_DEBUG, SURFACE_STATS;
+        SURFACE_CONFIGURE, SURFACE_ACQUIRE, SURFACE_BLIT, SURFACE_DROP, SET_FAST_MATH, SET_GPU_DEBUG, SURFACE_STATS, PASS_SET_VIEWPORT, GENERATE_MIPMAPS, SAMPLER_CREATE_EX;
 
     private static void bind() {
         ENUM = h("mm_enum", f(JAVA_LONG, P, P));
@@ -138,6 +138,10 @@ public final class Native {
         SET_FAST_MATH = h("mm_set_fast_math", v(JAVA_INT));
         SET_GPU_DEBUG = h("mm_set_gpu_debug", v(P, JAVA_INT));
         SURFACE_STATS = h("mm_surface_stats", v(P, P));
+        PASS_SET_VIEWPORT = hc("mm_pass_set_viewport", v(P, JAVA_DOUBLE, JAVA_DOUBLE, JAVA_DOUBLE, JAVA_DOUBLE, JAVA_DOUBLE, JAVA_DOUBLE));
+        GENERATE_MIPMAPS = h("mm_generate_mipmaps", v(P, P));
+        SAMPLER_CREATE_EX = h("mm_sampler_create_ex",
+            f(P, P, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_FLOAT, JAVA_FLOAT, JAVA_LONG));
     }
 
     private static RuntimeException rethrow(Throwable t) {
@@ -424,6 +428,24 @@ public final class Native {
 
     public static void surfaceStats(long surface, long out) {
         try { SURFACE_STATS.invokeExact(surface, out); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    public static void passSetViewport(long ctx, double x, double y, double w, double h, double znear, double zfar) {
+        try { PASS_SET_VIEWPORT.invokeExact(ctx, x, y, w, h, znear, zfar); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    public static void generateMipmaps(long ctx, long texture) {
+        try { GENERATE_MIPMAPS.invokeExact(ctx, texture); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    /** addr: 0 repeat, 1 clamp-to-edge, 2 mirrored repeat, 3 clamp-to-border; mipMode: 0 none, 1 nearest, 2 linear; compare: MTLCompareFunction or -1. */
+    public static long samplerCreateEx(long ctx, int addrU, int addrV, boolean minLinear, boolean magLinear, int mipMode, int maxAnisotropy,
+                                       float lodMin, float lodMax, long compareFunc) {
+        try {
+            return (long) SAMPLER_CREATE_EX.invokeExact(ctx, addrU, addrV, b(minLinear), b(magLinear), mipMode, maxAnisotropy, lodMin, lodMax, compareFunc);
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
     }
 
     private static int b(boolean v) {

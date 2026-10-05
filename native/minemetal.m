@@ -528,6 +528,42 @@ MM_EXPORT void *mm_texture_view(void *texPtr, int baseMip, int mips) {
     }
 }
 
+/** Generates the full mip chain of a texture (blit encoder). */
+MM_EXPORT void mm_generate_mipmaps(void *p, void *texPtr) {
+    @autoreleasepool {
+        id<MTLTexture> tex = (__bridge id<MTLTexture>)texPtr;
+        if (tex.mipmapLevelCount < 2) return;
+        [mm_blit(CTX(p)) generateMipmapsForTexture:tex];
+    }
+}
+
+/**
+ * Sampler with extended GL-style state: addressing 0=repeat 1=clamp-to-edge 2=mirrored-repeat 3=clamp-to-border(black),
+ * mipMode 0=none 1=nearest 2=linear, compareFunc = MTLCompareFunction or -1 for none (sampler2DShadow).
+ */
+MM_EXPORT void *mm_sampler_create_ex(void *p, int addrU, int addrV, int minLinear, int magLinear, int mipMode, int maxAnisotropy,
+                                     float lodMin, float lodMax, int64_t compareFunc) {
+    @autoreleasepool {
+        MMContext *ctx = CTX(p);
+        MTLSamplerAddressMode modes[4] = {MTLSamplerAddressModeRepeat, MTLSamplerAddressModeClampToEdge,
+                                          MTLSamplerAddressModeMirrorRepeat, MTLSamplerAddressModeClampToBorderColor};
+        MTLSamplerDescriptor *d = [[MTLSamplerDescriptor alloc] init];
+        d.sAddressMode = modes[addrU & 3];
+        d.tAddressMode = modes[addrV & 3];
+        d.rAddressMode = MTLSamplerAddressModeClampToEdge;
+        d.borderColor = MTLSamplerBorderColorOpaqueBlack;
+        d.minFilter = minLinear ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
+        d.magFilter = magLinear ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
+        d.mipFilter = mipMode == 2 ? MTLSamplerMipFilterLinear : (mipMode == 1 ? MTLSamplerMipFilterNearest : MTLSamplerMipFilterNotMipmapped);
+        d.maxAnisotropy = (NSUInteger)MAX(1, MIN(maxAnisotropy, 16));
+        d.lodMinClamp = lodMin;
+        d.lodMaxClamp = lodMax;
+        if (compareFunc >= 0) d.compareFunction = (MTLCompareFunction)compareFunc;
+        id<MTLSamplerState> s = [ctx.device newSamplerStateWithDescriptor:d];
+        return s != nil ? (__bridge_retained void *)s : NULL;
+    }
+}
+
 MM_EXPORT void *mm_sampler_create(void *p, int repeatU, int repeatV, int minLinear, int magLinear, int mipLinear,
                                   int maxAnisotropy, float lodMax) {
     @autoreleasepool {
@@ -786,6 +822,13 @@ MM_EXPORT int mm_pass_begin(void *p, void **colorViews, int count, int clearMask
         ctx->scissor[0] = x0; ctx->scissor[1] = y0; ctx->scissor[2] = x1 - x0; ctx->scissor[3] = y1 - y0;
         return 1;
     }
+}
+
+/** Viewport in framebuffer pixels (top-left origin = memory row 0, same convention as scissors). */
+MM_EXPORT void mm_pass_set_viewport(void *p, double x, double y, double w, double h, double znear, double zfar) {
+    MMContext *ctx = CTX(p);
+    if (ctx.render == nil) return;
+    [ctx.render setViewport:(MTLViewport){x, y, w, h, znear, zfar}];
 }
 
 MM_EXPORT void mm_pass_end(void *p) {

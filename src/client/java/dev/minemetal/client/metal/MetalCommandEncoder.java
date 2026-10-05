@@ -47,6 +47,11 @@ public final class MetalCommandEncoder implements CommandEncoderBackend {
         return this.device.ctx();
     }
 
+    /** True while a renderpearl render pass is open (the GL emulation must not start its own passes then). */
+    public boolean isInRenderPass() {
+        return this.currentRenderPass != null;
+    }
+
     public void queueForDestroy(final Runnable destroyable) {
         if (this.destroyed) {
             destroyable.run();

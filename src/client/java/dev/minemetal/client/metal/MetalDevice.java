@@ -44,6 +44,8 @@ public final class MetalDevice implements GpuDeviceBackend {
     /** Metal's winding test after our Y flip; overridable while we validate culling on real hardware. */
     private static final boolean FRONT_FACE_CCW = Boolean.getBoolean("minemetal.frontFaceCCW");
 
+    private static volatile @Nullable MetalDevice current;
+
     private final long ctx;
     private final DeviceInfo deviceInfo;
     private final MetalCommandEncoder encoder;
@@ -87,7 +89,13 @@ public final class MetalDevice implements GpuDeviceBackend {
             );
         }
         this.encoder = new MetalCommandEncoder(this);
+        current = this;
         LOGGER.info("MineMetal: created Metal device '{}'", this.deviceInfo.name());
+    }
+
+    /** The live Metal device, or null when Minecraft runs on another backend. */
+    public static @Nullable MetalDevice current() {
+        return current;
     }
 
     public long ctx() {
@@ -287,6 +295,9 @@ public final class MetalDevice implements GpuDeviceBackend {
     public void close() {
         if (!this.closed) {
             this.closed = true;
+            if (current == this) {
+                current = null;
+            }
             this.encoder.destroy();
             Native.destroyContext(this.ctx);
         }
