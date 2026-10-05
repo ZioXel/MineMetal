@@ -247,10 +247,18 @@ public final class GlOverridePipeline implements MetalRenderPass.OverridePipelin
             List<GlProgramCompiler.Interface> inputs = compiled.vertex().inputs;
             IntBuffer attribs = stack.callocInt(Math.max(inputs.size(), 1) * 4);
             int attribCount = 0;
+            String baseFormat = System.getProperty("minemetal.debugEntityFormat");
+            boolean useBase = baseFormat != null && !baseFormat.isEmpty() && this.name.contains(baseFormat);
+            if (useBase) {
+                LOGGER.info("override {}: using vanilla ENTITY vertex layout (minemetal.debugEntityFormat)", this.name);
+            }
             for (int slot = 0; slot < slots; slot++) {
                 VertexFormat format = this.vertexFormats.get(slot);
                 if (format == null) {
                     continue;
+                }
+                if (useBase && slot == 0) {
+                    format = com.mojang.blaze3d.vertex.DefaultVertexFormat.ENTITY;
                 }
                 layouts.put(layoutCount * 3, MetalRenderPipeline.VERTEX_BUFFER_BASE - slot);
                 layouts.put(layoutCount * 3 + 1, format.getVertexSize());
