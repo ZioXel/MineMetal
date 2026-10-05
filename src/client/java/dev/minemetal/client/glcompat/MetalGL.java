@@ -1004,6 +1004,7 @@ public final class MetalGL {
             int vw = viewport[2] > 0 ? viewport[2] : w;
             int vh = viewport[3] > 0 ? viewport[3] : h;
             int[] area = scissorTest ? scissor : new int[]{vx, vy, vw, vh};
+            Native.setDepthFlip(ctx, false); // GL depth functions are used as given
             if (!Native.passBegin(ctx, MemoryUtil.memAddress(views), count, 0, 0L, depthView, 0.0, area[0], area[1], area[2], area[3], 0L)) {
                 return;
             }

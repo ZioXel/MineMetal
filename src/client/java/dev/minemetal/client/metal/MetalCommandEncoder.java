@@ -104,6 +104,27 @@ public final class MetalCommandEncoder implements CommandEncoderBackend {
 
     // --- render passes -----------------------------------------------------------------------------------------------
 
+    private static java.util.function.BooleanSupplier standardDepth = () -> false;
+
+    /**
+     * Shader packs expect standard depth (near = 0) while Minecraft renders with reversed Z. When the supplier says
+     * so (Iris: a pack is active and the level is being rendered), render passes mirror their depth compare ops and
+     * depth bias and depth clears use 1 - value – what Iris' UndoReverseZ mixins do on the OpenGL backend.
+     */
+    public static void setStandardDepthSupplier(final java.util.function.BooleanSupplier supplier) {
+        standardDepth = supplier;
+    }
+
+    private static double clearDepthValue(final double depth, final boolean flip) {
+        return flip ? Math.max(0.0, Math.min(1.0, 1.0 - depth)) : depth;
+    }
+
+    private boolean depthFlip() {
+        boolean flip = standardDepth.getAsBoolean();
+        Native.setDepthFlip(this.ctx(), flip);
+        return flip;
+    }
+
     @Override
     public RenderPassBackend createRenderPass(final RenderPassDescriptor descriptor) {
         if (this.currentRenderPass != null) {
@@ -144,9 +165,10 @@ public final class MetalCommandEncoder implements CommandEncoderBackend {
                 }
                 if (depthAttachment.clearValue().isPresent()) {
                     clearMask |= 1 << 31;
-                    clearDepth = depthAttachment.clearValue().getAsDouble();
+                    clearDepth = clearDepthValue(depthAttachment.clearValue().getAsDouble(), this.depthFlip());
                 }
             }
+            this.depthFlip();
             long label = this.device.labelsEnabled() ? MemoryUtil.memAddress(stack.UTF8(descriptor.label().get())) : 0L;
             var area = descriptor.renderArea();
             boolean ok = Native.passBegin(this.ctx(), MemoryUtil.memAddress(views), count, clearMask, MemoryUtil.memAddress(clearColors), depthView,
@@ -192,12 +214,13 @@ public final class MetalCommandEncoder implements CommandEncoderBackend {
                                            final double clearDepth, final int regionX, final int regionY, final int regionWidth,
                                            final int regionHeight, final int mipLevel) {
         Native.clearRegion(this.ctx(), ((MetalTexture) colorTexture).handle(), ((MetalTexture) depthTexture).handle(), mipLevel, clearColor.x(),
-            clearColor.y(), clearColor.z(), clearColor.w(), clearDepth, regionX, regionY, regionWidth, regionHeight);
+            clearColor.y(), clearColor.z(), clearColor.w(), clearDepthValue(clearDepth, standardDepth.getAsBoolean()), regionX, regionY, regionWidth,
+            regionHeight);
     }
 
     @Override
     public void clearDepthTexture(final GpuTexture depthTexture, final double clearDepth) {
-        Native.clearDepthTexture(this.ctx(), ((MetalTexture) depthTexture).handle(), clearDepth);
+        Native.clearDepthTexture(this.ctx(), ((MetalTexture) depthTexture).handle(), clearDepthValue(clearDepth, standardDepth.getAsBoolean()));
     }
 
     // --- copies ------------------------------------------------------------------------------------------------------

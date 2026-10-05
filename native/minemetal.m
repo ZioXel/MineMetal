@@ -169,6 +169,7 @@ MM_EXPORT int64_t mm_enum(const char *kind, const char *name) {
 @property(nonatomic, strong) id<MTLRenderPipelineState> withDepth;
 @property(nonatomic, strong) id<MTLRenderPipelineState> withoutDepth;
 @property(nonatomic, strong) id<MTLDepthStencilState> depthState;   // nil when the pipeline has no depth state
+@property(nonatomic, strong) id<MTLDepthStencilState> depthStateFlipped; // compare op mirrored (standard vs reversed Z)
 @property(nonatomic) MTLPrimitiveType primitiveType;
 @property(nonatomic) BOOL skipDraws;                                  // topology Metal cannot express (TRIANGLE_FAN)
 @property(nonatomic) MTLCullMode cullMode;
@@ -188,6 +189,7 @@ MM_EXPORT int64_t mm_enum(const char *kind, const char *name) {
 
 @interface MMContext : NSObject {
 @public
+    int depthFlip;   // 1 = mirror depth compare ops (shader packs expect standard depth, Minecraft uses reversed Z)
     pthread_mutex_t completionMutex;
     pthread_cond_t completionCond;
     uint64_t completedIndex;
@@ -318,6 +320,14 @@ MM_EXPORT void *mm_create_context(char *err, int errLen) {
 
 /** Enables per-encoder GPU error reporting (slower; for validation runs). */
 MM_EXPORT void mm_set_gpu_debug(void *p, int enabled) { CTX(p)->gpuDebug = enabled; }
+
+MM_EXPORT void mm_set_depth_flip(void *p, int flip) {
+    MMContext *ctx = CTX(p);
+    if (ctx->depthFlip != flip) {
+        ctx->depthFlip = flip;
+        ctx.pipeline = nil; // re-apply depth state / bias with the next pipeline bind
+    }
+}
 
 MM_EXPORT void mm_destroy_context(void *p) {
     if (p == NULL) return;
@@ -894,7 +904,8 @@ MM_EXPORT int mm_pass_set_pipeline(void *p, void *pipelinePtr) {
         if (pso == nil) { ctx.pipeline = nil; return 0; }
         id<MTLRenderCommandEncoder> enc = ctx.render;
         [enc setRenderPipelineState:pso];
-        id<MTLDepthStencilState> dss = (ctx.passHasDepth && pl.depthState != nil) ? pl.depthState : ctx.depthDisabled;
+        id<MTLDepthStencilState> dss = (ctx.passHasDepth && pl.depthState != nil)
+            ? (ctx->depthFlip && pl.depthStateFlipped != nil ? pl.depthStateFlipped : pl.depthState) : ctx.depthDisabled;
         void *dssRaw = (__bridge void *)dss;
         // Metal's default depth state is "always, no write", identical to depthDisabled: skip the call in that case.
         if (ctx->boundDepthState != dssRaw && !(ctx->boundDepthState == NULL && dss == ctx.depthDisabled)) {
@@ -913,12 +924,14 @@ MM_EXPORT int mm_pass_set_pipeline(void *p, void *pipelinePtr) {
             [enc setTriangleFillMode:pl.fillMode];
         }
         ctx->boundFill = (int)pl.fillMode;
-        BOOL biasDefault = isnan(ctx->boundBias[0]) && pl.depthBiasConstant == 0.0f && pl.depthBiasSlope == 0.0f;
-        if (!biasDefault && (ctx->boundBias[0] != pl.depthBiasConstant || ctx->boundBias[1] != pl.depthBiasSlope)) {
-            [enc setDepthBias:pl.depthBiasConstant slopeScale:pl.depthBiasSlope clamp:0.0f];
+        float sign = ctx->depthFlip ? -1.0f : 1.0f; // bias always pulls toward the camera
+        float biasC = pl.depthBiasConstant * sign, biasS = pl.depthBiasSlope * sign;
+        BOOL biasDefault = isnan(ctx->boundBias[0]) && biasC == 0.0f && biasS == 0.0f;
+        if (!biasDefault && (ctx->boundBias[0] != biasC || ctx->boundBias[1] != biasS)) {
+            [enc setDepthBias:biasC slopeScale:biasS clamp:0.0f];
         }
-        ctx->boundBias[0] = pl.depthBiasConstant;
-        ctx->boundBias[1] = pl.depthBiasSlope;
+        ctx->boundBias[0] = biasC;
+        ctx->boundBias[1] = biasS;
         ctx.pipeline = pl;
         return 1;
     }
@@ -1227,6 +1240,16 @@ MM_EXPORT void *mm_pipeline_create(void *p, const char *name, const char *vsSrc,
             dd.depthCompareFunction = (MTLCompareFunction)raster[5];
             dd.depthWriteEnabled = raster[6] != 0;
             pl.depthState = [ctx.device newDepthStencilStateWithDescriptor:dd];
+            MTLCompareFunction f = (MTLCompareFunction)raster[5];
+            switch (f) {
+                case MTLCompareFunctionLess: f = MTLCompareFunctionGreater; break;
+                case MTLCompareFunctionLessEqual: f = MTLCompareFunctionGreaterEqual; break;
+                case MTLCompareFunctionGreater: f = MTLCompareFunctionLess; break;
+                case MTLCompareFunctionGreaterEqual: f = MTLCompareFunctionLessEqual; break;
+                default: break;
+            }
+            dd.depthCompareFunction = f;
+            pl.depthStateFlipped = [ctx.device newDepthStencilStateWithDescriptor:dd];
         }
         pl.depthBiasConstant = bias[0];
         pl.depthBiasSlope = bias[1];

@@ -72,6 +72,7 @@ public final class GlOverridePipeline implements MetalRenderPass.OverridePipelin
     private final String name;
     private final Object2LongOpenHashMap<String> pipelines = new Object2LongOpenHashMap<>();
     private boolean closed;
+    private boolean loggedFirstDraw;
 
     public GlOverridePipeline(final BackendRenderPipeline original, final int program, final List<@Nullable VertexFormat> vertexFormats, final Hooks hooks) {
         this.original = (MetalRenderPipeline) original;
@@ -185,6 +186,11 @@ public final class GlOverridePipeline implements MetalRenderPass.OverridePipelin
             }
         }
         MetalGL.bindUnitSamplers(p, usedUnits);
+        if (!this.loggedFirstDraw) {
+            this.loggedFirstDraw = true;
+            LOGGER.info("override {}: first draw into {} color target(s){}, units from pass {}", this.name, target.colorViews().length,
+                target.depthView() != 0L ? " + depth" : "", Long.toBinaryString(usedUnits));
+        }
         return true;
     }
 
