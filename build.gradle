@@ -112,6 +112,10 @@ loom {
 				vmArg "-Dfabric.addMods=" + file('run/mods-stage0').absolutePath
 				programArgs "--graphicsBackend", "opengl"
 			}
+			// Shader packs on Metal: MineMetal-Iris fork + Sodium from run/mods-stage0, Metal backend (./mm.sh run -PirisMetal)
+			if (project.hasProperty('irisMetal')) {
+				vmArg "-Dfabric.addMods=" + file('run/mods-stage0').absolutePath
+			}
 			if (project.hasProperty('mmArgs')) {
 				project.property('mmArgs').toString().split(' ').findAll { !it.isBlank() }.each { vmArg it }
 			}

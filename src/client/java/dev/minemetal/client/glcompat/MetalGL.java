@@ -304,16 +304,14 @@ public final class MetalGL {
 
     public static void glGenerateMipmap(final int target) {
         GlTextureObject tex = boundTextureObject();
-        if (tex != null && tex.texture != null && tex.levels > 1) {
-            requireNoPass();
+        if (tex != null && tex.texture != null && tex.levels > 1 && !passOpen("glGenerateMipmap")) {
             Native.generateMipmaps(device().ctx(), tex.texture.handle());
         }
     }
 
     public static void glGenerateTextureMipmap(final int texture) {
         GlTextureObject tex = TEXTURES.get(texture);
-        if (tex != null && tex.texture != null && tex.levels > 1) {
-            requireNoPass();
+        if (tex != null && tex.texture != null && tex.levels > 1 && !passOpen("glGenerateMipmap")) {
             Native.generateMipmaps(device().ctx(), tex.texture.handle());
         }
     }
@@ -790,7 +788,9 @@ public final class MetalGL {
         if (fb == null) {
             return;
         }
-        requireNoPass();
+        if (passOpen("glClear")) {
+            return;
+        }
         MetalDevice device = device();
         try (MemoryStack stack = MemoryStack.stackPush()) {
             PointerBuffer views = stack.callocPointer(MAX_DRAW_BUFFERS);
@@ -900,7 +900,9 @@ public final class MetalGL {
             LOGGER.warn("Copy between different formats ({} -> {}) is not supported on Metal", src.format, dst.format);
             return;
         }
-        requireNoPass();
+        if (passOpen("copyTexture")) {
+            return;
+        }
         int w = Math.min(width, Math.min(src.width >> level, dst.width >> level) - Math.max(srcX, dstX));
         int h = Math.min(height, Math.min(src.height >> level, dst.height >> level) - Math.max(srcY, dstY));
         if (w > 0 && h > 0) {
@@ -957,7 +959,9 @@ public final class MetalGL {
         if (program == null || !program.linked || program.compiled == null || fb == null) {
             return;
         }
-        requireNoPass();
+        if (passOpen("draw")) {
+            return;
+        }
         MetalDevice device = device();
         long ctx = device.ctx();
         int outputs = program.maxFragmentOutput() + 1;
@@ -1154,10 +1158,306 @@ public final class MetalGL {
         }
     }
 
-    private static void requireNoPass() {
-        if (device().encoder().isInRenderPass()) {
-            throw new IllegalStateException("MetalGL call while a renderpearl render pass is open");
+    private static final java.util.Set<String> PASS_WARNED = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /**
+     * GL work cannot be encoded while a renderpearl render pass is open on the same command buffer. Instead of crashing,
+     * the call is skipped and the first occurrence per call site is logged with a stack trace (for fixing the caller).
+     */
+    private static boolean passOpen(final String what) {
+        if (!device().encoder().isInRenderPass()) {
+            return false;
         }
+        if (PASS_WARNED.add(what)) {
+            LOGGER.error("MetalGL {} skipped: a renderpearl render pass is open", what, new IllegalStateException("call site"));
+        }
+        return true;
+    }
+
+    // =================================================================================================================
+    // Helpers for Iris on Metal (renderpearl render targets as GL framebuffers, format-converting copies)
+    // =================================================================================================================
+
+    private record ExternalFbo(GpuTexture color, @Nullable GpuTexture depth) {
+    }
+
+    private static final Map<ExternalFbo, Integer> EXTERNAL_FBOS = new java.util.HashMap<>();
+
+    /**
+     * An emulated framebuffer whose attachments are renderpearl textures (Minecraft's main render target): color on
+     * attachment 0, optional depth. Cached per texture pair; entries of closed textures are dropped.
+     */
+    public static int externalFramebuffer(final GpuTexture color, final @Nullable GpuTexture depth) {
+        ExternalFbo key = new ExternalFbo(color, depth);
+        Integer existing = EXTERNAL_FBOS.get(key);
+        if (existing != null && FRAMEBUFFERS.containsKey(existing.intValue())) {
+            return existing;
+        }
+        pruneClosedExternals();
+        int fbo = glGenFramebuffers();
+        GlFramebufferObject fb = FRAMEBUFFERS.get(fbo);
+        fb.attach(GL_COLOR_ATTACHMENT0, registerExternalTexture(color), 0);
+        if (depth != null) {
+            fb.attach(GL_DEPTH_ATTACHMENT, registerExternalTexture(depth), 0);
+        }
+        fb.setDrawBuffers(new int[]{GL_COLOR_ATTACHMENT0});
+        EXTERNAL_FBOS.put(key, fbo);
+        return fbo;
+    }
+
+    private static void pruneClosedExternals() {
+        EXTERNAL_FBOS.entrySet().removeIf(e -> {
+            boolean closed = e.getKey().color().isClosed() || (e.getKey().depth() != null && e.getKey().depth().isClosed());
+            if (closed) {
+                glDeleteFramebuffers(e.getValue());
+            }
+            return closed;
+        });
+        java.util.List<Integer> stale = new java.util.ArrayList<>();
+        EXTERNAL_IDS.forEach((texture, id) -> {
+            if (texture.isClosed()) {
+                stale.add(id);
+            }
+        });
+        for (int id : stale) {
+            glDeleteTextures(id);
+        }
+    }
+
+    private static int blitProgram;
+    private static int blitFramebuffer;
+
+    private static final String BLIT_VS = """
+        #version 330 core
+        in vec3 Position;
+        void main() {
+            gl_Position = vec4(Position.xy * 2.0 - 1.0, 0.0, 1.0);
+        }
+        """;
+
+    private static final String BLIT_FS = """
+        #version 330 core
+        uniform sampler2D src;
+        layout(location = 0) out vec4 fragColor;
+        void main() {
+            fragColor = texelFetch(src, ivec2(gl_FragCoord.xy), 0);
+        }
+        """;
+
+    /**
+     * Copies texture {@code src} into {@code dst} (level 0, same size, any float/normalized color formats) with a
+     * fullscreen draw, leaving all emulated GL state as it was.
+     */
+    public static void blitColor(final int src, final int dst) {
+        GlTextureObject s = TEXTURES.get(src);
+        GlTextureObject d = TEXTURES.get(dst);
+        if (s == null || d == null || s.texture == null || d.texture == null) {
+            return;
+        }
+        if (blitProgram == 0) {
+            int vs = glCreateShader(GL_VERTEX_SHADER);
+            glShaderSource(vs, BLIT_VS);
+            int fs = glCreateShader(GL_FRAGMENT_SHADER);
+            glShaderSource(fs, BLIT_FS);
+            blitProgram = glCreateProgram();
+            setProgramDebugName(blitProgram, "minemetal:blit");
+            glAttachShader(blitProgram, vs);
+            glAttachShader(blitProgram, fs);
+            glLinkProgram(blitProgram);
+            glDeleteShader(vs);
+            glDeleteShader(fs);
+            blitFramebuffer = glGenFramebuffers();
+        }
+        int prevProgram = currentProgram;
+        int prevDraw = drawFramebuffer;
+        int prevUnit = activeUnit;
+        int prevTexture = boundTextures[0];
+        int prevSampler = boundSamplers[0];
+        int[] prevViewport = viewport.clone();
+        boolean prevBlend = blend;
+        boolean prevDepthTest = depthTest;
+        boolean prevScissor = scissorTest;
+        int prevColorMask = colorMask;
+        try {
+            GlFramebufferObject fb = FRAMEBUFFERS.get(blitFramebuffer);
+            fb.attach(GL_COLOR_ATTACHMENT0, dst, 0);
+            fb.setDrawBuffers(new int[]{GL_COLOR_ATTACHMENT0});
+            drawFramebuffer = blitFramebuffer;
+            currentProgram = blitProgram;
+            glUniform1i(glGetUniformLocation(blitProgram, "src"), 0);
+            activeUnit = 0;
+            boundTextures[0] = src;
+            boundSamplers[0] = 0;
+            blend = false;
+            depthTest = false;
+            scissorTest = false;
+            colorMask = 15;
+            viewport[0] = 0;
+            viewport[1] = 0;
+            viewport[2] = d.width;
+            viewport[3] = d.height;
+            drawFullscreenQuad();
+        } finally {
+            currentProgram = prevProgram;
+            drawFramebuffer = prevDraw;
+            activeUnit = prevUnit;
+            boundTextures[0] = prevTexture;
+            boundSamplers[0] = prevSampler;
+            System.arraycopy(prevViewport, 0, viewport, 0, 4);
+            blend = prevBlend;
+            depthTest = prevDepthTest;
+            scissorTest = prevScissor;
+            colorMask = prevColorMask;
+        }
+    }
+
+    // =================================================================================================================
+    // Queries
+    // =================================================================================================================
+
+    public static int glGetInteger(final int pname) {
+        return switch (pname) {
+            case GL_MAX_TEXTURE_IMAGE_UNITS -> 16;
+            case GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS, GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS -> MAX_UNITS;
+            case GL_MAX_DRAW_BUFFERS, GL_MAX_COLOR_ATTACHMENTS -> MAX_DRAW_BUFFERS;
+            case GL_MAX_TEXTURE_SIZE, GL_MAX_RENDERBUFFER_SIZE -> 16384;
+            case GL_MAX_ARRAY_TEXTURE_LAYERS -> 2048;
+            case GL_MAX_IMAGE_UNITS -> 8;
+            case GL_MAX_SAMPLES -> 4;
+            case GL_MAX_VERTEX_ATTRIBS -> 31;
+            case GL_MAX_UNIFORM_BUFFER_BINDINGS -> 14;
+            case GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS -> 0;
+            case GL_MAJOR_VERSION -> 4;
+            case GL_MINOR_VERSION -> 1;
+            case GL_NUM_EXTENSIONS -> 0;
+            case GL_FRAMEBUFFER_BINDING -> drawFramebuffer;
+            case GL_READ_FRAMEBUFFER_BINDING -> readFramebuffer;
+            case GL_CURRENT_PROGRAM -> currentProgram;
+            case GL_ACTIVE_TEXTURE -> GL_TEXTURE0 + activeUnit;
+            case GL_TEXTURE_BINDING_2D -> boundTextures[activeUnit];
+            case GL_SAMPLER_BINDING -> boundSamplers[activeUnit];
+            case GL_DEPTH_FUNC -> depthFunc;
+            case GL_BLEND_SRC_RGB -> blendSrcRgb;
+            case GL_BLEND_DST_RGB -> blendDstRgb;
+            case GL_BLEND_SRC_ALPHA -> blendSrcAlpha;
+            case GL_BLEND_DST_ALPHA -> blendDstAlpha;
+            default -> 0;
+        };
+    }
+
+    /** Fills {@code out} like glGetIntegerv; handles the multi-value queries Iris uses. */
+    public static void glGetIntegerv(final int pname, final int[] out) {
+        if (pname == GL_VIEWPORT && out.length >= 4) {
+            System.arraycopy(viewport, 0, out, 0, 4);
+        } else if (pname == GL_SCISSOR_BOX && out.length >= 4) {
+            System.arraycopy(scissor, 0, out, 0, 4);
+        } else if (out.length > 0) {
+            out[0] = glGetInteger(pname);
+        }
+    }
+
+    public static float glGetFloat(final int pname) {
+        return pname == 0x84FF /* GL_MAX_TEXTURE_MAX_ANISOTROPY */ ? 16.0F : glGetInteger(pname);
+    }
+
+    public static String glGetString(final int name) {
+        MetalDevice device = MetalDevice.current();
+        return switch (name) {
+            case GL_VENDOR -> "Apple";
+            case GL_RENDERER -> (device != null ? device.getDeviceInfo().name() : "Apple GPU") + " (MineMetal)";
+            case GL_VERSION -> "4.1 MineMetal (Metal)";
+            case GL_SHADING_LANGUAGE_VERSION -> "4.10";
+            default -> "";
+        };
+    }
+
+    public static boolean glIsEnabled(final int cap) {
+        return switch (cap) {
+            case GL_BLEND -> blend;
+            case GL_DEPTH_TEST -> depthTest;
+            case GL_SCISSOR_TEST -> scissorTest;
+            default -> false;
+        };
+    }
+
+    public static int glGetTexParameteri(final int target, final int pname) {
+        GlTextureObject tex = boundTextureObject();
+        if (tex == null) {
+            return 0;
+        }
+        return switch (pname) {
+            case GL_TEXTURE_MIN_FILTER -> tex.minFilter;
+            case GL_TEXTURE_MAG_FILTER -> tex.magFilter;
+            case GL_TEXTURE_WRAP_S -> tex.wrapS;
+            case GL_TEXTURE_WRAP_T -> tex.wrapT;
+            case GL_TEXTURE_COMPARE_MODE -> tex.compareMode;
+            case GL_TEXTURE_COMPARE_FUNC -> tex.compareFunc;
+            case GL_TEXTURE_MAX_LEVEL -> tex.maxLevel;
+            default -> 0;
+        };
+    }
+
+    public static int glGetTexLevelParameteri(final int target, final int level, final int pname) {
+        GlTextureObject tex = boundTextureObject();
+        if (tex == null) {
+            return 0;
+        }
+        return switch (pname) {
+            case GL_TEXTURE_WIDTH -> tex.hasStorage() ? Math.max(1, tex.width >> level) : 0;
+            case GL_TEXTURE_HEIGHT -> tex.hasStorage() ? Math.max(1, tex.height >> level) : 0;
+            case GL_TEXTURE_INTERNAL_FORMAT -> tex.internalFormat;
+            default -> 0;
+        };
+    }
+
+    /** glCopyTexImage2D: (re)allocates the bound texture and copies the read buffer into it. */
+    public static void glCopyTexImage2D(final int target, final int level, final int internalFormat, final int x, final int y, final int width,
+                                        final int height, final int border) {
+        GlTextureObject dst = boundTextureObject();
+        if (dst == null) {
+            return;
+        }
+        texImage2D(dst, level, internalFormat, width, height, GL_RGBA, GL_UNSIGNED_BYTE, 0L);
+        glCopyTexSubImage2D(target, level, 0, 0, x, y, width, height);
+    }
+
+    /** glClearBufferfv(GL_COLOR, drawbuffer, value) / (GL_DEPTH, 0, value). */
+    public static void glClearBufferfv(final int buffer, final int drawBuffer, final float[] value) {
+        float[] saved = clearColor.clone();
+        double savedDepth = clearDepth;
+        GlFramebufferObject fb = FRAMEBUFFERS.get(drawFramebuffer);
+        if (fb == null) {
+            return;
+        }
+        if (buffer == GL_DEPTH) {
+            clearDepth = value[0];
+            glClear(GL_DEPTH_BUFFER_BIT);
+        } else {
+            System.arraycopy(value, 0, clearColor, 0, Math.min(4, value.length));
+            int[] previous = new int[MAX_DRAW_BUFFERS];
+            for (int i = 0; i < MAX_DRAW_BUFFERS; i++) {
+                int b = fb.drawBuffer(i);
+                previous[i] = b < 0 ? GL_NONE : GL_COLOR_ATTACHMENT0 + b;
+            }
+            int target = fb.drawBuffer(drawBuffer);
+            fb.setDrawBuffers(new int[]{target < 0 ? GL_NONE : GL_COLOR_ATTACHMENT0 + target});
+            glClear(GL_COLOR_BUFFER_BIT);
+            fb.setDrawBuffers(previous);
+        }
+        System.arraycopy(saved, 0, clearColor, 0, 4);
+        clearDepth = savedDepth;
+    }
+
+    // =================================================================================================================
+    // Buffer objects (names only for now: Iris' SSBO/UBO features are not supported on Metal yet)
+    // =================================================================================================================
+
+    public static int glGenBuffers() {
+        return newName();
+    }
+
+    public static int glGenVertexArrays() {
+        return newName();
     }
 
     /** Resolves a GL texture name to the Metal texture view used for sampling (for interop/debugging). */
