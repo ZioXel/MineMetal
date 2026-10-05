@@ -20,11 +20,13 @@ public final class MetalRenderPipeline implements BackendRenderPipeline {
     private final String name;
     private final List<BindGroupLayout.UniformDescription> uniforms;
     private final MslTranslator.Bindings bindings;
+    private final BackendRenderPipeline.CreateInfo createInfo;
     private boolean closed;
 
     MetalRenderPipeline(final MetalDevice device, final long handle, final String name, final List<BindGroupLayout.UniformDescription> uniforms,
-                        final MslTranslator.Bindings bindings) {
+                        final MslTranslator.Bindings bindings, final BackendRenderPipeline.CreateInfo createInfo) {
         this.device = device;
+        this.createInfo = createInfo;
         this.handle = handle;
         this.name = name;
         this.uniforms = uniforms;
@@ -41,6 +43,11 @@ public final class MetalRenderPipeline implements BackendRenderPipeline {
 
     public List<BindGroupLayout.UniformDescription> uniforms() {
         return this.uniforms;
+    }
+
+    /** What the frontend asked for (shaders, vertex layout, depth/blend/cull state) – used to derive override pipelines. */
+    public BackendRenderPipeline.CreateInfo createInfo() {
+        return this.createInfo;
     }
 
     public MslTranslator.Bindings bindings() {

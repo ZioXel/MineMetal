@@ -1061,6 +1061,131 @@ public final class MetalGL {
         }
     }
 
+    /** Color target descriptors (pixel format, write mask, blend) for the current emulated blend state. */
+    static void fillColorTargets(final LongBuffer targets, final GpuFormat[] formats, final int count) {
+        for (int i = 0; i < count; i++) {
+            int base = i * 9;
+            if (formats[i] == null) {
+                continue;
+            }
+            targets.put(base, MetalEnums.pixelFormat(formats[i]));
+            targets.put(base + 1, colorMask);
+            GpuFormat.ComponentType ct = formats[i].componentType();
+            if (blend && ct != GpuFormat.ComponentType.UINT_8 && ct != GpuFormat.ComponentType.UINT_16 && ct != GpuFormat.ComponentType.UINT_32
+                && ct != GpuFormat.ComponentType.SINT_32) {
+                targets.put(base + 2, 1L);
+                targets.put(base + 3, MetalEnums.blendFactor(GlEnums.blendFactor(blendSrcRgb)));
+                targets.put(base + 4, MetalEnums.blendFactor(GlEnums.blendFactor(blendDstRgb)));
+                targets.put(base + 5, MetalEnums.blendOp(GlEnums.blendOp(blendEquationRgb)));
+                targets.put(base + 6, MetalEnums.blendFactor(GlEnums.blendFactor(blendSrcAlpha)));
+                targets.put(base + 7, MetalEnums.blendFactor(GlEnums.blendFactor(blendDstAlpha)));
+                targets.put(base + 8, MetalEnums.blendOp(GlEnums.blendOp(blendEquationAlpha)));
+            }
+        }
+    }
+
+    /** Cache key part for the emulated blend/color-mask state. */
+    static String blendKey() {
+        return blend ? blendSrcRgb + ":" + blendDstRgb + ":" + blendSrcAlpha + ":" + blendDstAlpha + ":" + blendEquationRgb + ":" + blendEquationAlpha + "/" + colorMask
+            : "off/" + colorMask;
+    }
+
+    /** Loads a renderpearl color target state into the emulated blend state (what GL's pipeline bind does before Iris' setup). */
+    static void applyColorTargetState(final com.mojang.renderpearl.api.pipeline.@Nullable ColorTargetState target) {
+        if (target == null) {
+            blend = false;
+            colorMask = 15;
+            return;
+        }
+        colorMask = target.writeMask();
+        if (target.blendFunction().isPresent()) {
+            var f = target.blendFunction().get();
+            blend = true;
+            blendSrcRgb = GlEnums.glBlendFactor(f.color().sourceFactor());
+            blendDstRgb = GlEnums.glBlendFactor(f.color().destFactor());
+            blendEquationRgb = GlEnums.glBlendOp(f.color().op());
+            blendSrcAlpha = GlEnums.glBlendFactor(f.alpha().sourceFactor());
+            blendDstAlpha = GlEnums.glBlendFactor(f.alpha().destFactor());
+            blendEquationAlpha = GlEnums.glBlendOp(f.alpha().op());
+        } else {
+            blend = false;
+        }
+    }
+
+    /** Draw target of the current draw framebuffer for {@code program}'s fragment outputs. */
+    record DrawTarget(long[] views, GpuFormat[] formats, long depthView) {
+    }
+
+    static @Nullable DrawTarget drawTarget(final GlProgramObject program) {
+        GlFramebufferObject fb = FRAMEBUFFERS.get(drawFramebuffer);
+        if (fb == null) {
+            return null;
+        }
+        MetalDevice device = device();
+        int outputs = Math.min(program.maxFragmentOutput() + 1, MAX_DRAW_BUFFERS);
+        int count = 0;
+        long[] views = new long[Math.max(outputs, 0)];
+        GpuFormat[] formats = new GpuFormat[Math.max(outputs, 0)];
+        for (int i = 0; i < outputs; i++) {
+            int attachment = fb.drawBuffer(i);
+            GlTextureObject tex = attachment >= 0 ? TEXTURES.get(fb.color[attachment]) : null;
+            if (tex == null || tex.texture == null) {
+                continue;
+            }
+            views[i] = tex.levelView(device, fb.colorLevel[attachment]).handle();
+            formats[i] = tex.format;
+            count = i + 1;
+        }
+        GlTextureObject depth = TEXTURES.get(fb.depth);
+        long depthView = depth != null && depth.texture != null ? depth.levelView(device, 0).handle() : 0L;
+        if (count == 0 && depthView == 0L) {
+            return null;
+        }
+        return new DrawTarget(java.util.Arrays.copyOf(views, count), java.util.Arrays.copyOf(formats, count), depthView);
+    }
+
+    static @Nullable GlProgramObject program(final int id) {
+        return PROGRAMS.get(id);
+    }
+
+    /** Loose-uniform blocks of both stages at buffer 0. */
+    static void bindLooseUniforms(final GlProgramObject program) {
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            bindUniforms(device(), program, stack);
+        }
+    }
+
+    /** Textures/samplers bound to GL texture units, except units in {@code skipUnits} (bit mask). */
+    static void bindUnitSamplers(final GlProgramObject program, final long skipUnits) {
+        MetalDevice device = device();
+        long ctx = device.ctx();
+        for (GlProgramObject.Slot slot : program.slots) {
+            if (!slot.sampler || slot.unit < 0 || slot.unit >= MAX_UNITS || (skipUnits & (1L << slot.unit)) != 0L) {
+                continue;
+            }
+            GlTextureObject tex = TEXTURES.get(boundTextures[slot.unit]);
+            if (tex == null || tex.sampleView == null) {
+                continue;
+            }
+            GlSamplerObject samplerObject = SAMPLERS.get(boundSamplers[slot.unit]);
+            long sampler = samplerObject != null ? samplerObject.handle(device, tex) : tex.sampler(device);
+            Native.passSetTexture(ctx, 3, tex.sampleView.handle(), slot.samplerIndex);
+            Native.passSetSampler(ctx, 3, sampler, slot.samplerIndex);
+        }
+    }
+
+    public static int glGetUniformBlockIndex(final int program, final CharSequence name) {
+        GlProgramObject p = PROGRAMS.get(program);
+        return p == null ? -1 : p.blockIndex(name.toString());
+    }
+
+    public static void glUniformBlockBinding(final int program, final int blockIndex, final int binding) {
+        GlProgramObject p = PROGRAMS.get(program);
+        if (p != null) {
+            p.setBlockBinding(blockIndex, binding);
+        }
+    }
+
     private static long pipelineFor(final GlProgramObject program, final GpuFormat[] formats, final int count, final boolean hasDepth) {
         StringBuilder key = new StringBuilder(64);
         for (int i = 0; i < count; i++) {
@@ -1111,24 +1236,7 @@ public final class MetalGL {
                 attribCount++;
             }
             LongBuffer targets = stack.callocLong(Math.max(1, count) * 9);
-            for (int i = 0; i < count; i++) {
-                int base = i * 9;
-                if (formats[i] == null) {
-                    continue;
-                }
-                targets.put(base, MetalEnums.pixelFormat(formats[i]));
-                targets.put(base + 1, colorMask);
-                if (blend && formats[i].componentType() != GpuFormat.ComponentType.UINT_8 && formats[i].componentType() != GpuFormat.ComponentType.UINT_16
-                    && formats[i].componentType() != GpuFormat.ComponentType.UINT_32 && formats[i].componentType() != GpuFormat.ComponentType.SINT_32) {
-                    targets.put(base + 2, 1L);
-                    targets.put(base + 3, MetalEnums.blendFactor(GlEnums.blendFactor(blendSrcRgb)));
-                    targets.put(base + 4, MetalEnums.blendFactor(GlEnums.blendFactor(blendDstRgb)));
-                    targets.put(base + 5, MetalEnums.blendOp(GlEnums.blendOp(blendEquationRgb)));
-                    targets.put(base + 6, MetalEnums.blendFactor(GlEnums.blendFactor(blendSrcAlpha)));
-                    targets.put(base + 7, MetalEnums.blendFactor(GlEnums.blendFactor(blendDstAlpha)));
-                    targets.put(base + 8, MetalEnums.blendOp(GlEnums.blendOp(blendEquationAlpha)));
-                }
-            }
+            fillColorTargets(targets, formats, count);
             IntBuffer raster = stack.callocInt(7);
             raster.put(0, PrimitiveTopology.TRIANGLES.ordinal());
             raster.put(4, hasDepth ? 1 : 0);

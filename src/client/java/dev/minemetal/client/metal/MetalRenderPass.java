@@ -21,6 +21,33 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 public final class MetalRenderPass implements RenderPassBackend {
+    /**
+     * A pipeline that draws somewhere else than the pass attachments (Iris gbuffer programs drawing into the shader
+     * pack's render targets through MineMetal's GL emulation). The pass switches its Metal encoder to the target the
+     * pipeline reports and back, keeping consecutive draws with the same target in one Metal render pass.
+     */
+    public interface OverridePipeline extends BackendRenderPipeline {
+        List<BindGroupLayout.UniformDescription> uniforms();
+
+        /** Called before every draw (mirrors GL's per-draw program setup). Returns the target, or null to skip the draw. */
+        @Nullable Target beforeDraw();
+
+        /** Binds pipeline state and every resource on the current encoder (which renders into {@code target}). */
+        boolean bind(long ctx, Target target, List<BindGroupLayout.UniformDescription> descriptions, @Nullable Object[] values,
+                     @Nullable ByteBuffer pushConstants);
+
+        /** The render pass that used this pipeline ended. */
+        void passEnded();
+    }
+
+    /** Attachments of an override target: color views (0 = unused slot), optional depth view. */
+    public record Target(long[] colorViews, long depthView) {
+        boolean sameAs(final long[] views, final long depth) {
+            return this.depthView == depth && java.util.Arrays.equals(this.colorViews, views);
+        }
+    }
+
+    private static final int MAX_VERTEX_SLOTS = 8;
     private static final Logger LOGGER = LoggerFactory.getLogger("MineMetal");
     private static final int STAGES_ALL = 3;
     private static boolean warnedMissingUniform;
@@ -30,6 +57,21 @@ public final class MetalRenderPass implements RenderPassBackend {
     private final RenderPass.RenderArea renderArea;
     private final int outputWidth;
     private final int outputHeight;
+    /** Original attachments (to come back to after drawing into an override target). */
+    private final long[] passViews;
+    private final long passDepthView;
+    private long[] activeViews;
+    private long activeDepthView;
+    private final long[] vertexBuffers = new long[MAX_VERTEX_SLOTS];
+    private final long[] vertexOffsets = new long[MAX_VERTEX_SLOTS];
+    private long indexBuffer;
+    private boolean indexInt;
+    private boolean scissorEnabled;
+    private final int[] scissorRect = new int[4];
+    private @Nullable ByteBuffer pushConstants;
+    private int nativeDebugGroups;
+    private @Nullable OverridePipeline override;
+    private final java.util.Set<OverridePipeline> overridesUsed = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
     private @Nullable MetalRenderPipeline pipeline;
     /** Pipelines are applied lazily at the next draw: the frontend often sets one and replaces it before drawing. */
     private boolean pipelineApplied;
@@ -40,8 +82,13 @@ public final class MetalRenderPass implements RenderPassBackend {
     private boolean bindingsDirty;
     private int pushedDebugGroups;
 
-    MetalRenderPass(final MetalDevice device, final RenderPass.RenderArea renderArea, final int outputWidth, final int outputHeight) {
+    MetalRenderPass(final MetalDevice device, final RenderPass.RenderArea renderArea, final int outputWidth, final int outputHeight,
+                    final long[] passViews, final long passDepthView) {
         this.device = device;
+        this.passViews = passViews;
+        this.passDepthView = passDepthView;
+        this.activeViews = passViews;
+        this.activeDepthView = passDepthView;
         this.ctx = device.ctx();
         this.renderArea = renderArea;
         this.outputWidth = outputWidth;
@@ -52,6 +99,7 @@ public final class MetalRenderPass implements RenderPassBackend {
     public void pushDebugGroup(final Supplier<String> label) {
         this.pushedDebugGroups++;
         if (this.device.labelsEnabled()) {
+            this.nativeDebugGroups++;
             try (MemoryStack stack = MemoryStack.stackPush()) {
                 Native.passPushDebug(this.ctx, MemoryUtil.memAddress(stack.UTF8(label.get())));
             }
@@ -64,19 +112,29 @@ public final class MetalRenderPass implements RenderPassBackend {
             throw new IllegalStateException("Can't pop more debug groups than was pushed!");
         }
         this.pushedDebugGroups--;
-        if (this.device.labelsEnabled()) {
+        if (this.device.labelsEnabled() && this.nativeDebugGroups > 0) {
+            this.nativeDebugGroups--;
             Native.passPopDebug(this.ctx);
         }
     }
 
     @Override
     public void setPipeline(final BackendRenderPipeline pipeline) {
-        if (!(pipeline instanceof MetalRenderPipeline metal)) {
+        List<BindGroupLayout.UniformDescription> descriptions;
+        if (pipeline instanceof OverridePipeline ov) {
+            this.override = ov;
+            this.overridesUsed.add(ov);
+            this.pipeline = null;
+            descriptions = ov.uniforms();
+        } else if (pipeline instanceof MetalRenderPipeline metal) {
+            this.override = null;
+            this.pipeline = metal;
+            descriptions = metal.uniforms();
+        } else {
             throw new IllegalArgumentException("Pipeline must be instance of MetalRenderPipeline");
         }
-        this.pipeline = metal;
         this.pipelineApplied = false;
-        int count = metal.uniforms().size();
+        int count = descriptions.size();
         if (this.uniforms.length != count) {
             this.uniforms = new Object[count];
         } else {
@@ -105,6 +163,17 @@ public final class MetalRenderPass implements RenderPassBackend {
         if (length == 0) {
             return;
         }
+        if (this.pushConstants == null || this.pushConstants.capacity() < length) {
+            if (this.pushConstants != null) {
+                MemoryUtil.memFree(this.pushConstants);
+            }
+            this.pushConstants = MemoryUtil.memAlloc(Math.max(length, 256));
+        }
+        this.pushConstants.clear();
+        this.pushConstants.put(value.duplicate()).flip();
+        if (this.override != null) {
+            return; // bound at draw time into the override program's push-constant block
+        }
         int stages = this.pipeline != null ? this.pipeline.bindings().pushStageMask()[0] : STAGES_ALL;
         if (stages == 0) {
             return;
@@ -123,11 +192,17 @@ public final class MetalRenderPass implements RenderPassBackend {
     @Override
     public void enableScissor(final int x, final int y, final int width, final int height) {
         // Same origin convention as Vulkan: offsets count from memory row 0 (we flip Y in the vertex stage).
+        this.scissorEnabled = true;
+        this.scissorRect[0] = x;
+        this.scissorRect[1] = y;
+        this.scissorRect[2] = width;
+        this.scissorRect[3] = height;
         Native.passSetScissor(this.ctx, x, y, width, height);
     }
 
     @Override
     public void disableScissor() {
+        this.scissorEnabled = false;
         Native.passSetScissor(this.ctx, this.renderArea.x(), this.renderArea.y(), this.renderArea.width(), this.renderArea.height());
     }
 
@@ -135,18 +210,87 @@ public final class MetalRenderPass implements RenderPassBackend {
     public void setVertexBuffer(final int slot, final @Nullable GpuBufferSlice vertexBuffer) {
         if (vertexBuffer != null) {
             MetalGpuBuffer buffer = (MetalGpuBuffer) vertexBuffer.buffer();
+            if (slot < MAX_VERTEX_SLOTS) {
+                this.vertexBuffers[slot] = buffer.handle();
+                this.vertexOffsets[slot] = vertexBuffer.offset();
+            }
             Native.passSetVertexBuffer(this.ctx, buffer.handle(), vertexBuffer.offset(), MetalRenderPipeline.VERTEX_BUFFER_BASE - slot);
         }
     }
 
     @Override
     public void setIndexBuffer(final GpuBuffer indexBuffer, final IndexType indexType) {
-        Native.passSetIndexBuffer(this.ctx, ((MetalGpuBuffer) indexBuffer).handle(), indexType == IndexType.INT);
+        this.indexBuffer = ((MetalGpuBuffer) indexBuffer).handle();
+        this.indexInt = indexType == IndexType.INT;
+        Native.passSetIndexBuffer(this.ctx, this.indexBuffer, this.indexInt);
+    }
+
+    /** Ends the current Metal encoder and begins one on the given attachments (contents loaded), restoring pass state. */
+    private boolean switchTarget(final long[] views, final long depthView) {
+        if (this.device.labelsEnabled()) {
+            while (this.nativeDebugGroups > 0) {
+                this.nativeDebugGroups--;
+                Native.passPopDebug(this.ctx);
+            }
+        }
+        boolean ok;
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            PointerBuffer p = stack.callocPointer(Math.max(views.length, 1));
+            for (int i = 0; i < views.length; i++) {
+                p.put(i, views[i]);
+            }
+            ok = Native.passBegin(this.ctx, MemoryUtil.memAddress(p), views.length, 0, 0L, depthView, 0.0, this.renderArea.x(), this.renderArea.y(),
+                this.renderArea.width(), this.renderArea.height(), 0L);
+        }
+        this.activeViews = views;
+        this.activeDepthView = depthView;
+        if (!ok) {
+            return false;
+        }
+        for (int slot = 0; slot < MAX_VERTEX_SLOTS; slot++) {
+            if (this.vertexBuffers[slot] != 0L) {
+                Native.passSetVertexBuffer(this.ctx, this.vertexBuffers[slot], this.vertexOffsets[slot], MetalRenderPipeline.VERTEX_BUFFER_BASE - slot);
+            }
+        }
+        if (this.indexBuffer != 0L) {
+            Native.passSetIndexBuffer(this.ctx, this.indexBuffer, this.indexInt);
+        }
+        if (this.scissorEnabled) {
+            Native.passSetScissor(this.ctx, this.scissorRect[0], this.scissorRect[1], this.scissorRect[2], this.scissorRect[3]);
+        }
+        this.pipelineApplied = false;
+        this.dirtyMask = -1L;
+        this.bindingsDirty = true;
+        return true;
     }
 
     private boolean prepareDraw() {
+        OverridePipeline ov = this.override;
+        if (ov != null) {
+            Target target = ov.beforeDraw();
+            if (target == null) {
+                return false;
+            }
+            if (!target.sameAs(this.activeViews, this.activeDepthView) && !this.switchTarget(target.colorViews(), target.depthView())) {
+                return false;
+            }
+            ByteBuffer push = this.pushConstants;
+            return ov.bind(this.ctx, target, ov.uniforms(), this.uniforms, push);
+        }
         if (this.pipeline == null) {
             return false;
+        }
+        if (this.activeViews != this.passViews || this.activeDepthView != this.passDepthView) {
+            if (!this.switchTarget(this.passViews, this.passDepthView)) {
+                return false;
+            }
+            if (this.pushConstants != null && this.pushConstants.remaining() > 0) {
+                int stages = this.pipeline.bindings().pushStageMask()[0];
+                if (stages != 0) {
+                    Native.passSetBytes(this.ctx, stages, MemoryUtil.memAddress(this.pushConstants), this.pushConstants.remaining(),
+                        MetalRenderPipeline.PUSH_CONSTANT_BUFFER_INDEX);
+                }
+            }
         }
         if (!this.pipelineApplied) {
             this.pipelineApplied = true;
@@ -257,6 +401,22 @@ public final class MetalRenderPass implements RenderPassBackend {
 
     @Override
     public void writeTimestamp(final GpuQueryPool pool, final int index) {
+    }
+
+    /** Called by the command encoder right before the pass's Metal encoder ends. */
+    void onEnd() {
+        for (OverridePipeline ov : this.overridesUsed) {
+            try {
+                ov.passEnded();
+            } catch (RuntimeException e) {
+                LOGGER.error("Override pipeline cleanup failed", e);
+            }
+        }
+        this.overridesUsed.clear();
+        if (this.pushConstants != null) {
+            MemoryUtil.memFree(this.pushConstants);
+            this.pushConstants = null;
+        }
     }
 
     int outputWidth() {

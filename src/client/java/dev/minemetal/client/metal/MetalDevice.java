@@ -287,7 +287,7 @@ public final class MetalDevice implements GpuDeviceBackend {
                 }
                 throw new ShaderCompileException("Metal rejected pipeline " + info.name() + ": " + message);
             }
-            return new MetalRenderPipeline(this, handle, info.name(), info.uniforms(), bindings);
+            return new MetalRenderPipeline(this, handle, info.name(), info.uniforms(), bindings, info);
         }
     }
 

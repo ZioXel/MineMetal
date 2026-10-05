@@ -483,11 +483,11 @@ public final class GLDispatch {
     }
 
     public static int glGetUniformBlockIndex(final int a0, final java.lang.CharSequence a1) {
-        return -1;
+        return MetalGL.glGetUniformBlockIndex(a0, a1);
     }
 
     public static int glGetUniformBlockIndex(final int a0, final java.nio.ByteBuffer a1) {
-        return -1;
+        return MetalGL.glGetUniformBlockIndex(a0, org.lwjgl.system.MemoryUtil.memUTF8(a1));
     }
 
     public static int glGetUniformLocation(final int a0, final java.lang.CharSequence a1) {
@@ -779,7 +779,7 @@ public final class GLDispatch {
     }
 
     public static void glUniformBlockBinding(final int a0, final int a1, final int a2) {
-        
+        MetalGL.glUniformBlockBinding(a0, a1, a2);
     }
 
     public static void glUniformMatrix3fv(final int a0, final boolean a1, final float[] a2) {

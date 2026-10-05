@@ -154,7 +154,11 @@ public final class MetalCommandEncoder implements CommandEncoderBackend {
             if (!ok) {
                 throw new IllegalStateException("Failed to begin Metal render pass " + descriptor.label().get());
             }
-            this.currentRenderPass = new MetalRenderPass(this.device, area, width, height);
+            long[] viewHandles = new long[count];
+            for (int i = 0; i < count; i++) {
+                viewHandles[i] = views.get(i);
+            }
+            this.currentRenderPass = new MetalRenderPass(this.device, area, width, height, viewHandles, depthView);
             return this.currentRenderPass;
         }
     }
@@ -164,6 +168,7 @@ public final class MetalCommandEncoder implements CommandEncoderBackend {
         if (this.currentRenderPass == null) {
             throw new IllegalStateException("Cannot submit a renderpass if one hasn't been started!");
         }
+        this.currentRenderPass.onEnd();
         Native.passEnd(this.ctx());
         this.currentRenderPass = null;
     }

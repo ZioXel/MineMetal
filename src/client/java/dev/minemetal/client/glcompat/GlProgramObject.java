@@ -64,6 +64,19 @@ final class GlProgramObject {
                 }
             }
         }
+        this.blockNames.clear();
+        for (String n : result.vertex().extraBlocks.keySet()) {
+            if (!this.blockNames.contains(n)) {
+                this.blockNames.add(n);
+            }
+        }
+        for (String n : result.fragment().extraBlocks.keySet()) {
+            if (!this.blockNames.contains(n)) {
+                this.blockNames.add(n);
+            }
+        }
+        this.blockBindings = new int[this.blockNames.size()];
+        java.util.Arrays.fill(this.blockBindings, -1);
         List<String> samplers = result.samplers();
         for (int i = 0; i < samplers.size(); i++) {
             Slot slot = this.slotFor(samplers.get(i));
@@ -204,6 +217,36 @@ final class GlProgramObject {
                 }
             }
         }
+    }
+
+    /** Named (non-loose) uniform blocks of both stages in a stable order; index = GL uniform block index. */
+    final List<String> blockNames = new ArrayList<>();
+    /** GL uniform block binding point per block index (-1 = never set). */
+    int[] blockBindings = new int[0];
+
+    int blockIndex(final String name) {
+        return this.blockNames.indexOf(name);
+    }
+
+    void setBlockBinding(final int index, final int binding) {
+        if (index >= 0 && index < this.blockBindings.length) {
+            this.blockBindings[index] = binding;
+        }
+    }
+
+    /** MSL buffer index of the block bound to {@code binding} in {@code stage} (0 vertex, 1 fragment), or -1. */
+    int bufferIndexForBinding(final int stage, final int binding) {
+        if (this.compiled == null) {
+            return -1;
+        }
+        GlProgramCompiler.StageResult s = stage == 0 ? this.compiled.vertex() : this.compiled.fragment();
+        for (var e : s.extraBlocks.entrySet()) {
+            int index = this.blockNames.indexOf(e.getKey());
+            if (index >= 0 && this.blockBindings[index] == binding) {
+                return e.getValue();
+            }
+        }
+        return -1;
     }
 
     int maxFragmentOutput() {

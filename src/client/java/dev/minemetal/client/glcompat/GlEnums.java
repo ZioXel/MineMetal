@@ -131,6 +131,37 @@ final class GlEnums {
         };
     }
 
+    static int glBlendFactor(final BlendFactor factor) {
+        return switch (factor) {
+            case ZERO -> GL_ZERO;
+            case ONE -> GL_ONE;
+            case SRC_COLOR -> GL_SRC_COLOR;
+            case ONE_MINUS_SRC_COLOR -> GL_ONE_MINUS_SRC_COLOR;
+            case SRC_ALPHA -> GL_SRC_ALPHA;
+            case ONE_MINUS_SRC_ALPHA -> GL_ONE_MINUS_SRC_ALPHA;
+            case DST_ALPHA -> GL_DST_ALPHA;
+            case ONE_MINUS_DST_ALPHA -> GL_ONE_MINUS_DST_ALPHA;
+            case DST_COLOR -> GL_DST_COLOR;
+            case ONE_MINUS_DST_COLOR -> GL_ONE_MINUS_DST_COLOR;
+            case SRC_ALPHA_SATURATE -> GL_SRC_ALPHA_SATURATE;
+            case CONSTANT_COLOR -> GL_CONSTANT_COLOR;
+            case ONE_MINUS_CONSTANT_COLOR -> GL_ONE_MINUS_CONSTANT_COLOR;
+            case CONSTANT_ALPHA -> GL_CONSTANT_ALPHA;
+            case ONE_MINUS_CONSTANT_ALPHA -> GL_ONE_MINUS_CONSTANT_ALPHA;
+            default -> GL_ONE;
+        };
+    }
+
+    static int glBlendOp(final BlendOp op) {
+        return switch (op) {
+            case SUBTRACT -> GL_FUNC_SUBTRACT;
+            case REVERSE_SUBTRACT -> GL_FUNC_REVERSE_SUBTRACT;
+            case MIN -> GL_MIN;
+            case MAX -> GL_MAX;
+            default -> GL_FUNC_ADD;
+        };
+    }
+
     static BlendOp blendOp(final int equation) {
         return switch (equation) {
             case GL_FUNC_SUBTRACT -> BlendOp.SUBTRACT;
