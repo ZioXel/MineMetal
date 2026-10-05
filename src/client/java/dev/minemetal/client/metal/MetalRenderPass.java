@@ -68,6 +68,7 @@ public final class MetalRenderPass implements RenderPassBackend {
     private final long[] vertexLengths = new long[MAX_VERTEX_SLOTS];
     private static final String DEBUG_VERTICES = System.getProperty("minemetal.debugVertices", "");
     private static int debugVertexDumps;
+    private static final java.util.Map<String, int[]> OVERRIDE_COUNTS = new java.util.HashMap<>();
     private long indexBuffer;
     private boolean indexInt;
     private boolean scissorEnabled;
@@ -274,8 +275,16 @@ public final class MetalRenderPass implements RenderPassBackend {
         OverridePipeline ov = this.override;
         if (ov != null) {
             Target target = ov.beforeDraw();
+            int[] c = OVERRIDE_COUNTS.computeIfAbsent(ov.toString(), k -> new int[2]);
             if (target == null) {
+                c[1]++;
                 return false;
+            }
+            int n = ++c[0];
+            if (n == 1 || n == 10 || n == 100 || n == 1000 || n == 10000 || n == 100000) {
+                LOGGER.info("override draws: {} x{} (no target x{}), pass area {},{} {}x{}, output {}x{}, target views {}{}", ov, n, c[1], this.renderArea.x(),
+                    this.renderArea.y(), this.renderArea.width(), this.renderArea.height(), this.outputWidth, this.outputHeight, target.colorViews().length,
+                    this.scissorEnabled ? " scissor " + java.util.Arrays.toString(this.scissorRect) : "");
             }
             if (!target.sameAs(this.activeViews, this.activeDepthView) && !this.switchTarget(target.colorViews(), target.depthView())) {
                 return false;
