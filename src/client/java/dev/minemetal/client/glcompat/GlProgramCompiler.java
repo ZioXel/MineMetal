@@ -76,10 +76,10 @@ public final class GlProgramCompiler {
 
     /** Compiles and links a vertex + fragment pair. */
     public static Result compile(final String name, final String vertexSource, final String fragmentSource) throws ShaderCompileException {
-        ByteBuffer vsSpv = toSpirv(name + ".vsh", vertexSource, Shaderc.shaderc_vertex_shader);
+        ByteBuffer vsSpv = toSpirv(name + ".vsh", renameReserved(vertexSource), Shaderc.shaderc_vertex_shader);
         ByteBuffer fsSpv = null;
         try {
-            fsSpv = toSpirv(name + ".fsh", fragmentSource, Shaderc.shaderc_fragment_shader);
+            fsSpv = toSpirv(name + ".fsh", renameReserved(fragmentSource), Shaderc.shaderc_fragment_shader);
             // Pass 1: reflect both stages to build the shared sampler numbering and the varying locations.
             StageResult vsInfo = new StageResult(STAGE_VERTEX);
             StageResult fsInfo = new StageResult(STAGE_FRAGMENT);
@@ -111,6 +111,19 @@ public final class GlProgramCompiler {
                 MemoryUtil.memFree(fsSpv);
             }
         }
+    }
+
+    /**
+     * Identifiers that are legal in GLSL but reserved in Metal Shading Language (C++14) and that SPIRV-Cross does not
+     * rename itself (e.g. BSL declares {@code bool new = ...}). Renamed consistently in both stages before compiling.
+     */
+    private static final java.util.regex.Pattern RESERVED = java.util.regex.Pattern.compile(
+        "\\b(new|delete|this|template|typename|namespace|operator|friend|virtual|explicit|mutable|using|constexpr|nullptr|auto|register"
+            + "|try|catch|throw|decltype|alignas|alignof|noexcept|static_assert|thread_local|char16_t|char32_t|wchar_t)\\b");
+
+    static String renameReserved(final String source) {
+        java.util.regex.Matcher m = RESERVED.matcher(source);
+        return m.find() ? m.replaceAll("mm_$1") : source;
     }
 
     private static ByteBuffer toSpirv(final String fileName, final String source, final int kind) throws ShaderCompileException {

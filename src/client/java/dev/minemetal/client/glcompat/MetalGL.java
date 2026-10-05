@@ -582,6 +582,9 @@ public final class MetalGL {
         if (p != null) {
             p.freeBlocks();
             for (long pipeline : p.pipelines.values()) {
+                if (pipeline == -1L) {
+                    continue;
+                }
                 device().encoder().queueForDestroy(() -> Native.release(pipeline));
             }
             p.pipelines.clear();
@@ -1069,12 +1072,10 @@ public final class MetalGL {
         String k = key.toString();
         long cached = program.pipelines.getOrDefault(k, 0L);
         if (cached != 0L) {
-            return cached;
+            return cached == -1L ? 0L : cached; // -1 = Metal rejected this variant before; don't retry (and re-log) every frame
         }
         long pipeline = createPipeline(program, formats, count, hasDepth);
-        if (pipeline != 0L) {
-            program.pipelines.put(k, pipeline);
-        }
+        program.pipelines.put(k, pipeline != 0L ? pipeline : -1L);
         return pipeline;
     }
 
