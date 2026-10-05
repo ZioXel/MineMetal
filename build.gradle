@@ -102,6 +102,11 @@ loom {
 				vmArg "-Dminemetal.gpuDebug=true"
 				vmArg "-Dminemetal.labels=true"
 			}
+			// Sodium on Metal (no Iris): ./mm.sh run -PsodiumTest
+			if (project.hasProperty('sodiumTest')) {
+				def sodiumJar = file('run/mods-stage0').listFiles()?.find { it.name.startsWith('sodium') }
+				if (sodiumJar != null) vmArg "-Dfabric.addMods=" + sodiumJar.absolutePath
+			}
 			// Stage 0 shader-pack test: vanilla OpenGL + Iris/Sodium from run/mods-stage0 (./mm.sh run -PirisTest)
 			if (project.hasProperty('irisTest')) {
 				vmArg "-Dfabric.addMods=" + file('run/mods-stage0').absolutePath
