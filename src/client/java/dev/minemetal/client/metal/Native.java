@@ -79,7 +79,7 @@ public final class Native {
         PASS_BEGIN, PASS_END, PASS_PUSH_DEBUG, PASS_POP_DEBUG, PASS_SET_SCISSOR, PASS_SET_PIPELINE, PASS_SET_VERTEX_BUFFER, PASS_SET_BUFFER,
         PASS_SET_BYTES, PASS_SET_TEXTURE, PASS_SET_SAMPLER, PASS_SET_TEXEL_BUFFER, PASS_SET_INDEX_BUFFER, PASS_DRAW, PASS_DRAW_INDEXED,
         PASS_MULTI_DRAW, PASS_MULTI_DRAW_INDEXED, PASS_DRAW_INDIRECT, PASS_DRAW_INDEXED_INDIRECT, PIPELINE_CREATE, SURFACE_CREATE,
-        SURFACE_CONFIGURE, SURFACE_ACQUIRE, SURFACE_BLIT, SURFACE_DROP, SET_FAST_MATH, SET_GPU_DEBUG, SET_DEPTH_FLIP, SURFACE_STATS, PASS_SET_VIEWPORT, GENERATE_MIPMAPS, SAMPLER_CREATE_EX;
+        SURFACE_CONFIGURE, SURFACE_ACQUIRE, SURFACE_BLIT, SURFACE_DROP, SET_FAST_MATH, SET_COALESCE, SET_GPU_DEBUG, SET_DEPTH_FLIP, PROF_ENABLE, PROF_SET_TAG, PROF_READ, SURFACE_STATS, PASS_SET_VIEWPORT, GENERATE_MIPMAPS, SAMPLER_CREATE_EX;
 
     private static void bind() {
         ENUM = h("mm_enum", f(JAVA_LONG, P, P));
@@ -136,8 +136,12 @@ public final class Native {
         SURFACE_BLIT = h("mm_surface_blit", v(P, P, P, JAVA_INT, JAVA_INT));
         SURFACE_DROP = h("mm_surface_drop", v(P));
         SET_FAST_MATH = h("mm_set_fast_math", v(JAVA_INT));
+        SET_COALESCE = h("mm_set_coalesce", v(JAVA_INT));
         SET_GPU_DEBUG = h("mm_set_gpu_debug", v(P, JAVA_INT));
         SET_DEPTH_FLIP = hc("mm_set_depth_flip", v(P, JAVA_INT));
+        PROF_ENABLE = h("mm_prof_enable", f(JAVA_INT, P));
+        PROF_SET_TAG = hc("mm_prof_set_tag", v(P, JAVA_INT));
+        PROF_READ = h("mm_prof_read", v(P, P));
         SURFACE_STATS = h("mm_surface_stats", v(P, P));
         PASS_SET_VIEWPORT = hc("mm_pass_set_viewport", v(P, JAVA_DOUBLE, JAVA_DOUBLE, JAVA_DOUBLE, JAVA_DOUBLE, JAVA_DOUBLE, JAVA_DOUBLE));
         GENERATE_MIPMAPS = h("mm_generate_mipmaps", v(P, P));
@@ -419,6 +423,10 @@ public final class Native {
         try { SURFACE_DROP.invokeExact(surface); } catch (Throwable t) { throw rethrow(t); }
     }
 
+    public static void setCoalesce(boolean enabled) {
+        try { SET_COALESCE.invokeExact(b(enabled)); } catch (Throwable t) { throw rethrow(t); }
+    }
+
     public static void setFastMath(boolean enabled) {
         try { SET_FAST_MATH.invokeExact(b(enabled)); } catch (Throwable t) { throw rethrow(t); }
     }
@@ -429,6 +437,18 @@ public final class Native {
 
     public static void setDepthFlip(long ctx, boolean flip) {
         try { SET_DEPTH_FLIP.invokeExact(ctx, b(flip)); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    public static int profEnable(long ctx) {
+        try { return (int) PROF_ENABLE.invokeExact(ctx); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    public static void profSetTag(long ctx, int tag) {
+        try { PROF_SET_TAG.invokeExact(ctx, tag); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    public static void profRead(long ctx, long out) {
+        try { PROF_READ.invokeExact(ctx, out); } catch (Throwable t) { throw rethrow(t); }
     }
 
     public static void surfaceStats(long surface, long out) {

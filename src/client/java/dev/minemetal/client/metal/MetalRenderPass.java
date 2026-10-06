@@ -98,12 +98,13 @@ public final class MetalRenderPass implements RenderPassBackend {
     }
 
     MetalRenderPass(final MetalDevice device, final RenderPass.RenderArea renderArea, final int outputWidth, final int outputHeight,
-                    final long[] passViews, final long passDepthView) {
+                    final long[] passViews, final long passDepthView, final boolean begun) {
         this.device = device;
         this.passViews = passViews;
         this.passDepthView = passDepthView;
-        this.activeViews = passViews;
-        this.activeDepthView = passDepthView;
+        // Not begun yet: the first draw opens the Metal pass on whichever target it needs.
+        this.activeViews = begun ? passViews : null;
+        this.activeDepthView = begun ? passDepthView : 0L;
         this.ctx = device.ctx();
         this.renderArea = renderArea;
         this.outputWidth = outputWidth;

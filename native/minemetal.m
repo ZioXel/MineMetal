@@ -187,6 +187,11 @@ MM_EXPORT int64_t mm_enum(const char *kind, const char *name) {
 // Context
 // ---------------------------------------------------------------------------------------------------------------------
 
+static int g_noCoalesce = 0; // -Dminemetal.noCoalesce=true: one encoder per pass (debugging)
+#define MM_PROF_SLOTS 4096
+#define MM_PROF_TAGS 16
+#define MM_PROF_BLIT 0x80
+
 @interface MMContext : NSObject {
 @public
     _Atomic double gpuFrameTime;  // smoothed GPU execution time of a submitted command buffer (s)
@@ -208,6 +213,29 @@ MM_EXPORT int64_t mm_enum(const char *kind, const char *name) {
     float boundBias[2];
 @public
     int gpuDebug;
+    // GPU profiler (-Dminemetal.gpuProfile): stage-boundary timestamps per encoder, summed per Java-set tag.
+    // Encoder coalescing: mm_pass_end leaves the encoder open ("lingering"); a following mm_pass_begin on exactly the
+    // same attachments without clears continues it instead of storing and reloading every attachment (TBDR).
+    int renderLingering;
+    int rpCount;
+    void *rpColor[8];
+    void *rpDepth;
+    int profEnabled;
+    int profSplit;               // fallback: one command buffer per phase, timed with GPUStart/EndTime
+    int profCbTag;               // tag the open command buffer belongs to (split mode)
+    uint32_t profCbEncoders;     // encoders recorded into the open command buffer (split mode)
+    int profTag;
+    id<MTLCounterSampleBuffer> profBuffer;
+    NSUInteger profSlots;        // capacity of profBuffer in encoder slots
+    NSUInteger profCursor;       // next encoder slot (4 samples per slot)
+    NSUInteger profCbStart;      // first slot of the open command buffer
+    uint8_t profTagOf[MM_PROF_SLOTS];
+    pthread_mutex_t profMutex;
+    double profTicks[MM_PROF_TAGS];
+    uint32_t profEncoders[MM_PROF_TAGS];
+    double profCbSeconds;
+    uint32_t profCbCount;
+    MTLTimestamp profCpu0, profGpu0;
 }
 @property(nonatomic, strong) id<MTLDevice> device;
 @property(nonatomic, strong) id<MTLCommandQueue> queue;
@@ -233,6 +261,7 @@ MM_EXPORT int64_t mm_enum(const char *kind, const char *name) {
 - (instancetype)init {
     if ((self = [super init])) {
         pthread_mutex_init(&completionMutex, NULL);
+        pthread_mutex_init(&profMutex, NULL);
         pthread_cond_init(&completionCond, NULL);
         completedIndex = 0;
         submitIndex = 1;
@@ -243,6 +272,7 @@ MM_EXPORT int64_t mm_enum(const char *kind, const char *name) {
 - (void)dealloc {
     pthread_cond_destroy(&completionCond);
     pthread_mutex_destroy(&completionMutex);
+    pthread_mutex_destroy(&profMutex);
 }
 @end
 
@@ -330,6 +360,77 @@ MM_EXPORT void mm_set_depth_flip(void *p, int flip) {
     }
 }
 
+/** Turns the GPU profiler on (returns 0 when the device cannot sample timestamps at encoder boundaries). */
+MM_EXPORT int mm_prof_enable(void *p) {
+    @autoreleasepool {
+        MMContext *ctx = CTX(p);
+        if (ctx->profBuffer != nil || ctx->profSplit) { ctx->profEnabled = 1; return ctx->profSplit ? 2 : 1; }
+        id<MTLCounterSet> timestamps = nil;
+        for (id<MTLCounterSet> set in ctx.device.counterSets) {
+            if ([set.name isEqualToString:MTLCommonCounterSetTimestamp]) timestamps = set;
+        }
+        if (timestamps == nil || ![ctx.device supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
+            // Apple GPUs: no encoder-boundary timestamps. Time one command buffer per phase instead.
+            ctx->profSplit = 1;
+            ctx->profEnabled = 1;
+            return 2;
+        }
+        NSError *err = nil;
+        for (NSUInteger slots = MM_PROF_SLOTS; slots >= 256 && ctx->profBuffer == nil; slots /= 2) {
+            MTLCounterSampleBufferDescriptor *d = [[MTLCounterSampleBufferDescriptor alloc] init];
+            d.counterSet = timestamps;
+            d.storageMode = MTLStorageModeShared;
+            d.sampleCount = slots * 4;
+            d.label = @"MineMetal profiler";
+            err = nil;
+            ctx->profBuffer = [ctx.device newCounterSampleBufferWithDescriptor:d error:&err];
+            if (ctx->profBuffer != nil) ctx->profSlots = slots;
+        }
+        if (ctx->profBuffer == nil) {
+            NSLog(@"[MineMetal] profiler: no counter sample buffer (%@); timing one command buffer per phase", err);
+            ctx->profSplit = 1;
+            ctx->profEnabled = 1;
+            return 2;
+        }
+        [ctx.device sampleTimestamps:&ctx->profCpu0 gpuTimestamp:&ctx->profGpu0];
+        ctx->profEnabled = 1;
+        return 1;
+    }
+}
+
+MM_EXPORT void mm_set_coalesce(int enabled) {
+    g_noCoalesce = enabled ? 0 : 1;
+}
+
+MM_EXPORT void mm_prof_set_tag(void *p, int tag) {
+    CTX(p)->profTag = tag;
+}
+
+/**
+ * Reads and resets the totals: out[t*2] = GPU ms of tag t's encoders, out[t*2+1] = encoder count (t < 16),
+ * out[32] = summed command buffer GPU time (ms), out[33] = command buffers, out[34] = GPU ticks per ns used.
+ */
+MM_EXPORT void mm_prof_read(void *p, double *out) {
+    MMContext *ctx = CTX(p);
+    MTLTimestamp cpu = 0, gpu = 0;
+    [ctx.device sampleTimestamps:&cpu gpuTimestamp:&gpu];
+    double ticksPerNs = (cpu > ctx->profCpu0 && gpu > ctx->profGpu0) ? (double)(gpu - ctx->profGpu0) / (double)(cpu - ctx->profCpu0) : 1.0;
+    if (ticksPerNs <= 0.0 || ctx->profSplit) ticksPerNs = 1.0;
+    pthread_mutex_lock(&ctx->profMutex);
+    for (int t = 0; t < MM_PROF_TAGS; t++) {
+        out[t * 2] = ctx->profTicks[t] / ticksPerNs / 1.0e6;
+        out[t * 2 + 1] = ctx->profEncoders[t];
+        ctx->profTicks[t] = 0.0;
+        ctx->profEncoders[t] = 0;
+    }
+    out[32] = ctx->profCbSeconds * 1000.0;
+    out[33] = ctx->profCbCount;
+    out[34] = ticksPerNs;
+    ctx->profCbSeconds = 0.0;
+    ctx->profCbCount = 0;
+    pthread_mutex_unlock(&ctx->profMutex);
+}
+
 MM_EXPORT void mm_destroy_context(void *p) {
     if (p == NULL) return;
     MMContext *ctx = (__bridge_transfer MMContext *)p;
@@ -380,23 +481,127 @@ static id<MTLCommandBuffer> mm_cmd(MMContext *ctx) {
             ctx.cmd = [ctx.queue commandBuffer];
         }
         ctx.cmd.label = [NSString stringWithFormat:@"MineMetal submit %llu", ctx->submitIndex];
+        if (ctx->profCursor > ctx->profSlots * 3 / 4) ctx->profCursor = 0;
+        ctx->profCbStart = ctx->profCursor;
+        ctx->profCbTag = ctx->profTag;
+        ctx->profCbEncoders = 0;
     }
     return ctx.cmd;
 }
 
+/** Split-mode profiling: adds one command buffer's GPU time to a tag. */
+static void mm_prof_add_cb(MMContext *ctx, int tag, uint32_t encoders, double seconds) {
+    if (tag < 0 || tag >= MM_PROF_TAGS) tag = 0;
+    pthread_mutex_lock(&ctx->profMutex);
+    ctx->profTicks[tag] += seconds * 1.0e9;
+    ctx->profEncoders[tag] += encoders;
+    if (seconds > 0.0) { ctx->profCbSeconds += seconds; ctx->profCbCount++; }
+    pthread_mutex_unlock(&ctx->profMutex);
+}
+
+/**
+ * Split mode: when a new encoder starts in a different phase than the open command buffer, commits that command
+ * buffer on its own so its GPU time can be attributed to its phase (only between encoders, never inside one).
+ */
+static void mm_prof_maybe_split(MMContext *ctx) {
+    if (!ctx->profEnabled || !ctx->profSplit || ctx.cmd == nil || ctx.render != nil || ctx.blit != nil) return;
+    if (ctx->profCbTag == ctx->profTag) return;
+    id<MTLCommandBuffer> cmd = ctx.cmd;
+    int tag = ctx->profCbTag;
+    uint32_t encoders = ctx->profCbEncoders;
+    MMContext *weakCtx = ctx;
+    [cmd addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+        CFTimeInterval gs = cb.GPUStartTime, ge = cb.GPUEndTime;
+        mm_prof_add_cb(weakCtx, tag, encoders, ge > gs && gs > 0.0 ? ge - gs : 0.0);
+    }];
+    [cmd commit];
+    ctx.cmd = nil;
+}
+
+/** Reserves a timestamp slot for the next encoder (or NSNotFound when profiling is off / the ring is full). */
+static NSUInteger mm_prof_slot(MMContext *ctx, BOOL blit) {
+    if (!ctx->profEnabled || ctx->profBuffer == nil) return NSNotFound;
+    mm_cmd(ctx);
+    if (ctx->profCursor >= ctx->profSlots) return NSNotFound;
+    NSUInteger s = ctx->profCursor++;
+    ctx->profTagOf[s] = (uint8_t)((ctx->profTag & 0x7F) | (blit ? MM_PROF_BLIT : 0));
+    return s;
+}
+
+static void mm_prof_attach_render(MMContext *ctx, MTLRenderPassDescriptor *rp) {
+    NSUInteger s = mm_prof_slot(ctx, NO);
+    if (s == NSNotFound) return;
+    MTLRenderPassSampleBufferAttachmentDescriptor *a = rp.sampleBufferAttachments[0];
+    a.sampleBuffer = ctx->profBuffer;
+    a.startOfVertexSampleIndex = s * 4;
+    a.endOfVertexSampleIndex = s * 4 + 1;
+    a.startOfFragmentSampleIndex = s * 4 + 2;
+    a.endOfFragmentSampleIndex = s * 4 + 3;
+}
+
+static id<MTLRenderCommandEncoder> mm_render_encoder(MMContext *ctx, MTLRenderPassDescriptor *rp) {
+    mm_prof_maybe_split(ctx);
+    mm_prof_attach_render(ctx, rp);
+    mm_cmd(ctx);
+    ctx->profCbEncoders++;
+    return [mm_cmd(ctx) renderCommandEncoderWithDescriptor:rp];
+}
+
+static id<MTLBlitCommandEncoder> mm_new_blit_encoder(MMContext *ctx) {
+    mm_prof_maybe_split(ctx);
+    mm_cmd(ctx);
+    ctx->profCbEncoders++;
+    NSUInteger s = mm_prof_slot(ctx, YES);
+    if (s == NSNotFound) return [mm_cmd(ctx) blitCommandEncoder];
+    MTLBlitPassDescriptor *d = [MTLBlitPassDescriptor blitPassDescriptor];
+    d.sampleBufferAttachments[0].sampleBuffer = ctx->profBuffer;
+    d.sampleBufferAttachments[0].startOfEncoderSampleIndex = s * 4;
+    d.sampleBufferAttachments[0].endOfEncoderSampleIndex = s * 4 + 1;
+    return [mm_cmd(ctx) blitCommandEncoderWithDescriptor:d];
+}
+
+/** Completion-handler side: adds the encoder durations of one command buffer to the per-tag totals. */
+static void mm_prof_collect(MMContext *ctx, id<MTLCounterSampleBuffer> buf, NSUInteger start, NSData *tags, double cbSeconds) {
+    NSUInteger n = tags.length;
+    NSData *data = n > 0 ? [buf resolveCounterRange:NSMakeRange(start * 4, n * 4)] : nil;
+    const uint8_t *tg = tags.bytes;
+    const MTLCounterResultTimestamp *ts = data != nil && data.length >= n * 4 * sizeof(MTLCounterResultTimestamp) ? data.bytes : NULL;
+    pthread_mutex_lock(&ctx->profMutex);
+    if (cbSeconds > 0.0) { ctx->profCbSeconds += cbSeconds; ctx->profCbCount++; }
+    for (NSUInteger i = 0; ts != NULL && i < n; i++) {
+        int tag = tg[i] & 0x7F;
+        if (tag >= MM_PROF_TAGS) tag = 0;
+        uint64_t lo = UINT64_MAX, hi = 0;
+        int samples = (tg[i] & MM_PROF_BLIT) ? 2 : 4;
+        for (int k = 0; k < samples; k++) {
+            uint64_t v = ts[i * 4 + k].timestamp;
+            if (v == MTLCounterErrorValue || v == 0) continue;
+            if (v < lo) lo = v;
+            if (v > hi) hi = v;
+        }
+        ctx->profEncoders[tag]++;
+        if (hi > lo) ctx->profTicks[tag] += (double)(hi - lo);
+    }
+    pthread_mutex_unlock(&ctx->profMutex);
+}
+
 static void mm_end_encoders(MMContext *ctx) {
+    ctx->renderLingering = 0;
     if (ctx.render != nil) { [ctx.render endEncoding]; ctx.render = nil; ctx.pipeline = nil; }
     if (ctx.blit != nil) { [ctx.blit endEncoding]; ctx.blit = nil; }
 }
 
 static id<MTLBlitCommandEncoder> mm_blit(MMContext *ctx) {
     if (ctx.render != nil) {
-        // Copies are not allowed inside a render pass; the frontend guarantees this never happens.
-        NSLog(@"[MineMetal] blit requested while a render pass is open; ending the pass");
+        // Copies are not allowed inside a render pass; the frontend guarantees this never happens (a lingering
+        // encoder of an already ended pass is simply closed here).
+        if (!ctx->renderLingering) NSLog(@"[MineMetal] blit requested while a render pass is open; ending the pass");
         [ctx.render endEncoding];
         ctx.render = nil;
+        ctx.pipeline = nil;
+        ctx->renderLingering = 0;
     }
-    if (ctx.blit == nil) ctx.blit = [mm_cmd(ctx) blitCommandEncoder];
+    if (ctx.blit == nil) ctx.blit = mm_new_blit_encoder(ctx);
     return ctx.blit;
 }
 
@@ -408,6 +613,14 @@ MM_EXPORT uint64_t mm_submit(void *p) {
         uint64_t index = ctx->submitIndex++;
         id<MTLCommandBuffer> cmd = mm_cmd(ctx);  // creates an empty one if nothing was recorded
         MMContext *weakCtx = ctx;  // the context outlives all command buffers (destroy waits)
+        BOOL prof = ctx->profEnabled && ctx->profBuffer != nil;
+        BOOL profSplit = ctx->profEnabled && ctx->profSplit;
+        int profCbTag = ctx->profCbTag;
+        uint32_t profCbEncoders = ctx->profCbEncoders;
+        id<MTLCounterSampleBuffer> profBuf = ctx->profBuffer;
+        NSUInteger profStart = ctx->profCbStart;
+        NSData *profTags = prof && ctx->profCursor > profStart
+            ? [NSData dataWithBytes:&ctx->profTagOf[profStart] length:ctx->profCursor - profStart] : [NSData data];
         [cmd addCompletedHandler:^(id<MTLCommandBuffer> cb) {
             if (cb.error != nil) {
                 NSLog(@"[MineMetal] command buffer %@ failed: %@", cb.label, cb.error);
@@ -426,6 +639,12 @@ MM_EXPORT uint64_t mm_submit(void *p) {
                 double cur = ge - gs;
                 // React quickly to slower frames, slowly to faster ones (pacing must not under-estimate).
                 atomic_store(&weakCtx->gpuFrameTime, cur > prevGpu ? prevGpu * 0.6 + cur * 0.4 : prevGpu * 0.95 + cur * 0.05);
+            }
+            if (profSplit) {
+                mm_prof_add_cb(weakCtx, profCbTag, profCbEncoders, ge > gs && gs > 0.0 ? ge - gs : 0.0);
+            }
+            if (prof) {
+                mm_prof_collect(weakCtx, profBuf, profStart, profTags, ge > gs && gs > 0.0 ? ge - gs : 0.0);
             }
             pthread_mutex_lock(&weakCtx->completionMutex);
             if (index > weakCtx->completedIndex) weakCtx->completedIndex = index;
@@ -673,7 +892,7 @@ MM_EXPORT void mm_clear_color_texture(void *p, void *texPtr, float r, float g, f
                 rp.colorAttachments[0].loadAction = MTLLoadActionClear;
                 rp.colorAttachments[0].storeAction = MTLStoreActionStore;
                 rp.colorAttachments[0].clearColor = MTLClearColorMake(r, g, b, a);
-                id<MTLRenderCommandEncoder> enc = [mm_cmd(ctx) renderCommandEncoderWithDescriptor:rp];
+                id<MTLRenderCommandEncoder> enc = mm_render_encoder(ctx, rp);
                 enc.label = @"MineMetal clear color";
                 [enc endEncoding];
             }
@@ -703,7 +922,7 @@ MM_EXPORT void mm_clear_depth_texture(void *p, void *texPtr, double depth) {
                     rp.stencilAttachment.loadAction = MTLLoadActionClear;
                     rp.stencilAttachment.storeAction = MTLStoreActionStore;
                 }
-                id<MTLRenderCommandEncoder> enc = [mm_cmd(ctx) renderCommandEncoderWithDescriptor:rp];
+                id<MTLRenderCommandEncoder> enc = mm_render_encoder(ctx, rp);
                 enc.label = @"MineMetal clear depth";
                 [enc endEncoding];
             }
@@ -759,7 +978,7 @@ MM_EXPORT void mm_clear_region(void *p, void *colorTex, void *depthTex, int mip,
         id<MTLRenderPipelineState> pso = mm_helper_pipeline(ctx, @"mm_clear_vs", @"mm_clear_fs", color.pixelFormat,
                                                             depthT != nil ? depthT.pixelFormat : MTLPixelFormatInvalid, YES);
         if (pso == nil) return;
-        id<MTLRenderCommandEncoder> enc = [mm_cmd(ctx) renderCommandEncoderWithDescriptor:rp];
+        id<MTLRenderCommandEncoder> enc = mm_render_encoder(ctx, rp);
         enc.label = @"MineMetal clear region";
         [enc setRenderPipelineState:pso];
         [enc setDepthStencilState:depthT != nil ? ctx.depthAlwaysWrite : ctx.depthDisabled];
@@ -786,7 +1005,34 @@ MM_EXPORT int mm_pass_begin(void *p, void **colorViews, int count, int clearMask
                             void *depthView, double clearDepth, int ax, int ay, int aw, int ah, const char *label) {
     @autoreleasepool {
         MMContext *ctx = CTX(p);
+        if (ctx.render != nil && ctx->renderLingering && clearMask == 0 && count == ctx->rpCount && count <= 8
+            && depthView == ctx->rpDepth && !g_noCoalesce) {
+            BOOL same = YES;
+            for (int i = 0; i < count; i++) {
+                if (colorViews[i] != ctx->rpColor[i]) { same = NO; break; }
+            }
+            if (same) {
+                // Same attachments, nothing to clear: keep drawing into the open encoder.
+                ctx->renderLingering = 0;
+                id<MTLRenderCommandEncoder> enc = ctx.render;
+                ctx.pipeline = nil;
+                ctx.indexBuffer = nil;
+                // The redundant-state caches still describe this encoder exactly, so they stay valid.
+                NSUInteger width = ctx.passWidth, height = ctx.passHeight;
+                [enc setViewport:(MTLViewport){0.0, 0.0, (double)width, (double)height, 0.0, 1.0}];
+                int x0 = MAX(ax, 0), y0 = MAX(ay, 0);
+                int x1 = MIN(ax + aw, (int)width), y1 = MIN(ay + ah, (int)height);
+                if (x1 < x0) x1 = x0;
+                if (y1 < y0) y1 = y0;
+                [enc setScissorRect:(MTLScissorRect){(NSUInteger)x0, (NSUInteger)y0, (NSUInteger)(x1 - x0), (NSUInteger)(y1 - y0)}];
+                ctx->scissor[0] = x0; ctx->scissor[1] = y0; ctx->scissor[2] = x1 - x0; ctx->scissor[3] = y1 - y0;
+                return 1;
+            }
+        }
         mm_end_encoders(ctx);
+        ctx->rpCount = count <= 8 ? count : -1;
+        for (int i = 0; i < count && i < 8; i++) ctx->rpColor[i] = colorViews[i];
+        ctx->rpDepth = depthView;
         MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
         NSUInteger width = 0, height = 0;
         for (int i = 0; i < count; i++) {
@@ -822,7 +1068,7 @@ MM_EXPORT int mm_pass_begin(void *p, void **colorViews, int count, int clearMask
             if (width == 0) { width = t.width; height = t.height; }
         }
         if (width == 0 || height == 0) return 0;
-        id<MTLRenderCommandEncoder> enc = [mm_cmd(ctx) renderCommandEncoderWithDescriptor:rp];
+        id<MTLRenderCommandEncoder> enc = mm_render_encoder(ctx, rp);
         if (enc == nil) return 0;
         if (label != NULL) enc.label = [NSString stringWithUTF8String:label];
         ctx.render = enc;
@@ -852,8 +1098,12 @@ MM_EXPORT void mm_pass_set_viewport(void *p, double x, double y, double w, doubl
 MM_EXPORT void mm_pass_end(void *p) {
     MMContext *ctx = CTX(p);
     if (ctx.render != nil) {
-        [ctx.render endEncoding];
-        ctx.render = nil;
+        if (g_noCoalesce) {
+            [ctx.render endEncoding];
+            ctx.render = nil;
+        } else {
+            ctx->renderLingering = 1; // closed by the next encoder / submit, or continued by an identical pass
+        }
     }
     ctx.pipeline = nil;
     ctx.indexBuffer = nil;
@@ -1450,7 +1700,7 @@ MM_EXPORT void mm_surface_blit(void *p, void *surfacePtr, void *srcView, int cop
         rp.colorAttachments[0].loadAction = MTLLoadActionClear;
         rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
         rp.colorAttachments[0].storeAction = MTLStoreActionStore;
-        id<MTLRenderCommandEncoder> enc = [mm_cmd(ctx) renderCommandEncoderWithDescriptor:rp];
+        id<MTLRenderCommandEncoder> enc = mm_render_encoder(ctx, rp);
         enc.label = @"MineMetal present";
         if (pso != nil) {
             uint32_t size[2] = {(uint32_t)MAX(copyWidth, 0), (uint32_t)MAX(copyHeight, 0)};

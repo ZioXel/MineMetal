@@ -56,12 +56,15 @@ public final class MetalDevice implements GpuDeviceBackend {
         MetalEnums.init();
         // Fast math (with preserveInvariance) is the default; -Dminemetal.safeMath=true restores IEEE-exact shaders.
         Native.setFastMath(!Boolean.getBoolean("minemetal.safeMath"));
+        // Consecutive passes on the same attachments share one Metal encoder; -Dminemetal.noCoalesce=true turns that off.
+        Native.setCoalesce(!Boolean.getBoolean("minemetal.noCoalesce"));
         try (MemoryStack stack = MemoryStack.stackPush()) {
             ByteBuffer err = stack.calloc(1024);
             this.ctx = Native.createContext(MemoryUtil.memAddress(err), err.capacity());
             if (this.ctx == 0L) {
                 throw new BackendCreationException("Metal: " + MemoryUtil.memUTF8(MemoryUtil.memAddress(err)), BackendCreationException.Reason.PLATFORM_ERROR);
             }
+            MetalProfiler.init(this.ctx);
             ByteBuffer name = stack.calloc(256);
             LongBuffer info = stack.callocLong(8);
             Native.contextInfo(this.ctx, MemoryUtil.memAddress(name), name.capacity(), MemoryUtil.memAddress(info));

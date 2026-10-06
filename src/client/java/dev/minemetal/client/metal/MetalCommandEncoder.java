@@ -125,6 +125,8 @@ public final class MetalCommandEncoder implements CommandEncoderBackend {
         return flip;
     }
 
+    private static final boolean LAZY_PASSES_OFF = Boolean.getBoolean("minemetal.noCoalesce");
+
     @Override
     public RenderPassBackend createRenderPass(final RenderPassDescriptor descriptor) {
         if (this.currentRenderPass != null) {
@@ -171,16 +173,21 @@ public final class MetalCommandEncoder implements CommandEncoderBackend {
             this.depthFlip();
             long label = this.device.labelsEnabled() ? MemoryUtil.memAddress(stack.UTF8(descriptor.label().get())) : 0L;
             var area = descriptor.renderArea();
-            boolean ok = Native.passBegin(this.ctx(), MemoryUtil.memAddress(views), count, clearMask, MemoryUtil.memAddress(clearColors), depthView,
-                clearDepth, area.x(), area.y(), area.width(), area.height(), label);
-            if (!ok) {
-                throw new IllegalStateException("Failed to begin Metal render pass " + descriptor.label().get());
+            // Passes without clears begin lazily at their first draw (often on another target, e.g. an Iris
+            // framebuffer, or not at all), so the pass target is not loaded and stored for nothing.
+            boolean begun = clearMask != 0 || LAZY_PASSES_OFF;
+            if (begun) {
+                boolean ok = Native.passBegin(this.ctx(), MemoryUtil.memAddress(views), count, clearMask, MemoryUtil.memAddress(clearColors), depthView,
+                    clearDepth, area.x(), area.y(), area.width(), area.height(), label);
+                if (!ok) {
+                    throw new IllegalStateException("Failed to begin Metal render pass " + descriptor.label().get());
+                }
             }
             long[] viewHandles = new long[count];
             for (int i = 0; i < count; i++) {
                 viewHandles[i] = views.get(i);
             }
-            this.currentRenderPass = new MetalRenderPass(this.device, area, width, height, viewHandles, depthView);
+            this.currentRenderPass = new MetalRenderPass(this.device, area, width, height, viewHandles, depthView, begun);
             if (FrameTrace.active()) {
                 FrameTrace.event("pass '" + descriptor.label().get() + "' views " + java.util.Arrays.toString(viewHandles) + " depth " + depthView + " clear " + clearMask);
             }

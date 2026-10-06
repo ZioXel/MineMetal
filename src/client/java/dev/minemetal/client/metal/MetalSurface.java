@@ -83,6 +83,7 @@ public final class MetalSurface implements GpuSurfaceBackend {
     public void blitFromTexture(final CommandEncoderBackend commandEncoder, final GpuTextureView textureView) {
         int copyWidth = Math.min(this.width, textureView.getWidth(0));
         int copyHeight = Math.min(this.height, textureView.getHeight(0));
+        MetalProfiler.phase("present");
         ((MetalCommandEncoder) commandEncoder).presentBlit(this, textureView, copyWidth, copyHeight);
         this.acquired = false;
     }
@@ -90,6 +91,8 @@ public final class MetalSurface implements GpuSurfaceBackend {
     @Override
     public void present() {
         FrameTrace.framePresented();
+        MetalProfiler.frame();
+        MetalProfiler.phase("other");
         // Presentation was scheduled on the command buffer in blitFromTexture ([MTLCommandBuffer presentDrawable:]),
         // so it happens when the frame's submit completes on the GPU.
         if (this.acquired) {
