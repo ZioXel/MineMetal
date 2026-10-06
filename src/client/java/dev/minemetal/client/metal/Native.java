@@ -79,7 +79,8 @@ public final class Native {
         PASS_BEGIN, PASS_END, PASS_PUSH_DEBUG, PASS_POP_DEBUG, PASS_SET_SCISSOR, PASS_SET_PIPELINE, PASS_SET_VERTEX_BUFFER, PASS_SET_BUFFER,
         PASS_SET_BYTES, PASS_SET_TEXTURE, PASS_SET_SAMPLER, PASS_SET_TEXEL_BUFFER, PASS_SET_INDEX_BUFFER, PASS_DRAW, PASS_DRAW_INDEXED,
         PASS_MULTI_DRAW, PASS_MULTI_DRAW_INDEXED, PASS_DRAW_INDIRECT, PASS_DRAW_INDEXED_INDIRECT, PIPELINE_CREATE, SURFACE_CREATE,
-        SURFACE_CONFIGURE, SURFACE_ACQUIRE, SURFACE_BLIT, SURFACE_DROP, SET_FAST_MATH, SET_COALESCE, SET_GPU_DEBUG, SET_DEPTH_FLIP, PROF_ENABLE, PROF_SET_TAG, PROF_READ, SURFACE_STATS, PASS_SET_VIEWPORT, GENERATE_MIPMAPS, SAMPLER_CREATE_EX;
+        SURFACE_CONFIGURE, SURFACE_ACQUIRE, SURFACE_BLIT, SURFACE_DROP, SET_FAST_MATH, SET_COALESCE, SET_GPU_DEBUG, SET_DEPTH_FLIP, PROF_ENABLE, PROF_SET_TAG, PROF_READ, SURFACE_STATS, PASS_SET_VIEWPORT, GENERATE_MIPMAPS, SAMPLER_CREATE_EX,
+        COMPUTE_PIPELINE_CREATE, COMPUTE_MAX_THREADS, COMPUTE_SET_PIPELINE, COMPUTE_SET_BUFFER, COMPUTE_SET_BYTES, COMPUTE_SET_TEXTURE, COMPUTE_SET_SAMPLER, COMPUTE_DISPATCH, COMPUTE_DISPATCH_INDIRECT, MEMORY_BARRIER, PASS_MARK_STORAGE, FILL_BUFFER, TEXTURE_ZERO, COPY_TEXTURE_ALL;
 
     private static void bind() {
         ENUM = h("mm_enum", f(JAVA_LONG, P, P));
@@ -145,6 +146,20 @@ public final class Native {
         SURFACE_STATS = h("mm_surface_stats", v(P, P));
         PASS_SET_VIEWPORT = hc("mm_pass_set_viewport", v(P, JAVA_DOUBLE, JAVA_DOUBLE, JAVA_DOUBLE, JAVA_DOUBLE, JAVA_DOUBLE, JAVA_DOUBLE));
         GENERATE_MIPMAPS = h("mm_generate_mipmaps", v(P, P));
+        COMPUTE_PIPELINE_CREATE = h("mm_compute_pipeline_create", f(P, P, P, P, P, P, JAVA_INT));
+        COMPUTE_MAX_THREADS = hc("mm_compute_max_threads", f(JAVA_INT, P));
+        COMPUTE_SET_PIPELINE = hc("mm_compute_set_pipeline", v(P, P));
+        COMPUTE_SET_BUFFER = hc("mm_compute_set_buffer", v(P, P, JAVA_LONG, JAVA_INT));
+        COMPUTE_SET_BYTES = hc("mm_compute_set_bytes", v(P, P, JAVA_LONG, JAVA_INT));
+        COMPUTE_SET_TEXTURE = hc("mm_compute_set_texture", v(P, P, JAVA_INT));
+        COMPUTE_SET_SAMPLER = hc("mm_compute_set_sampler", v(P, P, JAVA_INT));
+        COMPUTE_DISPATCH = hc("mm_compute_dispatch", v(P, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT));
+        COMPUTE_DISPATCH_INDIRECT = hc("mm_compute_dispatch_indirect", v(P, P, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT));
+        MEMORY_BARRIER = hc("mm_memory_barrier", v(P));
+        PASS_MARK_STORAGE = hc("mm_pass_mark_storage", v(P));
+        FILL_BUFFER = h("mm_fill_buffer", v(P, P, JAVA_LONG, JAVA_LONG, JAVA_INT));
+        TEXTURE_ZERO = h("mm_texture_zero", v(P, P, JAVA_INT, JAVA_INT));
+        COPY_TEXTURE_ALL = h("mm_copy_texture_all", v(P, P, P));
         SAMPLER_CREATE_EX = h("mm_sampler_create_ex",
             f(P, P, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_FLOAT, JAVA_FLOAT, JAVA_LONG));
     }
@@ -449,6 +464,65 @@ public final class Native {
 
     public static void profRead(long ctx, long out) {
         try { PROF_READ.invokeExact(ctx, out); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    // --- stage 4: compute / storage ---
+
+    /** MSL kernel → compute pipeline (0 on failure, message in err). */
+    public static long computePipelineCreate(long ctx, long name, long src, long entry, long err, int errLen) {
+        try { return (long) COMPUTE_PIPELINE_CREATE.invokeExact(ctx, name, src, entry, err, errLen); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    public static int computeMaxThreads(long pso) {
+        try { return (int) COMPUTE_MAX_THREADS.invokeExact(pso); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    public static void computeSetPipeline(long ctx, long pso) {
+        try { COMPUTE_SET_PIPELINE.invokeExact(ctx, pso); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    public static void computeSetBuffer(long ctx, long buffer, long offset, int index) {
+        try { COMPUTE_SET_BUFFER.invokeExact(ctx, buffer, offset, index); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    public static void computeSetBytes(long ctx, long data, long length, int index) {
+        try { COMPUTE_SET_BYTES.invokeExact(ctx, data, length, index); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    public static void computeSetTexture(long ctx, long texture, int index) {
+        try { COMPUTE_SET_TEXTURE.invokeExact(ctx, texture, index); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    public static void computeSetSampler(long ctx, long sampler, int index) {
+        try { COMPUTE_SET_SAMPLER.invokeExact(ctx, sampler, index); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    public static void computeDispatch(long ctx, int gx, int gy, int gz, int tx, int ty, int tz) {
+        try { COMPUTE_DISPATCH.invokeExact(ctx, gx, gy, gz, tx, ty, tz); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    public static void computeDispatchIndirect(long ctx, long buffer, long offset, int tx, int ty, int tz) {
+        try { COMPUTE_DISPATCH_INDIRECT.invokeExact(ctx, buffer, offset, tx, ty, tz); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    public static void memoryBarrier(long ctx) {
+        try { MEMORY_BARRIER.invokeExact(ctx); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    public static void passMarkStorage(long ctx) {
+        try { PASS_MARK_STORAGE.invokeExact(ctx); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    public static void fillBuffer(long ctx, long buffer, long offset, long size, int value) {
+        try { FILL_BUFFER.invokeExact(ctx, buffer, offset, size, value); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    public static void textureZero(long ctx, long texture, int level, int bytesPerPixel) {
+        try { TEXTURE_ZERO.invokeExact(ctx, texture, level, bytesPerPixel); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    public static void copyTextureAll(long ctx, long src, long dst) {
+        try { COPY_TEXTURE_ALL.invokeExact(ctx, src, dst); } catch (Throwable t) { throw rethrow(t); }
     }
 
     public static void surfaceStats(long surface, long out) {

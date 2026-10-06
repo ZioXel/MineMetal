@@ -39,15 +39,15 @@ public final class GLDispatch {
     }
 
     public static void glBindBuffer(final int a0, final int a1) {
-        
+        MetalGL.glBindBuffer(a0, a1);
     }
 
     public static void glBindBufferBase(final int a0, final int a1, final int a2) {
-        
+        MetalGL.glBindBufferBase(a0, a1, a2);
     }
 
     public static void glBindImageTexture(final int a0, final int a1, final int a2, final boolean a3, final int a4, final int a5, final int a6) {
-        unsupported("glBindImageTexture(int, int, int, boolean, int, int, int)"); 
+        MetalGL.glBindImageTexture(a0, a1, a2, a3, a4, a5, a6);
     }
 
     public static void glBindSampler(final int a0, final int a1) {
@@ -83,31 +83,31 @@ public final class GLDispatch {
     }
 
     public static void glBufferData(final int a0, final java.nio.ByteBuffer a1, final int a2) {
-        unsupported("glBufferData(int, java.nio.ByteBuffer, int)"); 
+        MetalGL.glBufferStorageData(a0, org.lwjgl.system.MemoryUtil.memAddress(a1), ((long) a1.remaining() << 0));
     }
 
     public static void glBufferData(final int a0, final java.nio.DoubleBuffer a1, final int a2) {
-        unsupported("glBufferData(int, java.nio.DoubleBuffer, int)"); 
+        MetalGL.glBufferStorageData(a0, org.lwjgl.system.MemoryUtil.memAddress(a1), ((long) a1.remaining() << 3));
     }
 
     public static void glBufferData(final int a0, final java.nio.FloatBuffer a1, final int a2) {
-        unsupported("glBufferData(int, java.nio.FloatBuffer, int)"); 
+        MetalGL.glBufferStorageData(a0, org.lwjgl.system.MemoryUtil.memAddress(a1), ((long) a1.remaining() << 2));
     }
 
     public static void glBufferData(final int a0, final java.nio.IntBuffer a1, final int a2) {
-        unsupported("glBufferData(int, java.nio.IntBuffer, int)"); 
+        MetalGL.glBufferStorageData(a0, org.lwjgl.system.MemoryUtil.memAddress(a1), ((long) a1.remaining() << 2));
     }
 
     public static void glBufferData(final int a0, final java.nio.LongBuffer a1, final int a2) {
-        unsupported("glBufferData(int, java.nio.LongBuffer, int)"); 
+        MetalGL.glBufferStorageData(a0, org.lwjgl.system.MemoryUtil.memAddress(a1), ((long) a1.remaining() << 3));
     }
 
     public static void glBufferData(final int a0, final java.nio.ShortBuffer a1, final int a2) {
-        unsupported("glBufferData(int, java.nio.ShortBuffer, int)"); 
+        MetalGL.glBufferStorageData(a0, org.lwjgl.system.MemoryUtil.memAddress(a1), ((long) a1.remaining() << 1));
     }
 
     public static void glBufferData(final int a0, final long a1, final int a2) {
-        unsupported("glBufferData(int, long, int)"); 
+        MetalGL.glBufferData(a0, a1, a2);
     }
 
     public static void glBufferData(final int a0, final long[] a1, final int a2) {
@@ -131,27 +131,27 @@ public final class GLDispatch {
     }
 
     public static void glBufferStorage(final int a0, final java.nio.ByteBuffer a1, final int a2) {
-        unsupported("glBufferStorage(int, java.nio.ByteBuffer, int)"); 
+        MetalGL.glBufferStorageData(a0, org.lwjgl.system.MemoryUtil.memAddress(a1), ((long) a1.remaining() << 0));
     }
 
     public static void glBufferStorage(final int a0, final java.nio.DoubleBuffer a1, final int a2) {
-        unsupported("glBufferStorage(int, java.nio.DoubleBuffer, int)"); 
+        MetalGL.glBufferStorageData(a0, org.lwjgl.system.MemoryUtil.memAddress(a1), ((long) a1.remaining() << 3));
     }
 
     public static void glBufferStorage(final int a0, final java.nio.FloatBuffer a1, final int a2) {
-        unsupported("glBufferStorage(int, java.nio.FloatBuffer, int)"); 
+        MetalGL.glBufferStorageData(a0, org.lwjgl.system.MemoryUtil.memAddress(a1), ((long) a1.remaining() << 2));
     }
 
     public static void glBufferStorage(final int a0, final java.nio.IntBuffer a1, final int a2) {
-        unsupported("glBufferStorage(int, java.nio.IntBuffer, int)"); 
+        MetalGL.glBufferStorageData(a0, org.lwjgl.system.MemoryUtil.memAddress(a1), ((long) a1.remaining() << 2));
     }
 
     public static void glBufferStorage(final int a0, final java.nio.ShortBuffer a1, final int a2) {
-        unsupported("glBufferStorage(int, java.nio.ShortBuffer, int)"); 
+        MetalGL.glBufferStorageData(a0, org.lwjgl.system.MemoryUtil.memAddress(a1), ((long) a1.remaining() << 1));
     }
 
     public static void glBufferStorage(final int a0, final long a1, final int a2) {
-        unsupported("glBufferStorage(int, long, int)"); 
+        MetalGL.glBufferStorage(a0, a1, a2);
     }
 
     public static void glBufferStorage(final int a0, final short[] a1, final int a2) {
@@ -163,31 +163,31 @@ public final class GLDispatch {
     }
 
     public static void glClearBufferSubData(final int a0, final int a1, final long a2, final long a3, final int a4, final int a5, final float[] a6) {
-        unsupported("glClearBufferSubData(int, int, long, long, int, int, float[])"); 
+        MetalGL.glClearBufferSubData(a0, a1, a2, a3, a4, a5, (int[]) null);
     }
 
     public static void glClearBufferSubData(final int a0, final int a1, final long a2, final long a3, final int a4, final int a5, final int[] a6) {
-        unsupported("glClearBufferSubData(int, int, long, long, int, int, int[])"); 
+        MetalGL.glClearBufferSubData(a0, a1, a2, a3, a4, a5, a6);
     }
 
     public static void glClearBufferSubData(final int a0, final int a1, final long a2, final long a3, final int a4, final int a5, final java.nio.ByteBuffer a6) {
-        unsupported("glClearBufferSubData(int, int, long, long, int, int, java.nio.ByteBuffer)"); 
+        MetalGL.glClearBufferSubData(a0, a1, a2, a3, a4, a5, a6 != null ? org.lwjgl.system.MemoryUtil.memAddress(a6) : 0L);
     }
 
     public static void glClearBufferSubData(final int a0, final int a1, final long a2, final long a3, final int a4, final int a5, final java.nio.FloatBuffer a6) {
-        unsupported("glClearBufferSubData(int, int, long, long, int, int, java.nio.FloatBuffer)"); 
+        MetalGL.glClearBufferSubData(a0, a1, a2, a3, a4, a5, a6 != null ? org.lwjgl.system.MemoryUtil.memAddress(a6) : 0L);
     }
 
     public static void glClearBufferSubData(final int a0, final int a1, final long a2, final long a3, final int a4, final int a5, final java.nio.IntBuffer a6) {
-        unsupported("glClearBufferSubData(int, int, long, long, int, int, java.nio.IntBuffer)"); 
+        MetalGL.glClearBufferSubData(a0, a1, a2, a3, a4, a5, a6 != null ? org.lwjgl.system.MemoryUtil.memAddress(a6) : 0L);
     }
 
     public static void glClearBufferSubData(final int a0, final int a1, final long a2, final long a3, final int a4, final int a5, final java.nio.ShortBuffer a6) {
-        unsupported("glClearBufferSubData(int, int, long, long, int, int, java.nio.ShortBuffer)"); 
+        MetalGL.glClearBufferSubData(a0, a1, a2, a3, a4, a5, a6 != null ? org.lwjgl.system.MemoryUtil.memAddress(a6) : 0L);
     }
 
     public static void glClearBufferSubData(final int a0, final int a1, final long a2, final long a3, final int a4, final int a5, final short[] a6) {
-        unsupported("glClearBufferSubData(int, int, long, long, int, int, short[])"); 
+        MetalGL.glClearBufferSubData(a0, a1, a2, a3, a4, a5, (int[]) null);
     }
 
     public static void glClearBufferfv(final int a0, final int a1, final float[] a2) {
@@ -263,15 +263,15 @@ public final class GLDispatch {
     }
 
     public static void glDeleteBuffers(final int a0) {
-        
+        MetalGL.glDeleteBuffers(a0);
     }
 
     public static void glDeleteBuffers(final int[] a0) {
-        
+        for (int b : a0) MetalGL.glDeleteBuffers(b);
     }
 
     public static void glDeleteBuffers(final java.nio.IntBuffer a0) {
-        
+        for (int i = a0.position(); i < a0.limit(); i++) MetalGL.glDeleteBuffers(a0.get(i));
     }
 
     public static void glDeleteProgram(final int a0) {
@@ -303,11 +303,11 @@ public final class GLDispatch {
     }
 
     public static void glDispatchCompute(final int a0, final int a1, final int a2) {
-        unsupported("glDispatchCompute(int, int, int)"); 
+        MetalGL.glDispatchCompute(a0, a1, a2);
     }
 
     public static void glDispatchComputeIndirect(final long a0) {
-        unsupported("glDispatchComputeIndirect(long)"); 
+        MetalGL.glDispatchComputeIndirect(a0);
     }
 
     public static void glDrawBuffers(final int a0) {
@@ -451,11 +451,11 @@ public final class GLDispatch {
     }
 
     public static void glGetProgramiv(final int a0, final int a1, final int[] a2) {
-        a2[0] = MetalGL.glGetProgrami(a0, a1);
+        MetalGL.glGetProgramiv(a0, a1, a2);
     }
 
     public static void glGetProgramiv(final int a0, final int a1, final java.nio.IntBuffer a2) {
-        a2.put(a2.position(), MetalGL.glGetProgrami(a0, a1));
+        int[] v = new int[Math.max(1, a2.remaining())]; MetalGL.glGetProgramiv(a0, a1, v); for (int i = 0; i < v.length && a2.position() + i < a2.limit(); i++) a2.put(a2.position() + i, v[i]);
     }
 
     public static java.lang.String glGetShaderInfoLog(final int a0) {
@@ -503,7 +503,7 @@ public final class GLDispatch {
     }
 
     public static void glMemoryBarrier(final int a0) {
-        
+        MetalGL.glMemoryBarrier(a0);
     }
 
     public static void glNamedBufferData(final int a0, final double[] a1, final int a2) {
@@ -519,31 +519,31 @@ public final class GLDispatch {
     }
 
     public static void glNamedBufferData(final int a0, final java.nio.ByteBuffer a1, final int a2) {
-        unsupported("glNamedBufferData(int, java.nio.ByteBuffer, int)"); 
+        MetalGL.glNamedBufferStorageData(a0, org.lwjgl.system.MemoryUtil.memAddress(a1), ((long) a1.remaining() << 0));
     }
 
     public static void glNamedBufferData(final int a0, final java.nio.DoubleBuffer a1, final int a2) {
-        unsupported("glNamedBufferData(int, java.nio.DoubleBuffer, int)"); 
+        MetalGL.glNamedBufferStorageData(a0, org.lwjgl.system.MemoryUtil.memAddress(a1), ((long) a1.remaining() << 3));
     }
 
     public static void glNamedBufferData(final int a0, final java.nio.FloatBuffer a1, final int a2) {
-        unsupported("glNamedBufferData(int, java.nio.FloatBuffer, int)"); 
+        MetalGL.glNamedBufferStorageData(a0, org.lwjgl.system.MemoryUtil.memAddress(a1), ((long) a1.remaining() << 2));
     }
 
     public static void glNamedBufferData(final int a0, final java.nio.IntBuffer a1, final int a2) {
-        unsupported("glNamedBufferData(int, java.nio.IntBuffer, int)"); 
+        MetalGL.glNamedBufferStorageData(a0, org.lwjgl.system.MemoryUtil.memAddress(a1), ((long) a1.remaining() << 2));
     }
 
     public static void glNamedBufferData(final int a0, final java.nio.LongBuffer a1, final int a2) {
-        unsupported("glNamedBufferData(int, java.nio.LongBuffer, int)"); 
+        MetalGL.glNamedBufferStorageData(a0, org.lwjgl.system.MemoryUtil.memAddress(a1), ((long) a1.remaining() << 3));
     }
 
     public static void glNamedBufferData(final int a0, final java.nio.ShortBuffer a1, final int a2) {
-        unsupported("glNamedBufferData(int, java.nio.ShortBuffer, int)"); 
+        MetalGL.glNamedBufferStorageData(a0, org.lwjgl.system.MemoryUtil.memAddress(a1), ((long) a1.remaining() << 1));
     }
 
     public static void glNamedBufferData(final int a0, final long a1, final int a2) {
-        unsupported("glNamedBufferData(int, long, int)"); 
+        MetalGL.glNamedBufferData(a0, a1, a2);
     }
 
     public static void glNamedBufferData(final int a0, final long[] a1, final int a2) {
@@ -623,27 +623,27 @@ public final class GLDispatch {
     }
 
     public static void glTexImage1D(final int a0, final int a1, final int a2, final int a3, final int a4, final int a5, final int a6, final java.nio.ByteBuffer a7) {
-        unsupported("glTexImage1D(int, int, int, int, int, int, int, java.nio.ByteBuffer)"); 
+        MetalGL.glTexImage1D(a0, a1, a2, a3, a4, a5, a6, org.lwjgl.system.MemoryUtil.memAddressSafe(a7));
     }
 
     public static void glTexImage1D(final int a0, final int a1, final int a2, final int a3, final int a4, final int a5, final int a6, final java.nio.DoubleBuffer a7) {
-        unsupported("glTexImage1D(int, int, int, int, int, int, int, java.nio.DoubleBuffer)"); 
+        MetalGL.glTexImage1D(a0, a1, a2, a3, a4, a5, a6, org.lwjgl.system.MemoryUtil.memAddressSafe(a7));
     }
 
     public static void glTexImage1D(final int a0, final int a1, final int a2, final int a3, final int a4, final int a5, final int a6, final java.nio.FloatBuffer a7) {
-        unsupported("glTexImage1D(int, int, int, int, int, int, int, java.nio.FloatBuffer)"); 
+        MetalGL.glTexImage1D(a0, a1, a2, a3, a4, a5, a6, org.lwjgl.system.MemoryUtil.memAddressSafe(a7));
     }
 
     public static void glTexImage1D(final int a0, final int a1, final int a2, final int a3, final int a4, final int a5, final int a6, final java.nio.IntBuffer a7) {
-        unsupported("glTexImage1D(int, int, int, int, int, int, int, java.nio.IntBuffer)"); 
+        MetalGL.glTexImage1D(a0, a1, a2, a3, a4, a5, a6, org.lwjgl.system.MemoryUtil.memAddressSafe(a7));
     }
 
     public static void glTexImage1D(final int a0, final int a1, final int a2, final int a3, final int a4, final int a5, final int a6, final java.nio.ShortBuffer a7) {
-        unsupported("glTexImage1D(int, int, int, int, int, int, int, java.nio.ShortBuffer)"); 
+        MetalGL.glTexImage1D(a0, a1, a2, a3, a4, a5, a6, org.lwjgl.system.MemoryUtil.memAddressSafe(a7));
     }
 
     public static void glTexImage1D(final int a0, final int a1, final int a2, final int a3, final int a4, final int a5, final int a6, final long a7) {
-        unsupported("glTexImage1D(int, int, int, int, int, int, int, long)"); 
+        MetalGL.glTexImage1D(a0, a1, a2, a3, a4, a5, a6, a7);
     }
 
     public static void glTexImage1D(final int a0, final int a1, final int a2, final int a3, final int a4, final int a5, final int a6, final short[] a7) {
@@ -703,27 +703,27 @@ public final class GLDispatch {
     }
 
     public static void glTexImage3D(final int a0, final int a1, final int a2, final int a3, final int a4, final int a5, final int a6, final int a7, final int a8, final java.nio.ByteBuffer a9) {
-        unsupported("glTexImage3D(int, int, int, int, int, int, int, int, int, java.nio.ByteBuffer)"); 
+        MetalGL.glTexImage3D(a0, a1, a2, a3, a4, a5, a6, a7, a8, org.lwjgl.system.MemoryUtil.memAddressSafe(a9));
     }
 
     public static void glTexImage3D(final int a0, final int a1, final int a2, final int a3, final int a4, final int a5, final int a6, final int a7, final int a8, final java.nio.DoubleBuffer a9) {
-        unsupported("glTexImage3D(int, int, int, int, int, int, int, int, int, java.nio.DoubleBuffer)"); 
+        MetalGL.glTexImage3D(a0, a1, a2, a3, a4, a5, a6, a7, a8, org.lwjgl.system.MemoryUtil.memAddressSafe(a9));
     }
 
     public static void glTexImage3D(final int a0, final int a1, final int a2, final int a3, final int a4, final int a5, final int a6, final int a7, final int a8, final java.nio.FloatBuffer a9) {
-        unsupported("glTexImage3D(int, int, int, int, int, int, int, int, int, java.nio.FloatBuffer)"); 
+        MetalGL.glTexImage3D(a0, a1, a2, a3, a4, a5, a6, a7, a8, org.lwjgl.system.MemoryUtil.memAddressSafe(a9));
     }
 
     public static void glTexImage3D(final int a0, final int a1, final int a2, final int a3, final int a4, final int a5, final int a6, final int a7, final int a8, final java.nio.IntBuffer a9) {
-        unsupported("glTexImage3D(int, int, int, int, int, int, int, int, int, java.nio.IntBuffer)"); 
+        MetalGL.glTexImage3D(a0, a1, a2, a3, a4, a5, a6, a7, a8, org.lwjgl.system.MemoryUtil.memAddressSafe(a9));
     }
 
     public static void glTexImage3D(final int a0, final int a1, final int a2, final int a3, final int a4, final int a5, final int a6, final int a7, final int a8, final java.nio.ShortBuffer a9) {
-        unsupported("glTexImage3D(int, int, int, int, int, int, int, int, int, java.nio.ShortBuffer)"); 
+        MetalGL.glTexImage3D(a0, a1, a2, a3, a4, a5, a6, a7, a8, org.lwjgl.system.MemoryUtil.memAddressSafe(a9));
     }
 
     public static void glTexImage3D(final int a0, final int a1, final int a2, final int a3, final int a4, final int a5, final int a6, final int a7, final int a8, final long a9) {
-        unsupported("glTexImage3D(int, int, int, int, int, int, int, int, int, long)"); 
+        MetalGL.glTexImage3D(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9);
     }
 
     public static void glTexImage3D(final int a0, final int a1, final int a2, final int a3, final int a4, final int a5, final int a6, final int a7, final int a8, final short[] a9) {
@@ -925,7 +925,7 @@ public final class GLDispatch {
     }
 
     public static void gsm_glBindBuffer(final int a0, final int a1) {
-        
+        MetalGL.glBindBuffer(a0, a1);
     }
 
     public static void gsm_glBindFramebuffer(final int a0, final int a1) {
@@ -937,7 +937,7 @@ public final class GLDispatch {
     }
 
     public static void gsm_glBufferSubData(final int a0, final long a1, final java.nio.ByteBuffer a2) {
-        
+        MetalGL.glBufferSubData(a0, a1, org.lwjgl.system.MemoryUtil.memAddress(a2), a2.remaining());
     }
 
     public static void gsm_glDeleteFramebuffers(final int a0) {

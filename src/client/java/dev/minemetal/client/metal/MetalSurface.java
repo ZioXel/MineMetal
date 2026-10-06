@@ -83,6 +83,8 @@ public final class MetalSurface implements GpuSurfaceBackend {
     public void blitFromTexture(final CommandEncoderBackend commandEncoder, final GpuTextureView textureView) {
         int copyWidth = Math.min(this.width, textureView.getWidth(0));
         int copyHeight = Math.min(this.height, textureView.getHeight(0));
+        // Textures bound for image load/store inside render passes get their writable copies now (no pass is open).
+        dev.minemetal.client.glcompat.MetalGL.flushPendingWritable();
         MetalProfiler.phase("present");
         ((MetalCommandEncoder) commandEncoder).presentBlit(this, textureView, copyWidth, copyHeight);
         this.acquired = false;

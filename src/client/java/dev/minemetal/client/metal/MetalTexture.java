@@ -7,6 +7,11 @@ import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
 
 public final class MetalTexture extends BaseGpuTexture {
+    /** MineMetal-private usage bits (above renderpearl's) used by the GL emulation; see mm_texture_create. */
+    public static final int USAGE_SHADER_WRITE = 1 << 20;
+    public static final int USAGE_TYPE_1D = 1 << 21;
+    public static final int USAGE_TYPE_3D = 1 << 22;
+
     private final MetalDevice device;
     private final long handle;
     private boolean closed;

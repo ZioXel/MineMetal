@@ -32,8 +32,17 @@ public final class GlProgramCompiler {
     public static final int STAGE_VERTEX = 0;
     public static final int STAGE_FRAGMENT = 1;
     private static final int MSL_VERSION = 2 * 10000 + 4 * 100;
+    /** Programs with image load/store, SSBOs or compute: MSL 3.1 (native texture atomics). */
+    private static final int MSL_VERSION_STORAGE = 3 * 10000 + 1 * 100;
+    static final String MSL31_MARKER = "// mm:msl31\n";
     private static final int EXEC_VERTEX = 0;
     private static final int EXEC_FRAGMENT = 4;
+    private static final int EXEC_COMPUTE = 5;
+    private static final int EXECUTION_MODE_LOCAL_SIZE = 17;
+    /** MSL buffer slots: loose block 0, named blocks 1.., SSBOs 10..18, buffer sizes 19, push 20, zero attrib 21, vertex 22..30. */
+    static final int SSBO_BUFFER_BASE = 10;
+    static final int MAX_SSBOS = 9;
+    static final int BUFFER_SIZE_BUFFER = 19;
     private static final int DECORATION_LOCATION = 30;
     private static final int DECORATION_BINDING = 33;
     private static final int DECORATION_DESCRIPTOR_SET = 34;
@@ -65,13 +74,78 @@ public final class GlProgramCompiler {
         public final List<Interface> outputs = new ArrayList<>();
         /** Uniform blocks other than the implicit one (name -> MSL buffer index); bound through glBindBufferBase. */
         public final Map<String, Integer> extraBlocks = new LinkedHashMap<>();
+        /** Storage images used by this stage (names; slots are program-wide, see {@link Result#images()}). */
+        public final List<String> images = new ArrayList<>();
+        /** Shader storage blocks: GL binding point -> MSL buffer index. */
+        public final Map<Integer, Integer> ssbos = new LinkedHashMap<>();
+        /** SPIRV-Cross wants the byte sizes of the storage buffers (array .length()) at buffer {@link #BUFFER_SIZE_BUFFER}. */
+        public boolean needsBufferSizes;
+        /** Compute only: local work group size. */
+        public final int[] localSize = {1, 1, 1};
 
         StageResult(final int stage) {
             this.stage = stage;
         }
     }
 
-    public record Result(StageResult vertex, StageResult fragment, List<String> samplers) {
+    /**
+     * Compiled program. For a compute program {@code vertex} is the kernel and {@code fragment} is null.
+     * Storage image <i>i</i> uses Metal texture slot {@code samplers.size() + i}.
+     */
+    public record Result(StageResult vertex, @Nullable StageResult fragment, List<String> samplers, List<String> images, boolean compute) {
+        public List<StageResult> stages() {
+            return this.fragment == null ? List.of(this.vertex) : List.of(this.vertex, this.fragment);
+        }
+    }
+
+    /** Program-wide resource numbering shared by all stages. */
+    private record Slots(Object2IntLinkedOpenHashMap<String> samplers, Object2IntLinkedOpenHashMap<String> images,
+                         Map<Integer, Integer> ssbos, boolean storage) {
+    }
+
+    private static Slots slots(final String name, final StageResult... infos) throws ShaderCompileException {
+        Object2IntLinkedOpenHashMap<String> samplerIndex = new Object2IntLinkedOpenHashMap<>();
+        for (StageResult info : infos) {
+            for (String sn : info.samplers) {
+                samplerIndex.putIfAbsent(sn, samplerIndex.size());
+            }
+        }
+        if (samplerIndex.size() > 16) {
+            throw new ShaderCompileException(name + ": " + samplerIndex.size() + " samplers exceed Metal's limit of 16 per stage");
+        }
+        Object2IntLinkedOpenHashMap<String> imageIndex = new Object2IntLinkedOpenHashMap<>();
+        for (StageResult info : infos) {
+            for (String im : info.images) {
+                imageIndex.putIfAbsent(im, samplerIndex.size() + imageIndex.size());
+            }
+        }
+        java.util.TreeSet<Integer> bindings = new java.util.TreeSet<>();
+        for (StageResult info : infos) {
+            bindings.addAll(info.ssbos.keySet());
+        }
+        if (bindings.size() > MAX_SSBOS) {
+            throw new ShaderCompileException(name + ": " + bindings.size() + " shader storage buffers (MineMetal supports " + MAX_SSBOS + ")");
+        }
+        Map<Integer, Integer> ssbos = new LinkedHashMap<>();
+        for (int b : bindings) {
+            ssbos.put(b, SSBO_BUFFER_BASE + ssbos.size());
+        }
+        return new Slots(samplerIndex, imageIndex, ssbos, !imageIndex.isEmpty() || !ssbos.isEmpty());
+    }
+
+    /** Compiles a compute shader. */
+    public static Result compileCompute(final String name, final String source) throws ShaderCompileException {
+        ByteBuffer spv = toSpirv(name + ".csh", renameReserved(source), Shaderc.shaderc_compute_shader);
+        try {
+            StageResult info = new StageResult(STAGE_VERTEX);
+            reflectOnly(spv, EXEC_COMPUTE, info);
+            Slots slots = slots(name, info);
+            StageResult cs = new StageResult(STAGE_VERTEX);
+            toMsl(name, spv, EXEC_COMPUTE, cs, slots, null);
+            return new Result(cs, null, new ArrayList<>(slots.samplers().keySet()), new ArrayList<>(slots.images().keySet()), true);
+        } finally {
+            MemoryUtil.memFree(spv);
+        }
     }
 
     /** Compiles and links a vertex + fragment pair. */
@@ -85,16 +159,7 @@ public final class GlProgramCompiler {
             StageResult fsInfo = new StageResult(STAGE_FRAGMENT);
             reflectOnly(vsSpv, EXEC_VERTEX, vsInfo);
             reflectOnly(fsSpv, EXEC_FRAGMENT, fsInfo);
-            Object2IntLinkedOpenHashMap<String> samplerIndex = new Object2IntLinkedOpenHashMap<>();
-            for (String s : vsInfo.samplers) {
-                samplerIndex.putIfAbsent(s, samplerIndex.size());
-            }
-            for (String s : fsInfo.samplers) {
-                samplerIndex.putIfAbsent(s, samplerIndex.size());
-            }
-            if (samplerIndex.size() > 16) {
-                throw new ShaderCompileException(name + ": " + samplerIndex.size() + " samplers exceed Metal's limit of 16 per stage");
-            }
+            Slots slots = slots(name, vsInfo, fsInfo);
             Map<String, Integer> varyingLocations = new LinkedHashMap<>();
             for (Interface out : vsInfo.outputs) {
                 varyingLocations.put(out.name(), out.location());
@@ -102,9 +167,9 @@ public final class GlProgramCompiler {
             // Pass 2: generate MSL with final slots.
             StageResult vs = new StageResult(STAGE_VERTEX);
             StageResult fs = new StageResult(STAGE_FRAGMENT);
-            toMsl(name, vsSpv, EXEC_VERTEX, vs, samplerIndex, null);
-            toMsl(name, fsSpv, EXEC_FRAGMENT, fs, samplerIndex, varyingLocations);
-            return new Result(vs, fs, new ArrayList<>(samplerIndex.keySet()));
+            toMsl(name, vsSpv, EXEC_VERTEX, vs, slots, null);
+            toMsl(name, fsSpv, EXEC_FRAGMENT, fs, slots, varyingLocations);
+            return new Result(vs, fs, new ArrayList<>(slots.samplers().keySet()), new ArrayList<>(slots.images().keySet()), false);
         } finally {
             MemoryUtil.memFree(vsSpv);
             if (fsSpv != null) {
@@ -204,6 +269,15 @@ public final class GlProgramCompiler {
         for (int i = 0; i < samplers.capacity(); i++) {
             out.samplers.add(samplers.get(i).nameString());
         }
+        SpvcReflectedResource.Buffer images = list(resources, Spvc.SPVC_RESOURCE_TYPE_STORAGE_IMAGE, context, stack);
+        for (int i = 0; i < images.capacity(); i++) {
+            out.images.add(images.get(i).nameString());
+        }
+        SpvcReflectedResource.Buffer ssbos = list(resources, Spvc.SPVC_RESOURCE_TYPE_STORAGE_BUFFER, context, stack);
+        for (int i = 0; i < ssbos.capacity(); i++) {
+            // GL binding point as written in the shader (layout(binding = N)); our unique renumbering happens later.
+            out.ssbos.putIfAbsent(Spvc.spvc_compiler_get_decoration(compiler, ssbos.get(i).id(), DECORATION_BINDING), -1);
+        }
         SpvcReflectedResource.Buffer inputs = list(resources, Spvc.SPVC_RESOURCE_TYPE_STAGE_INPUT, context, stack);
         for (int i = 0; i < inputs.capacity(); i++) {
             out.inputs.add(iface(compiler, inputs.get(i)));
@@ -221,15 +295,25 @@ public final class GlProgramCompiler {
     }
 
     private static void toMsl(final String name, final ByteBuffer spv, final int model, final StageResult out,
-                              final Object2IntLinkedOpenHashMap<String> samplerIndex, final @Nullable Map<String, Integer> varyingLocations)
+                              final Slots slots, final @Nullable Map<String, Integer> varyingLocations)
         throws ShaderCompileException {
+        Object2IntLinkedOpenHashMap<String> samplerIndex = slots.samplers();
+        boolean storage = slots.storage() || model == EXEC_COMPUTE;
         withCompiler(spv, (context, compiler, resources, stack) -> {
             reflect(context, compiler, resources, stack, out);
+            // GL binding point of each storage block, read before the bindings are renumbered below.
+            SpvcReflectedResource.Buffer storageBuffers = list(resources, Spvc.SPVC_RESOURCE_TYPE_STORAGE_BUFFER, context, stack);
+            int[] ssboGlBinding = new int[storageBuffers.capacity()];
+            for (int i = 0; i < storageBuffers.capacity(); i++) {
+                ssboGlBinding[i] = Spvc.spvc_compiler_get_decoration(compiler, storageBuffers.get(i).id(), DECORATION_BINDING);
+            }
+            out.ssbos.clear();
             PointerBuffer ptr = stack.callocPointer(1);
 
             check(Spvc.spvc_compiler_create_compiler_options(compiler, ptr), context, "options");
             long options = ptr.get(0);
-            Spvc.spvc_compiler_options_set_uint(options, Spvc.SPVC_COMPILER_OPTION_MSL_VERSION, MSL_VERSION);
+            Spvc.spvc_compiler_options_set_uint(options, Spvc.SPVC_COMPILER_OPTION_MSL_VERSION, storage ? MSL_VERSION_STORAGE : MSL_VERSION);
+            Spvc.spvc_compiler_options_set_uint(options, Spvc.SPVC_COMPILER_OPTION_MSL_BUFFER_SIZE_BUFFER_INDEX, BUFFER_SIZE_BUFFER);
             Spvc.spvc_compiler_options_set_uint(options, Spvc.SPVC_COMPILER_OPTION_MSL_PLATFORM, Spvc.SPVC_MSL_PLATFORM_MACOS);
             Spvc.spvc_compiler_options_set_bool(options, Spvc.SPVC_COMPILER_OPTION_MSL_TEXTURE_BUFFER_NATIVE, true);
             if (model == EXEC_VERTEX) {
@@ -253,6 +337,15 @@ public final class GlProgramCompiler {
                 Spvc.spvc_compiler_set_decoration(compiler, allSamplers.get(i).id(), DECORATION_DESCRIPTOR_SET, 0);
                 Spvc.spvc_compiler_set_decoration(compiler, allSamplers.get(i).id(), DECORATION_BINDING, uniqueBinding++);
             }
+            SpvcReflectedResource.Buffer storageImages = list(resources, Spvc.SPVC_RESOURCE_TYPE_STORAGE_IMAGE, context, stack);
+            for (int i = 0; i < storageImages.capacity(); i++) {
+                Spvc.spvc_compiler_set_decoration(compiler, storageImages.get(i).id(), DECORATION_DESCRIPTOR_SET, 0);
+                Spvc.spvc_compiler_set_decoration(compiler, storageImages.get(i).id(), DECORATION_BINDING, uniqueBinding++);
+            }
+            for (int i = 0; i < storageBuffers.capacity(); i++) {
+                Spvc.spvc_compiler_set_decoration(compiler, storageBuffers.get(i).id(), DECORATION_DESCRIPTOR_SET, 0);
+                Spvc.spvc_compiler_set_decoration(compiler, storageBuffers.get(i).id(), DECORATION_BINDING, uniqueBinding++);
+            }
             for (int i = 0; i < ubos.capacity(); i++) {
                 SpvcReflectedResource r = ubos.get(i);
                 String blockName = Spvc.spvc_compiler_get_name(compiler, r.base_type_id());
@@ -274,6 +367,22 @@ public final class GlProgramCompiler {
                 int index = samplerIndex.getInt(r.nameString());
                 bind(compiler, context, model, r, 0, index, index, stack);
             }
+            // Storage images: texture slots after the samplers, shared numbering by name.
+            for (int i = 0; i < storageImages.capacity(); i++) {
+                SpvcReflectedResource r = storageImages.get(i);
+                int index = slots.images().getInt(r.nameString());
+                bind(compiler, context, model, r, 0, index, 0, stack);
+            }
+            // Storage buffers: by GL binding point.
+            for (int i = 0; i < storageBuffers.capacity(); i++) {
+                SpvcReflectedResource r = storageBuffers.get(i);
+                Integer index = slots.ssbos().get(ssboGlBinding[i]);
+                if (index == null) {
+                    continue;
+                }
+                out.ssbos.put(ssboGlBinding[i], index);
+                bind(compiler, context, model, r, index, 0, 0, stack);
+            }
             // Varyings: give fragment inputs the vertex output location of the same name.
             if (varyingLocations != null) {
                 SpvcReflectedResource.Buffer inputs = list(resources, Spvc.SPVC_RESOURCE_TYPE_STAGE_INPUT, context, stack);
@@ -286,8 +395,15 @@ public final class GlProgramCompiler {
                 }
             }
             check(Spvc.spvc_compiler_set_entry_point(compiler, "main", model), context, "entry point");
-            check(Spvc.spvc_compiler_compile(compiler, ptr), context, "compile " + name + (model == EXEC_VERTEX ? " (vertex)" : " (fragment)"));
-            out.msl = MemoryUtil.memUTF8(ptr.get(0));
+            if (model == EXEC_COMPUTE) {
+                for (int d = 0; d < 3; d++) {
+                    out.localSize[d] = Math.max(1, Spvc.spvc_compiler_get_execution_mode_argument_by_index(compiler, EXECUTION_MODE_LOCAL_SIZE, d));
+                }
+            }
+            check(Spvc.spvc_compiler_compile(compiler, ptr), context,
+                "compile " + name + (model == EXEC_VERTEX ? " (vertex)" : model == EXEC_COMPUTE ? " (compute)" : " (fragment)"));
+            out.msl = (storage ? MSL31_MARKER : "") + MemoryUtil.memUTF8(ptr.get(0));
+            out.needsBufferSizes = Spvc.spvc_compiler_msl_needs_buffer_size_buffer(compiler);
             String entry = Spvc.spvc_compiler_get_cleansed_entry_point_name(compiler, "main", model);
             out.entryPoint = entry != null ? entry : "main0";
         });

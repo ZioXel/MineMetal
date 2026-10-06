@@ -50,6 +50,25 @@ public final class MetalGLSelfTest {
         }
         """;
 
+    private static final String CS = """
+        #version 430
+        layout(local_size_x = 8, local_size_y = 8) in;
+        layout(rgba32f) uniform writeonly image2D outImage;
+        layout(r32ui) uniform uimage2D counter;
+        layout(std430, binding = 3) buffer Results {
+            uint total;
+            uint values[];
+        };
+        uniform float scale;
+        void main() {
+            ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+            imageStore(outImage, p, vec4(float(p.x) * scale, float(p.y) * scale, 0.25, 1.0));
+            imageAtomicAdd(counter, ivec2(0, 0), 1u);
+            atomicAdd(total, 1u);
+            values[p.y * 16 + p.x] = uint(p.x + p.y * 100);
+        }
+        """;
+
     private MetalGLSelfTest() {
     }
 
@@ -62,6 +81,7 @@ public final class MetalGLSelfTest {
         long t0 = System.nanoTime();
         try {
             boolean ok = runChecks(device);
+            ok &= runComputeChecks(device);
             LOGGER.info("GL self-test {} ({} ms)", ok ? "PASSED" : "FAILED", (System.nanoTime() - t0) / 1_000_000);
         } catch (Throwable t) {
             LOGGER.error("GL self-test FAILED with an exception", t);
@@ -171,6 +191,96 @@ public final class MetalGLSelfTest {
         MetalGL.glDeleteTextures(src);
         MetalGL.glDeleteTextures(dst);
         MetalGL.glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        MetalGL.glUseProgram(0);
+        return ok;
+    }
+
+    /** Compute shader with a storage image, an atomic counter image and an SSBO (stage 4). */
+    private static boolean runComputeChecks(final MetalDevice device) {
+        final int n = 16;
+        int image = MetalGL.glGenTextures();
+        MetalGL.glBindTexture(GL_TEXTURE_2D, image);
+        MetalGL.glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, n, n, 0, GL_RGBA, GL_FLOAT, 0L);
+        int counter = MetalGL.glGenTextures();
+        MetalGL.glBindTexture(GL_TEXTURE_2D, counter);
+        MetalGL.glTexImage2D(GL_TEXTURE_2D, 0, GL_R32UI, 1, 1, 0, GL_RED_INTEGER, GL_UNSIGNED_INT, 0L);
+        MetalGL.glClearTexImage(counter, 0);
+        int ssbo = MetalGL.glGenBuffers();
+        MetalGL.glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo);
+        MetalGL.glBufferStorage(GL_SHADER_STORAGE_BUFFER, 4L + n * n * 4L, 0);
+        MetalGL.glClearBufferSubData(GL_SHADER_STORAGE_BUFFER, GL_R8, 0L, 4L + n * n * 4L, GL_RED, GL_BYTE, (int[]) null);
+        MetalGL.glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, ssbo);
+
+        int cs = MetalGL.glCreateShader(GL_COMPUTE_SHADER);
+        MetalGL.glShaderSource(cs, CS);
+        int program = MetalGL.glCreateProgram();
+        MetalGL.setProgramDebugName(program, "minemetal:selftest-compute");
+        MetalGL.glAttachShader(program, cs);
+        MetalGL.glLinkProgram(program);
+        if (MetalGL.glGetProgrami(program, GL_LINK_STATUS) != GL_TRUE) {
+            LOGGER.error("compute self-test: link failed: {}", MetalGL.glGetProgramInfoLog(program));
+            return false;
+        }
+        int[] local = new int[3];
+        MetalGL.glGetProgramiv(program, GL_COMPUTE_WORK_GROUP_SIZE, local);
+        MetalGL.glUseProgram(program);
+        MetalGL.glUniform1f(MetalGL.glGetUniformLocation(program, "scale"), 0.5F);
+        MetalGL.glUniform1i(MetalGL.glGetUniformLocation(program, "outImage"), 0);
+        MetalGL.glUniform1i(MetalGL.glGetUniformLocation(program, "counter"), 1);
+        MetalGL.glBindImageTexture(0, image, 0, false, 0, GL_WRITE_ONLY, GL_RGBA32F);
+        MetalGL.glBindImageTexture(1, counter, 0, false, 0, GL_READ_WRITE, GL_R32UI);
+        MetalGL.glDispatchCompute(n / 8, n / 8, 1);
+        MetalGL.glMemoryBarrier(GL_ALL_BARRIER_BITS);
+
+        GpuTexture imageTex = MetalGL.gpuTexture(image);
+        GpuTexture counterTex = MetalGL.gpuTexture(counter);
+        GpuBuffer readback = device.createBuffer(() -> "selftest compute readback", GpuBuffer.USAGE_MAP_READ | GpuBuffer.USAGE_COPY_DST, n * n * 16L);
+        GpuBuffer counterReadback = device.createBuffer(() -> "selftest counter readback", GpuBuffer.USAGE_MAP_READ | GpuBuffer.USAGE_COPY_DST, 16L);
+        device.encoder().copyTextureToBuffer(imageTex, readback, 0L, () -> {}, 0);
+        device.encoder().copyTextureToBuffer(counterTex, counterReadback, 0L, () -> {}, 0);
+        device.encoder().submit();
+        Native.waitIdle(device.ctx());
+
+        boolean ok = local[0] == 8 && local[1] == 8 && local[2] == 1;
+        LOGGER.info("compute self-test: work group size {}x{}x{} {}", local[0], local[1], local[2], ok ? "OK" : "MISMATCH");
+        long ssboData = MetalGL.bufferContents(ssbo);
+        if (ssboData != 0L) {
+            int total = MemoryUtil.memGetInt(ssboData);
+            int v = MemoryUtil.memGetInt(ssboData + 4L + (5L * n + 3) * 4L);
+            boolean ssboOk = total == n * n && v == 3 + 5 * 100;
+            ok &= ssboOk;
+            LOGGER.info("compute self-test SSBO: total {} (expected {}), values[5][3] {} (expected {}) {}", total, n * n, v, 3 + 5 * 100,
+                ssboOk ? "OK" : "MISMATCH");
+        } else {
+            ok = false;
+            LOGGER.error("compute self-test: SSBO has no storage");
+        }
+        try (GpuBufferSlice.MappedView view = readback.map(true, false)) {
+            ByteBuffer data = view.data().order(ByteOrder.nativeOrder());
+            int[][] probes = {{0, 0}, {15, 0}, {3, 11}, {15, 15}};
+            for (int[] p : probes) {
+                int at = (p[1] * n + p[0]) * 16;
+                float r = data.getFloat(at);
+                float g = data.getFloat(at + 4);
+                float b = data.getFloat(at + 8);
+                boolean match = near(r, p[0] * 0.5F) && near(g, p[1] * 0.5F) && near(b, 0.25F);
+                ok &= match;
+                LOGGER.info("compute self-test image ({},{}): got ({}, {}, {}) expected ({}, {}, 0.250) {}", p[0], p[1], f(r), f(g), f(b),
+                    f(p[0] * 0.5F), f(p[1] * 0.5F), match ? "OK" : "MISMATCH");
+            }
+        }
+        try (GpuBufferSlice.MappedView view = counterReadback.map(true, false)) {
+            int count = view.data().order(ByteOrder.nativeOrder()).getInt(0);
+            boolean match = count == n * n;
+            ok &= match;
+            LOGGER.info("compute self-test image atomics: counter {} (expected {}) {}", count, n * n, match ? "OK" : "MISMATCH");
+        }
+        readback.close();
+        counterReadback.close();
+        MetalGL.glDeleteProgram(program);
+        MetalGL.glDeleteTextures(image);
+        MetalGL.glDeleteTextures(counter);
+        MetalGL.glDeleteBuffers(ssbo);
         MetalGL.glUseProgram(0);
         return ok;
     }

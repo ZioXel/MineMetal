@@ -20,6 +20,7 @@ import java.nio.FloatBuffer;
 import java.nio.IntBuffer;
 import java.nio.LongBuffer;
 import java.util.IdentityHashMap;
+import java.util.List;
 import java.util.Map;
 import org.jspecify.annotations.Nullable;
 import org.lwjgl.PointerBuffer;
@@ -199,7 +200,7 @@ public final class MetalGL {
             if (resize) {
                 // Color textures get a full mip chain up front: Iris generates mipmaps on render targets after drawing.
                 int levels = gpuFormat.hasColorAspect() ? 1 + (int) Math.floor(Math.log(Math.max(1, Math.max(width, height))) / Math.log(2)) : 1;
-                tex.allocate(device(), gpuFormat, internalFormat, Math.max(1, width), Math.max(1, height), levels);
+                tex.allocate(device(), gpuFormat, internalFormat, Math.max(1, width), Math.max(1, height), 1, 2, levels, tex.writable);
             }
         }
         if (pixels != 0L && tex.hasStorage()) {
@@ -525,6 +526,7 @@ public final class MetalGL {
         }
         String vs = null;
         String fs = null;
+        String cs = null;
         for (int shader : p.shaders) {
             GlShaderObject s = SHADERS.get(shader);
             if (s == null) {
@@ -534,12 +536,27 @@ public final class MetalGL {
                 vs = s.source;
             } else if (s.type == GL_FRAGMENT_SHADER) {
                 fs = s.source;
+            } else if (s.type == GL_COMPUTE_SHADER) {
+                cs = s.source;
             } else {
                 p.linked = false;
-                p.infoLog = "MineMetal: shader stage 0x" + Integer.toHexString(s.type) + " (geometry/tessellation/compute) is not supported on Metal yet";
+                p.infoLog = "MineMetal: shader stage 0x" + Integer.toHexString(s.type) + " (geometry/tessellation) is not supported on Metal yet";
                 LOGGER.warn("{}: {}", p.debugName, p.infoLog);
                 return;
             }
+        }
+        if (cs != null) {
+            String cname = p.debugName != null ? p.debugName : "compute" + p.id;
+            try {
+                p.setCompiled(GlProgramCompiler.compileCompute(cname, cs));
+                p.computePipeline = 0L;
+                p.infoLog = "";
+            } catch (ShaderCompileException | RuntimeException e) {
+                p.linked = false;
+                p.infoLog = e.getMessage() != null ? e.getMessage() : e.toString();
+                LOGGER.error("Failed to compile compute {} for Metal: {}", cname, p.infoLog);
+            }
+            return;
         }
         if (vs == null || fs == null) {
             p.linked = false;
@@ -588,6 +605,11 @@ public final class MetalGL {
                 device().encoder().queueForDestroy(() -> Native.release(pipeline));
             }
             p.pipelines.clear();
+            if (p.computePipeline > 0L) {
+                long pso = p.computePipeline;
+                device().encoder().queueForDestroy(() -> Native.release(pso));
+                p.computePipeline = 0L;
+            }
         }
         if (currentProgram == program) {
             currentProgram = 0;
@@ -966,11 +988,14 @@ public final class MetalGL {
         }
         GlProgramObject program = current();
         GlFramebufferObject fb = FRAMEBUFFERS.get(drawFramebuffer);
-        if (program == null || !program.linked || program.compiled == null || fb == null) {
+        if (program == null || !program.linked || program.compiled == null || fb == null || program.isCompute()) {
             return;
         }
         if (passOpen("draw")) {
             return;
+        }
+        if (program.usesStorage()) {
+            prepareStorage(program);
         }
         MetalDevice device = device();
         long ctx = device.ctx();
@@ -1022,6 +1047,9 @@ public final class MetalGL {
                 }
                 bindUniforms(device, program, stack);
                 bindSamplers(device, program);
+                if (program.usesStorage()) {
+                    bindStorage(program, false);
+                }
                 Native.passSetVertexBuffer(ctx, ((MetalGpuBuffer) quadVertices).handle(), 0L, 30);
                 if (indexed) {
                     Native.passSetIndexBuffer(ctx, ((MetalGpuBuffer) quadIndices).handle(), false);
@@ -1461,7 +1489,9 @@ public final class MetalGL {
             case GL_MAX_SAMPLES -> 4;
             case GL_MAX_VERTEX_ATTRIBS -> 31;
             case GL_MAX_UNIFORM_BUFFER_BINDINGS -> 14;
-            case GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS -> 0;
+            case GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS -> GlProgramCompiler.MAX_SSBOS;
+            case GL_MAX_COMPUTE_SHADER_STORAGE_BLOCKS, GL_MAX_FRAGMENT_SHADER_STORAGE_BLOCKS, GL_MAX_VERTEX_SHADER_STORAGE_BLOCKS -> GlProgramCompiler.MAX_SSBOS;
+            case GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS -> 1024;
             case GL_MAJOR_VERSION -> 4;
             case GL_MINOR_VERSION -> 1;
             case GL_NUM_EXTENSIONS -> 0;
@@ -1587,8 +1617,447 @@ public final class MetalGL {
     // Buffer objects (names only for now: Iris' SSBO/UBO features are not supported on Metal yet)
     // =================================================================================================================
 
+    // =================================================================================================================
+    // Stage 4: buffers (SSBOs), image load/store, compute shaders, 1D/3D textures
+    // =================================================================================================================
+
+    /** Emulated GL buffer object (only used as shader storage / indirect dispatch buffers on Metal). */
+    private static final class GlBufferObject {
+        final int id;
+        @Nullable MetalGpuBuffer buffer;
+        long size;
+
+        GlBufferObject(final int id) {
+            this.id = id;
+        }
+    }
+
+    /** glBindImageTexture state of one image unit. */
+    private record ImageUnit(int texture, int level, boolean layered, int layer, int access, int format) {
+    }
+
+    private static final int MAX_IMAGE_UNITS = 8;
+    private static final int MAX_SSBO_BINDINGS = 16;
+    private static final int GL_COMPUTE_WORK_GROUP_SIZE_ = 0x8267;
+    private static final Int2ObjectOpenHashMap<GlBufferObject> BUFFERS = new Int2ObjectOpenHashMap<>();
+    private static final it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap BOUND_BUFFERS = new it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap();
+    private static final int[] ssboBindings = new int[MAX_SSBO_BINDINGS];
+    private static final @Nullable ImageUnit[] imageUnits = new ImageUnit[MAX_IMAGE_UNITS];
+    /** Textures bound for image load/store while a render pass was open: made writable at the next safe point. */
+    private static final it.unimi.dsi.fastutil.ints.IntLinkedOpenHashSet PENDING_WRITABLE = new it.unimi.dsi.fastutil.ints.IntLinkedOpenHashSet();
+
     public static int glGenBuffers() {
-        return newName();
+        int id = newName();
+        BUFFERS.put(id, new GlBufferObject(id));
+        return id;
+    }
+
+    private static GlBufferObject bufferObject(final int id) {
+        return BUFFERS.computeIfAbsent(id, GlBufferObject::new);
+    }
+
+    private static @Nullable GlBufferObject boundBuffer(final int target) {
+        int id = BOUND_BUFFERS.get(target);
+        return id != 0 ? bufferObject(id) : null;
+    }
+
+    /** CPU address of a GL buffer's storage (self-test readback; shared memory). */
+    static long bufferContents(final int buffer) {
+        GlBufferObject b = BUFFERS.get(buffer);
+        return b != null && b.buffer != null ? b.buffer.contents() : 0L;
+    }
+
+    public static void glBindBuffer(final int target, final int buffer) {
+        BOUND_BUFFERS.put(target, buffer);
+    }
+
+    public static void glBindBufferBase(final int target, final int index, final int buffer) {
+        if (target == GL_SHADER_STORAGE_BUFFER && index >= 0 && index < MAX_SSBO_BINDINGS) {
+            ssboBindings[index] = buffer;
+        }
+        BOUND_BUFFERS.put(target, buffer);
+    }
+
+    public static void glDeleteBuffers(final int buffer) {
+        GlBufferObject b = BUFFERS.remove(buffer);
+        if (b != null && b.buffer != null) {
+            b.buffer.close();
+        }
+        for (int i = 0; i < MAX_SSBO_BINDINGS; i++) {
+            if (ssboBindings[i] == buffer) {
+                ssboBindings[i] = 0;
+            }
+        }
+    }
+
+    private static void allocateBuffer(final @Nullable GlBufferObject b, final long size, final long data, final long dataBytes) {
+        if (b == null || size < 0) {
+            return;
+        }
+        if (b.buffer != null) {
+            b.buffer.close();
+        }
+        b.size = size;
+        int usage = GpuBuffer.USAGE_COPY_DST | GpuBuffer.USAGE_COPY_SRC | GpuBuffer.USAGE_INDIRECT_PARAMETERS | GpuBuffer.USAGE_UNIFORM;
+        MetalGpuBuffer buffer = (MetalGpuBuffer) device().createBuffer(() -> "gl buffer " + b.id, usage, Math.max(size, 16L));
+        // A brand-new buffer is not referenced by any GPU work yet, so its contents can be written directly.
+        MemoryUtil.memSet(buffer.contents(), 0, Math.max(size, 16L));
+        if (data != 0L && dataBytes > 0) {
+            MemoryUtil.memCopy(data, buffer.contents(), Math.min(dataBytes, size));
+        }
+        b.buffer = buffer;
+    }
+
+    public static void glBufferStorage(final int target, final long size, final int flags) {
+        allocateBuffer(boundBuffer(target), size, 0L, 0L);
+    }
+
+    public static void glBufferData(final int target, final long size, final int usage) {
+        allocateBuffer(boundBuffer(target), size, 0L, 0L);
+    }
+
+    /** glBufferStorage / glBufferData with initial contents ({@code bytes} at {@code address}). */
+    public static void glBufferStorageData(final int target, final long address, final long bytes) {
+        allocateBuffer(boundBuffer(target), bytes, address, bytes);
+    }
+
+    public static void glNamedBufferData(final int buffer, final long size, final int usage) {
+        allocateBuffer(bufferObject(buffer), size, 0L, 0L);
+    }
+
+    public static void glNamedBufferStorageData(final int buffer, final long address, final long bytes) {
+        allocateBuffer(bufferObject(buffer), bytes, address, bytes);
+    }
+
+    public static void glBufferSubData(final int target, final long offset, final long address, final long bytes) {
+        GlBufferObject b = boundBuffer(target);
+        if (b == null || b.buffer == null || address == 0L || bytes <= 0 || offset < 0 || offset + bytes > b.size || passOpen("glBufferSubData")) {
+            return;
+        }
+        device().encoder().writeToBuffer(b.buffer.slice(offset, bytes), MemoryUtil.memByteBuffer(address, (int) bytes));
+    }
+
+    public static void glClearBufferSubData(final int target, final int internalFormat, final long offset, final long size, final int format,
+                                            final int type, final int @Nullable [] data) {
+        clearBuffer(target, offset, size, data != null && data.length > 0 ? data[0] : 0);
+    }
+
+    public static void glClearBufferSubData(final int target, final int internalFormat, final long offset, final long size, final int format,
+                                            final int type, final long data) {
+        clearBuffer(target, offset, size, data != 0L ? MemoryUtil.memGetByte(data) : 0);
+    }
+
+    /** Only byte-pattern fills (Iris clears with R8 = 0). */
+    private static void clearBuffer(final int target, final long offset, final long size, final int value) {
+        GlBufferObject b = boundBuffer(target);
+        if (b == null || b.buffer == null || size <= 0 || passOpen("glClearBufferSubData")) {
+            return;
+        }
+        Native.fillBuffer(device().ctx(), b.buffer.handle(), offset, Math.min(size, b.size - offset), value & 0xFF);
+    }
+
+    // --- images -------------------------------------------------------------------------------------------------------
+
+    public static void glBindImageTexture(final int unit, final int texture, final int level, final boolean layered, final int layer,
+                                          final int access, final int format) {
+        if (unit < 0 || unit >= MAX_IMAGE_UNITS) {
+            return;
+        }
+        imageUnits[unit] = texture == 0 ? null : new ImageUnit(texture, level, layered, layer, access, format);
+        GlTextureObject tex = TEXTURES.get(texture);
+        if (tex != null && tex.texture != null && !tex.writable && !tex.external) {
+            if (device().encoder().isInRenderPass()) {
+                PENDING_WRITABLE.add(texture);
+            } else {
+                tex.makeWritable(device());
+            }
+        }
+    }
+
+    /** Swaps in writable copies of textures that were bound as images inside a render pass (call outside passes). */
+    public static void flushPendingWritable() {
+        if (PENDING_WRITABLE.isEmpty() || !isActive() || device().encoder().isInRenderPass()) {
+            return;
+        }
+        for (int id : PENDING_WRITABLE) {
+            GlTextureObject tex = TEXTURES.get(id);
+            if (tex != null) {
+                tex.makeWritable(device());
+            }
+        }
+        PENDING_WRITABLE.clear();
+    }
+
+    private static final java.util.Set<Integer> WARNED_IMAGE = new java.util.HashSet<>();
+
+    /**
+     * Binds the program's storage images (by GL image unit) and storage buffers (by GL binding point).
+     * {@code compute}: compute encoder, else the open render encoder (all stages).
+     */
+    static void bindStorage(final GlProgramObject program, final boolean compute) {
+        GlProgramCompiler.Result compiled = program.compiled;
+        if (compiled == null) {
+            return;
+        }
+        MetalDevice device = device();
+        long ctx = device.ctx();
+        boolean any = false;
+        for (GlProgramObject.Slot slot : program.slots) {
+            if (!slot.image || slot.unit < 0 || slot.unit >= MAX_IMAGE_UNITS) {
+                continue;
+            }
+            ImageUnit iu = imageUnits[slot.unit];
+            GlTextureObject tex = iu != null ? TEXTURES.get(iu.texture()) : null;
+            if (tex == null || tex.texture == null) {
+                continue;
+            }
+            if (!tex.writable) {
+                if (WARNED_IMAGE.add(iu.texture())) {
+                    LOGGER.debug("Image {} of {} is not writable yet; skipped this draw", slot.name, program.debugName);
+                }
+                continue;
+            }
+            long view = tex.levelView(device, Math.max(0, Math.min(iu.level(), tex.levels - 1))).handle();
+            if (compute) {
+                Native.computeSetTexture(ctx, view, slot.samplerIndex);
+            } else {
+                Native.passSetTexture(ctx, 3, view, slot.samplerIndex);
+            }
+            any = true;
+        }
+        List<GlProgramCompiler.StageResult> stages = compiled.stages();
+        for (int stage = 0; stage < stages.size(); stage++) {
+            GlProgramCompiler.StageResult st = stages.get(stage);
+            if (st.ssbos.isEmpty()) {
+                continue;
+            }
+            int stageBit = stage == 0 ? 1 : 2;
+            int[] sizes = st.needsBufferSizes ? new int[32] : null;
+            for (Map.Entry<Integer, Integer> e : st.ssbos.entrySet()) {
+                int binding = e.getKey();
+                GlBufferObject b = binding >= 0 && binding < MAX_SSBO_BINDINGS ? BUFFERS.get(ssboBindings[binding]) : null;
+                if (b == null || b.buffer == null) {
+                    continue;
+                }
+                if (compute) {
+                    Native.computeSetBuffer(ctx, b.buffer.handle(), 0L, e.getValue());
+                } else {
+                    Native.passSetBuffer(ctx, stageBit, b.buffer.handle(), 0L, e.getValue());
+                }
+                if (sizes != null && e.getValue() < sizes.length) {
+                    sizes[e.getValue()] = (int) Math.min(Integer.MAX_VALUE, b.size);
+                }
+                any = true;
+            }
+            if (sizes != null) {
+                try (MemoryStack stack = MemoryStack.stackPush()) {
+                    IntBuffer sb = stack.ints(sizes);
+                    if (compute) {
+                        Native.computeSetBytes(ctx, MemoryUtil.memAddress(sb), sizes.length * 4L, GlProgramCompiler.BUFFER_SIZE_BUFFER);
+                    } else {
+                        Native.passSetBytes(ctx, stageBit, MemoryUtil.memAddress(sb), sizes.length * 4L, GlProgramCompiler.BUFFER_SIZE_BUFFER);
+                    }
+                }
+            }
+        }
+        if (any && !compute) {
+            Native.passMarkStorage(ctx);
+        }
+    }
+
+    /** Before a draw/dispatch outside render passes: textures bound as images get shader-write usage now. */
+    private static void prepareStorage(final GlProgramObject program) {
+        flushPendingWritable();
+        for (GlProgramObject.Slot slot : program.slots) {
+            if (slot.image && slot.unit >= 0 && slot.unit < MAX_IMAGE_UNITS && imageUnits[slot.unit] != null) {
+                GlTextureObject tex = TEXTURES.get(imageUnits[slot.unit].texture());
+                if (tex != null && !tex.writable) {
+                    tex.makeWritable(device());
+                }
+            }
+        }
+    }
+
+    public static void glMemoryBarrier(final int barriers) {
+        if (isActive()) {
+            Native.memoryBarrier(device().ctx());
+        }
+    }
+
+    // --- compute ------------------------------------------------------------------------------------------------------
+
+    public static void glDispatchCompute(final int x, final int y, final int z) {
+        dispatch(x, y, z, null, 0L);
+    }
+
+    public static void glDispatchComputeIndirect(final long offset) {
+        GlBufferObject b = boundBuffer(GL_DISPATCH_INDIRECT_BUFFER);
+        if (b == null || b.buffer == null) {
+            return;
+        }
+        dispatch(0, 0, 0, b.buffer, offset);
+    }
+
+    private static void dispatch(final int x, final int y, final int z, final @Nullable MetalGpuBuffer indirect, final long offset) {
+        GlProgramObject p = current();
+        if (p == null || !p.linked || !p.isCompute() || p.compiled == null) {
+            return;
+        }
+        if (passOpen("glDispatchCompute")) {
+            return;
+        }
+        long pso = computePipeline(p);
+        if (pso == 0L) {
+            return;
+        }
+        prepareStorage(p);
+        MetalDevice device = device();
+        long ctx = device.ctx();
+        Native.computeSetPipeline(ctx, pso);
+        ByteBuffer block = p.blocks[0];
+        if (block != null) {
+            if (block.capacity() <= 4096) {
+                Native.computeSetBytes(ctx, MemoryUtil.memAddress(block), block.capacity(), 0);
+            } else {
+                GpuBufferSlice slice = device.encoder().transientMemory().uploadGpu(block.duplicate().clear(), 256L, GpuBuffer.USAGE_UNIFORM);
+                Native.computeSetBuffer(ctx, ((MetalGpuBuffer) slice.buffer()).handle(), slice.offset(), 0);
+            }
+        }
+        for (GlProgramObject.Slot slot : p.slots) {
+            if (!slot.sampler || slot.unit < 0 || slot.unit >= MAX_UNITS) {
+                continue;
+            }
+            GlTextureObject tex = TEXTURES.get(boundTextures[slot.unit]);
+            if (tex == null || tex.sampleView == null) {
+                continue;
+            }
+            GlSamplerObject samplerObject = SAMPLERS.get(boundSamplers[slot.unit]);
+            long sampler = samplerObject != null ? samplerObject.handle(device, tex) : tex.sampler(device);
+            Native.computeSetTexture(ctx, tex.sampleView.handle(), slot.samplerIndex);
+            Native.computeSetSampler(ctx, sampler, slot.samplerIndex);
+        }
+        bindStorage(p, true);
+        int[] local = p.compiled.vertex().localSize;
+        if (indirect != null) {
+            Native.computeDispatchIndirect(ctx, indirect.handle(), offset, local[0], local[1], local[2]);
+        } else {
+            Native.computeDispatch(ctx, x, y, z, local[0], local[1], local[2]);
+        }
+    }
+
+    private static long computePipeline(final GlProgramObject p) {
+        if (p.computePipeline != 0L) {
+            return p.computePipeline == -1L ? 0L : p.computePipeline;
+        }
+        GlProgramCompiler.StageResult cs = p.compiled.vertex();
+        String name = p.debugName != null ? p.debugName : "compute" + p.id;
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            ByteBuffer err = stack.calloc(2048);
+            ByteBuffer src = MemoryUtil.memUTF8(cs.msl);
+            try {
+                long pso = Native.computePipelineCreate(device().ctx(), MemoryUtil.memAddress(stack.UTF8(name)), MemoryUtil.memAddress(src),
+                    MemoryUtil.memAddress(stack.UTF8(cs.entryPoint)), MemoryUtil.memAddress(err), err.capacity());
+                if (pso == 0L) {
+                    LOGGER.error("Metal rejected compute program {}: {}", name, MemoryUtil.memUTF8(MemoryUtil.memAddress(err)));
+                    if (Boolean.getBoolean("minemetal.dumpShaders")) {
+                        LOGGER.error("--- {} compute ---\n{}", name, cs.msl);
+                    }
+                    p.computePipeline = -1L;
+                    return 0L;
+                }
+                p.computeMaxThreads = Native.computeMaxThreads(pso);
+                int threads = cs.localSize[0] * cs.localSize[1] * cs.localSize[2];
+                if (threads > p.computeMaxThreads) {
+                    LOGGER.error("Compute program {}: work group of {} threads exceeds Metal's limit of {} for it", name, threads, p.computeMaxThreads);
+                    device().encoder().queueForDestroy(() -> Native.release(pso));
+                    p.computePipeline = -1L;
+                    return 0L;
+                }
+                p.computePipeline = pso;
+                return pso;
+            } finally {
+                MemoryUtil.memFree(src);
+            }
+        }
+    }
+
+    /** glGetProgramiv with array results (GL_COMPUTE_WORK_GROUP_SIZE fills three values). */
+    public static void glGetProgramiv(final int program, final int pname, final int[] out) {
+        GlProgramObject p = PROGRAMS.get(program);
+        if (pname == GL_COMPUTE_WORK_GROUP_SIZE_ && p != null && p.isCompute() && p.compiled != null) {
+            int[] local = p.compiled.vertex().localSize;
+            for (int i = 0; i < Math.min(3, out.length); i++) {
+                out[i] = local[i];
+            }
+            return;
+        }
+        if (out.length > 0) {
+            out[0] = glGetProgrami(program, pname);
+        }
+    }
+
+    // --- 1D / 3D textures, clears ---------------------------------------------------------------------------------------
+
+    public static void glTexImage3D(final int target, final int level, final int internalFormat, final int width, final int height, final int depth,
+                                    final int border, final int format, final int type, final long pixels) {
+        GlTextureObject tex = boundTextureObject();
+        if (tex == null || level != 0) {
+            return;
+        }
+        GpuFormat gpuFormat = GlEnums.textureFormat(internalFormat);
+        if (gpuFormat == null) {
+            LOGGER.warn("Unsupported internal format 0x{} for 3D texture {}", Integer.toHexString(internalFormat), tex.id);
+            return;
+        }
+        boolean array = target == GL_TEXTURE_2D_ARRAY;
+        if (array) {
+            LOGGER.warn("2D array textures are not supported by MineMetal's GL emulation yet (texture {})", tex.id);
+            return;
+        }
+        tex.allocate(device(), gpuFormat, internalFormat, Math.max(1, width), Math.max(1, height), Math.max(1, depth), 3, 1, tex.writable);
+        if (pixels != 0L) {
+            upload3D(tex, width, height, depth, format, type, pixels);
+        }
+    }
+
+    public static void glTexImage1D(final int target, final int level, final int internalFormat, final int width, final int border, final int format,
+                                    final int type, final long pixels) {
+        GlTextureObject tex = boundTextureObject();
+        if (tex == null || level != 0) {
+            return;
+        }
+        GpuFormat gpuFormat = GlEnums.textureFormat(internalFormat);
+        if (gpuFormat == null) {
+            LOGGER.warn("Unsupported internal format 0x{} for 1D texture {}", Integer.toHexString(internalFormat), tex.id);
+            return;
+        }
+        tex.allocate(device(), gpuFormat, internalFormat, Math.max(1, width), 1, 1, 1, 1, tex.writable);
+        if (pixels != 0L) {
+            upload(tex, 0, 0, 0, width, 1, format, type, pixels);
+        }
+    }
+
+    /** 3D uploads slice by slice (same client formats as 2D uploads, without conversion). */
+    private static void upload3D(final GlTextureObject tex, final int width, final int height, final int depth, final int format, final int type,
+                                 final long pixels) {
+        int[] layout = GlEnums.clientPixelLayout(format, type);
+        if (layout == null || tex.texture == null || tex.format == null || layout[0] * layout[1] != tex.format.blockSize()) {
+            LOGGER.warn("Unsupported 3D texture upload 0x{}/0x{} for texture {}", Integer.toHexString(format), Integer.toHexString(type), tex.id);
+            return;
+        }
+        long slice = (long) width * height * tex.format.blockSize();
+        for (int z = 0; z < depth; z++) {
+            device().encoder().writeToTexture(tex.texture, MemoryUtil.memByteBuffer(pixels + z * slice, (int) slice), 0, z, 0, 0, width, height);
+        }
+    }
+
+    /** glClearTexImage with zero (what Iris uses for shader pack images). */
+    public static void glClearTexImage(final int texture, final int level) {
+        GlTextureObject tex = TEXTURES.get(texture);
+        if (tex == null || tex.texture == null || tex.format == null || passOpen("glClearTexImage")) {
+            return;
+        }
+        Native.textureZero(device().ctx(), tex.texture.handle(), level, tex.format.blockSize());
     }
 
     public static int glGenVertexArrays() {

@@ -219,6 +219,9 @@ public final class GlOverridePipeline implements MetalRenderPass.OverridePipelin
             }
         }
         MetalGL.bindUnitSamplers(p, usedUnits);
+        if (p.usesStorage()) {
+            MetalGL.bindStorage(p, false);
+        }
         if (!this.loggedFirstDraw) {
             this.loggedFirstDraw = true;
             StringBuilder sb = new StringBuilder();

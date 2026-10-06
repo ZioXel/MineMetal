@@ -217,6 +217,7 @@ static int g_noCoalesce = 0; // -Dminemetal.noCoalesce=true: one encoder per pas
     // Encoder coalescing: mm_pass_end leaves the encoder open ("lingering"); a following mm_pass_begin on exactly the
     // same attachments without clears continues it instead of storing and reloading every attachment (TBDR).
     int renderLingering;
+    int renderStorage;           // the open render encoder wrote storage images/buffers: never continue it
     int rpCount;
     void *rpColor[8];
     void *rpDepth;
@@ -242,6 +243,8 @@ static int g_noCoalesce = 0; // -Dminemetal.noCoalesce=true: one encoder per pas
 @property(nonatomic, strong) id<MTLCommandBuffer> cmd;
 @property(nonatomic, strong) id<MTLRenderCommandEncoder> render;
 @property(nonatomic, strong) id<MTLBlitCommandEncoder> blit;
+@property(nonatomic, strong) id<MTLComputeCommandEncoder> compute;
+@property(nonatomic, strong) id<MTLBuffer> zeroBuffer;   // shared, all zero: source for texture clears
 // render pass state
 @property(nonatomic, strong) id<MTLBuffer> indexBuffer;
 @property(nonatomic) MTLIndexType indexType;
@@ -436,6 +439,7 @@ MM_EXPORT void mm_destroy_context(void *p) {
     MMContext *ctx = (__bridge_transfer MMContext *)p;
     if (ctx.render != nil) { [ctx.render endEncoding]; ctx.render = nil; }
     if (ctx.blit != nil) { [ctx.blit endEncoding]; ctx.blit = nil; }
+    if (ctx.compute != nil) { [ctx.compute endEncoding]; ctx.compute = nil; }
     if (ctx.cmd != nil) { [ctx.cmd commit]; [ctx.cmd waitUntilCompleted]; ctx.cmd = nil; }
     ctx = nil;
 }
@@ -504,7 +508,7 @@ static void mm_prof_add_cb(MMContext *ctx, int tag, uint32_t encoders, double se
  * buffer on its own so its GPU time can be attributed to its phase (only between encoders, never inside one).
  */
 static void mm_prof_maybe_split(MMContext *ctx) {
-    if (!ctx->profEnabled || !ctx->profSplit || ctx.cmd == nil || ctx.render != nil || ctx.blit != nil) return;
+    if (!ctx->profEnabled || !ctx->profSplit || ctx.cmd == nil || ctx.render != nil || ctx.blit != nil || ctx.compute != nil) return;
     if (ctx->profCbTag == ctx->profTag) return;
     id<MTLCommandBuffer> cmd = ctx.cmd;
     int tag = ctx->profCbTag;
@@ -589,6 +593,7 @@ static void mm_end_encoders(MMContext *ctx) {
     ctx->renderLingering = 0;
     if (ctx.render != nil) { [ctx.render endEncoding]; ctx.render = nil; ctx.pipeline = nil; }
     if (ctx.blit != nil) { [ctx.blit endEncoding]; ctx.blit = nil; }
+    if (ctx.compute != nil) { [ctx.compute endEncoding]; ctx.compute = nil; }
 }
 
 static id<MTLBlitCommandEncoder> mm_blit(MMContext *ctx) {
@@ -601,6 +606,7 @@ static id<MTLBlitCommandEncoder> mm_blit(MMContext *ctx) {
         ctx.pipeline = nil;
         ctx->renderLingering = 0;
     }
+    if (ctx.compute != nil) { [ctx.compute endEncoding]; ctx.compute = nil; }
     if (ctx.blit == nil) ctx.blit = mm_new_blit_encoder(ctx);
     return ctx.blit;
 }
@@ -727,6 +733,10 @@ MM_EXPORT void *mm_buffer_contents(void *buf) {
 #define MM_TEX_USAGE_TEXTURE_BINDING 4
 #define MM_TEX_USAGE_RENDER_ATTACHMENT 8
 #define MM_TEX_USAGE_CUBEMAP_COMPATIBLE 16
+// MineMetal-private usage bits (above renderpearl's): GL image load/store and 1D/3D textures for the GL emulation.
+#define MM_TEX_USAGE_SHADER_WRITE (1 << 20)
+#define MM_TEX_USAGE_TYPE_1D (1 << 21)
+#define MM_TEX_USAGE_TYPE_3D (1 << 22)
 
 MM_EXPORT void *mm_texture_create(void *p, int64_t pixelFormat, int width, int height, int layers, int mips, int usage) {
     @autoreleasepool {
@@ -736,7 +746,13 @@ MM_EXPORT void *mm_texture_create(void *p, int64_t pixelFormat, int width, int h
         d.width = (NSUInteger)MAX(width, 1);
         d.height = (NSUInteger)MAX(height, 1);
         d.mipmapLevelCount = (NSUInteger)MAX(mips, 1);
-        if ((usage & MM_TEX_USAGE_CUBEMAP_COMPATIBLE) && layers == 6) {
+        if (usage & MM_TEX_USAGE_TYPE_3D) {
+            d.textureType = MTLTextureType3D;
+            d.depth = (NSUInteger)MAX(layers, 1);
+        } else if (usage & MM_TEX_USAGE_TYPE_1D) {
+            d.textureType = MTLTextureType1D;
+            d.height = 1;
+        } else if ((usage & MM_TEX_USAGE_CUBEMAP_COMPATIBLE) && layers == 6) {
             d.textureType = MTLTextureTypeCube;
         } else if (layers > 1) {
             d.textureType = MTLTextureType2DArray;
@@ -746,7 +762,15 @@ MM_EXPORT void *mm_texture_create(void *p, int64_t pixelFormat, int width, int h
         }
         d.storageMode = MTLStorageModePrivate;
         MTLTextureUsage u = MTLTextureUsageShaderRead;
-        if (usage & MM_TEX_USAGE_RENDER_ATTACHMENT) u |= MTLTextureUsageRenderTarget;
+        if ((usage & MM_TEX_USAGE_RENDER_ATTACHMENT) && !(usage & MM_TEX_USAGE_TYPE_1D)) u |= MTLTextureUsageRenderTarget;
+        if (usage & MM_TEX_USAGE_SHADER_WRITE) {
+            u |= MTLTextureUsageShaderWrite;
+            // GLSL imageAtomic* on r32ui/r32i images: native texture atomics (MSL 3.1) need this usage.
+            if (@available(macOS 14.0, *)) {
+                MTLPixelFormat f = (MTLPixelFormat)pixelFormat;
+                if (f == MTLPixelFormatR32Uint || f == MTLPixelFormatR32Sint || f == MTLPixelFormatRG32Uint) u |= MTLTextureUsageShaderAtomic;
+            }
+        }
         d.usage = u;
         id<MTLTexture> tex = [ctx.device newTextureWithDescriptor:d];
         return tex != nil ? (__bridge_retained void *)tex : NULL;
@@ -836,10 +860,13 @@ MM_EXPORT void mm_copy_buffer_to_texture(void *p, void *buf, uint64_t offset, ui
                                          void *tex, int slice, int mip, int x, int y, int w, int h) {
     if (w <= 0 || h <= 0) return;
     @autoreleasepool {
+        id<MTLTexture> t = (__bridge id<MTLTexture>)tex;
+        // 3D textures have one slice; the "layer" is the depth plane.
+        BOOL is3D = t.textureType == MTLTextureType3D;
         [mm_blit(CTX(p)) copyFromBuffer:(__bridge id<MTLBuffer>)buf sourceOffset:offset sourceBytesPerRow:bytesPerRow
                       sourceBytesPerImage:bytesPerImage sourceSize:MTLSizeMake((NSUInteger)w, (NSUInteger)h, 1)
-                                toTexture:(__bridge id<MTLTexture>)tex destinationSlice:(NSUInteger)slice
-                         destinationLevel:(NSUInteger)mip destinationOrigin:MTLOriginMake((NSUInteger)x, (NSUInteger)y, 0)];
+                                toTexture:t destinationSlice:is3D ? 0 : (NSUInteger)slice
+                         destinationLevel:(NSUInteger)mip destinationOrigin:MTLOriginMake((NSUInteger)x, (NSUInteger)y, is3D ? (NSUInteger)slice : 0)];
     }
 }
 
@@ -1005,7 +1032,7 @@ MM_EXPORT int mm_pass_begin(void *p, void **colorViews, int count, int clearMask
                             void *depthView, double clearDepth, int ax, int ay, int aw, int ah, const char *label) {
     @autoreleasepool {
         MMContext *ctx = CTX(p);
-        if (ctx.render != nil && ctx->renderLingering && clearMask == 0 && count == ctx->rpCount && count <= 8
+        if (ctx.render != nil && ctx->renderLingering && !ctx->renderStorage && clearMask == 0 && count == ctx->rpCount && count <= 8
             && depthView == ctx->rpDepth && !g_noCoalesce) {
             BOOL same = YES;
             for (int i = 0; i < count; i++) {
@@ -1030,6 +1057,7 @@ MM_EXPORT int mm_pass_begin(void *p, void **colorViews, int count, int clearMask
             }
         }
         mm_end_encoders(ctx);
+        ctx->renderStorage = 0;
         ctx->rpCount = count <= 8 ? count : -1;
         for (int i = 0; i < count && i < 8; i++) ctx->rpColor[i] = colorViews[i];
         ctx->rpDepth = depthView;
@@ -1384,6 +1412,10 @@ static id<MTLFunction> mm_compile_function(MMContext *ctx, const char *src, cons
     NSError *error = nil;
     MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
     options.languageVersion = MTLLanguageVersion2_4;
+    // Shaders with image load/store or compute kernels are generated for MSL 3.1 (native texture atomics).
+    if (strstr(src, "// mm:msl31") != NULL) {
+        if (@available(macOS 14.0, *)) options.languageVersion = MTLLanguageVersion3_1;
+    }
     // Multi-pass rendering (e.g. translucency over terrain) relies on bit-identical positions between pipelines.
     options.preserveInvariance = YES;
     if (@available(macOS 15.0, *)) {
@@ -1733,4 +1765,151 @@ MM_EXPORT void mm_surface_stats(void *surfacePtr, int64_t *out) {
 MM_EXPORT void mm_surface_drop(void *surfacePtr) {
     MMSurface *s = (__bridge MMSurface *)surfacePtr;
     s.drawable = nil;
+}
+
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Compute, storage resources, clears (stage 4: GL compute shaders, image load/store, SSBOs)
+// ---------------------------------------------------------------------------------------------------------------------
+
+/** Compiles an MSL kernel into a compute pipeline (retained; free with mm_release). */
+MM_EXPORT void *mm_compute_pipeline_create(void *p, const char *name, const char *src, const char *entry, char *err, int errLen) {
+    @autoreleasepool {
+        MMContext *ctx = CTX(p);
+        id<MTLFunction> fn = mm_compile_function(ctx, src, entry, @"compute", err, errLen);
+        if (fn == nil) return NULL;
+        MTLComputePipelineDescriptor *d = [[MTLComputePipelineDescriptor alloc] init];
+        d.computeFunction = fn;
+        if (name != NULL) d.label = [NSString stringWithUTF8String:name];
+        NSError *error = nil;
+        id<MTLComputePipelineState> pso = [ctx.device newComputePipelineStateWithDescriptor:d options:MTLPipelineOptionNone
+                                                                                reflection:nil error:&error];
+        if (pso == nil) {
+            mm_copy_error(err, errLen, [NSString stringWithFormat:@"compute pipeline: %@", error.localizedDescription]);
+            return NULL;
+        }
+        return (__bridge_retained void *)pso;
+    }
+}
+
+MM_EXPORT int mm_compute_max_threads(void *psoPtr) {
+    return (int)((__bridge id<MTLComputePipelineState>)psoPtr).maxTotalThreadsPerThreadgroup;
+}
+
+static id<MTLComputeCommandEncoder> mm_compute_encoder(MMContext *ctx) {
+    if (ctx.compute == nil) {
+        mm_end_encoders(ctx);
+        ctx.compute = [mm_cmd(ctx) computeCommandEncoder];
+    }
+    return ctx.compute;
+}
+
+/** Opens (or continues) the compute encoder and sets the pipeline. */
+MM_EXPORT void mm_compute_set_pipeline(void *p, void *psoPtr) {
+    @autoreleasepool {
+        MMContext *ctx = CTX(p);
+        [mm_compute_encoder(ctx) setComputePipelineState:(__bridge id<MTLComputePipelineState>)psoPtr];
+    }
+}
+
+MM_EXPORT void mm_compute_set_buffer(void *p, void *buf, uint64_t offset, int index) {
+    MMContext *ctx = CTX(p);
+    if (ctx.compute == nil || index < 0 || index > 30) return;
+    [ctx.compute setBuffer:(__bridge id<MTLBuffer>)buf offset:offset atIndex:(NSUInteger)index];
+}
+
+MM_EXPORT void mm_compute_set_bytes(void *p, const void *data, uint64_t length, int index) {
+    MMContext *ctx = CTX(p);
+    if (ctx.compute == nil || length == 0 || index < 0 || index > 30) return;
+    [ctx.compute setBytes:data length:length atIndex:(NSUInteger)index];
+}
+
+MM_EXPORT void mm_compute_set_texture(void *p, void *tex, int index) {
+    MMContext *ctx = CTX(p);
+    if (ctx.compute == nil || index < 0 || index > 127) return;
+    [ctx.compute setTexture:(__bridge id<MTLTexture>)tex atIndex:(NSUInteger)index];
+}
+
+MM_EXPORT void mm_compute_set_sampler(void *p, void *sampler, int index) {
+    MMContext *ctx = CTX(p);
+    if (ctx.compute == nil || index < 0 || index > 15) return;
+    [ctx.compute setSamplerState:(__bridge id<MTLSamplerState>)sampler atIndex:(NSUInteger)index];
+}
+
+MM_EXPORT void mm_compute_dispatch(void *p, int gx, int gy, int gz, int tx, int ty, int tz) {
+    MMContext *ctx = CTX(p);
+    if (ctx.compute == nil || gx <= 0 || gy <= 0 || gz <= 0) return;
+    [ctx.compute dispatchThreadgroups:MTLSizeMake((NSUInteger)gx, (NSUInteger)gy, (NSUInteger)gz)
+                threadsPerThreadgroup:MTLSizeMake((NSUInteger)MAX(tx, 1), (NSUInteger)MAX(ty, 1), (NSUInteger)MAX(tz, 1))];
+}
+
+MM_EXPORT void mm_compute_dispatch_indirect(void *p, void *buf, uint64_t offset, int tx, int ty, int tz) {
+    MMContext *ctx = CTX(p);
+    if (ctx.compute == nil || buf == NULL) return;
+    [ctx.compute dispatchThreadgroupsWithIndirectBuffer:(__bridge id<MTLBuffer>)buf indirectBufferOffset:offset
+                                  threadsPerThreadgroup:MTLSizeMake((NSUInteger)MAX(tx, 1), (NSUInteger)MAX(ty, 1), (NSUInteger)MAX(tz, 1))];
+}
+
+/** glMemoryBarrier: orders storage writes before later reads inside the open encoder (across encoders Metal tracks hazards). */
+MM_EXPORT void mm_memory_barrier(void *p) {
+    MMContext *ctx = CTX(p);
+    if (ctx.compute != nil) {
+        [ctx.compute memoryBarrierWithScope:MTLBarrierScopeBuffers | MTLBarrierScopeTextures];
+    } else if (ctx.render != nil && !ctx->renderLingering) {
+        [ctx.render memoryBarrierWithScope:MTLBarrierScopeBuffers | MTLBarrierScopeTextures
+                               afterStages:MTLRenderStageFragment
+                              beforeStages:MTLRenderStageVertex | MTLRenderStageFragment];
+    }
+}
+
+/** The open render pass binds writable storage: it must not be continued by the next pass (see mm_pass_begin). */
+MM_EXPORT void mm_pass_mark_storage(void *p) {
+    CTX(p)->renderStorage = 1;
+}
+
+/** Fills a byte range of a buffer (glClearBufferSubData with a single repeated byte). */
+MM_EXPORT void mm_fill_buffer(void *p, void *buf, uint64_t offset, uint64_t size, int value) {
+    @autoreleasepool {
+        MMContext *ctx = CTX(p);
+        if (buf == NULL || size == 0) return;
+        [mm_blit(ctx) fillBuffer:(__bridge id<MTLBuffer>)buf range:NSMakeRange((NSUInteger)offset, (NSUInteger)size) value:(uint8_t)value];
+    }
+}
+
+/** Clears one mip level of a color texture (any type: 1D/2D/array/cube/3D) to zero by copying from a zero buffer. */
+MM_EXPORT void mm_texture_zero(void *p, void *texPtr, int level, int bytesPerPixel) {
+    @autoreleasepool {
+        MMContext *ctx = CTX(p);
+        id<MTLTexture> tex = (__bridge id<MTLTexture>)texPtr;
+        if (tex == nil || bytesPerPixel <= 0 || level < 0 || (NSUInteger)level >= tex.mipmapLevelCount) return;
+        NSUInteger w = MAX(tex.width >> level, (NSUInteger)1);
+        NSUInteger h = tex.textureType == MTLTextureType1D ? 1 : MAX(tex.height >> level, (NSUInteger)1);
+        NSUInteger d = tex.textureType == MTLTextureType3D ? MAX(tex.depth >> level, (NSUInteger)1) : 1;
+        NSUInteger slices = tex.textureType == MTLTextureTypeCube ? 6 : MAX(tex.arrayLength, (NSUInteger)1);
+        NSUInteger row = w * (NSUInteger)bytesPerPixel;
+        NSUInteger image = row * h;
+        if (ctx.zeroBuffer == nil || ctx.zeroBuffer.length < image) {
+            ctx.zeroBuffer = [ctx.device newBufferWithLength:MAX(image, (NSUInteger)4096) options:MTLResourceStorageModeShared];
+            memset(ctx.zeroBuffer.contents, 0, ctx.zeroBuffer.length);
+        }
+        id<MTLBlitCommandEncoder> blit = mm_blit(ctx);
+        for (NSUInteger s = 0; s < slices; s++) {
+            for (NSUInteger z = 0; z < d; z++) {
+                [blit copyFromBuffer:ctx.zeroBuffer sourceOffset:0 sourceBytesPerRow:row sourceBytesPerImage:image
+                          sourceSize:MTLSizeMake(w, h, 1) toTexture:tex destinationSlice:s destinationLevel:(NSUInteger)level
+                   destinationOrigin:MTLOriginMake(0, 0, z)];
+            }
+        }
+    }
+}
+
+/** Copies all of level 0..n-1 of one texture into another of identical size/format (used to swap in a writable texture). */
+MM_EXPORT void mm_copy_texture_all(void *p, void *src, void *dst) {
+    @autoreleasepool {
+        MMContext *ctx = CTX(p);
+        id<MTLTexture> s = (__bridge id<MTLTexture>)src;
+        id<MTLTexture> d = (__bridge id<MTLTexture>)dst;
+        if (s == nil || d == nil) return;
+        [mm_blit(ctx) copyFromTexture:s toTexture:d];
+    }
 }

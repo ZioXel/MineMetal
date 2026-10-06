@@ -24,7 +24,13 @@ final class GlTextureObject {
     @Nullable GpuFormat format;
     int width;
     int height;
+    /** Depth of a 3D texture (1 otherwise). */
+    int depth = 1;
+    /** 1, 2 or 3 (GL_TEXTURE_1D / 2D / 3D storage). */
+    int dims = 2;
     int levels = 1;
+    /** Created with shader-write usage (needed for image load/store). */
+    boolean writable;
 
     // texture parameters (GL defaults)
     int minFilter = GL_NEAREST_MIPMAP_LINEAR;
@@ -45,16 +51,66 @@ final class GlTextureObject {
     }
 
     void allocate(final MetalDevice device, final GpuFormat format, final int internalFormat, final int width, final int height, final int levels) {
+        this.allocate(device, format, internalFormat, width, height, 1, 2, levels, false);
+    }
+
+    void allocate(final MetalDevice device, final GpuFormat format, final int internalFormat, final int width, final int height, final int depth,
+                  final int dims, final int levels, final boolean writable) {
         this.release(device);
         this.format = format;
         this.internalFormat = internalFormat;
         this.width = width;
-        this.height = height;
+        this.height = dims == 1 ? 1 : height;
+        this.depth = dims == 3 ? Math.max(1, depth) : 1;
+        this.dims = dims;
         this.levels = Math.max(1, levels);
-        int usage = GpuTexture.USAGE_COPY_DST | GpuTexture.USAGE_COPY_SRC | GpuTexture.USAGE_TEXTURE_BINDING | GpuTexture.USAGE_RENDER_ATTACHMENT;
-        this.texture = (MetalTexture) device.createTexture("gl#" + this.id, usage, format, width, height, 1, this.levels);
+        this.writable = writable;
+        this.texture = this.createStorage(device, writable);
         this.sampleView = (MetalTextureView) device.createTextureView(this.texture, 0, this.levels);
         this.external = false;
+    }
+
+    private MetalTexture createStorage(final MetalDevice device, final boolean writable) {
+        int usage = GpuTexture.USAGE_COPY_DST | GpuTexture.USAGE_COPY_SRC | GpuTexture.USAGE_TEXTURE_BINDING | GpuTexture.USAGE_RENDER_ATTACHMENT;
+        if (writable) {
+            usage |= MetalTexture.USAGE_SHADER_WRITE;
+        }
+        if (this.dims == 1) {
+            usage |= MetalTexture.USAGE_TYPE_1D;
+        } else if (this.dims == 3) {
+            usage |= MetalTexture.USAGE_TYPE_3D;
+        }
+        return (MetalTexture) device.createTexture("gl#" + this.id, usage, this.format, this.width, this.height, this.depth, this.levels);
+    }
+
+    /**
+     * Image load/store needs shader-write usage, which Metal fixes at creation: swaps in a writable copy of the texture
+     * (contents copied on the GPU). Must not be called while a render pass is open. Returns false for textures owned
+     * by Minecraft, which cannot be replaced.
+     */
+    boolean makeWritable(final MetalDevice device) {
+        if (this.writable) {
+            return true;
+        }
+        if (this.texture == null || this.external || this.format == null) {
+            return false;
+        }
+        MetalTexture old = this.texture;
+        MetalTexture fresh = this.createStorage(device, true);
+        Native.copyTextureAll(device.ctx(), old.handle(), fresh.handle());
+        this.parametersChanged();
+        for (MetalTextureView view : this.levelViews.values()) {
+            view.close();
+        }
+        this.levelViews.clear();
+        if (this.sampleView != null) {
+            this.sampleView.close();
+        }
+        old.close();
+        this.texture = fresh;
+        this.sampleView = (MetalTextureView) device.createTextureView(fresh, 0, this.levels);
+        this.writable = true;
+        return true;
     }
 
     void wrapExternal(final MetalDevice device, final MetalTexture texture) {
@@ -63,6 +119,9 @@ final class GlTextureObject {
         this.format = texture.getFormat();
         this.width = texture.getWidth(0);
         this.height = texture.getHeight(0);
+        this.depth = 1;
+        this.dims = 2;
+        this.writable = (texture.usage() & MetalTexture.USAGE_SHADER_WRITE) != 0;
         this.levels = texture.getMipLevels();
         this.sampleView = (MetalTextureView) device.createTextureView(texture, 0, this.levels);
         this.external = true;

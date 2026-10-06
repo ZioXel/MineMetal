@@ -21,6 +21,8 @@ final class GlProgramObject {
         GlProgramCompiler.@Nullable BlockMember type;
         boolean sampler;
         int samplerIndex = -1;
+        /** Storage image (image load/store): Metal texture slot in {@link #samplerIndex}, GL image unit in {@link #unit}. */
+        boolean image;
         int unit;
 
         Slot(final String name) {
@@ -32,6 +34,26 @@ final class GlProgramObject {
     final List<Integer> shaders = new ArrayList<>();
     final Object2IntOpenHashMap<String> attribBindings = new Object2IntOpenHashMap<>();
     boolean linked;
+
+    boolean isCompute() {
+        return this.compiled != null && this.compiled.compute();
+    }
+
+    /** True when any stage uses storage images or storage buffers. */
+    boolean usesStorage() {
+        if (this.compiled == null) {
+            return false;
+        }
+        if (!this.compiled.images().isEmpty()) {
+            return true;
+        }
+        for (GlProgramCompiler.StageResult st : this.compiled.stages()) {
+            if (!st.ssbos.isEmpty()) {
+                return true;
+            }
+        }
+        return false;
+    }
     String infoLog = "";
     GlProgramCompiler.@Nullable Result compiled;
     final List<Slot> slots = new ArrayList<>();
@@ -45,6 +67,9 @@ final class GlProgramObject {
     final long[] uploadedOffset = new long[2];
     final Object2LongOpenHashMap<String> pipelines = new Object2LongOpenHashMap<>();
     @Nullable String debugName;
+    /** Compute program: Metal compute pipeline (0 until first dispatch, -1 if Metal rejected it). */
+    long computePipeline;
+    int computeMaxThreads;
 
     GlProgramObject(final int id) {
         this.id = id;
@@ -56,9 +81,9 @@ final class GlProgramObject {
         this.slots.clear();
         this.slotByName.clear();
         this.compiled = result;
-        GlProgramCompiler.StageResult[] stages = {result.vertex(), result.fragment()};
-        for (int stage = 0; stage < 2; stage++) {
-            GlProgramCompiler.StageResult s = stages[stage];
+        List<GlProgramCompiler.StageResult> stages = result.stages();
+        for (int stage = 0; stage < stages.size(); stage++) {
+            GlProgramCompiler.StageResult s = stages.get(stage);
             if (s.blockSize > 0) {
                 this.blocks[stage] = MemoryUtil.memCalloc(s.blockSize);
             }
@@ -76,9 +101,11 @@ final class GlProgramObject {
                 this.blockNames.add(n);
             }
         }
-        for (String n : result.fragment().extraBlocks.keySet()) {
-            if (!this.blockNames.contains(n)) {
-                this.blockNames.add(n);
+        if (result.fragment() != null) {
+            for (String n : result.fragment().extraBlocks.keySet()) {
+                if (!this.blockNames.contains(n)) {
+                    this.blockNames.add(n);
+                }
             }
         }
         this.blockBindings = new int[this.blockNames.size()];
@@ -88,6 +115,12 @@ final class GlProgramObject {
             Slot slot = this.slotFor(samplers.get(i));
             slot.sampler = true;
             slot.samplerIndex = i;
+        }
+        List<String> images = result.images();
+        for (int i = 0; i < images.size(); i++) {
+            Slot slot = this.slotFor(images.get(i));
+            slot.image = true;
+            slot.samplerIndex = samplers.size() + i;
         }
         this.linked = true;
     }
@@ -167,7 +200,7 @@ final class GlProgramObject {
         if (slot == null) {
             return;
         }
-        if (slot.sampler) {
+        if (slot.sampler || slot.image) {
             slot.unit = values[0];
             return;
         }
@@ -249,6 +282,9 @@ final class GlProgramObject {
             return -1;
         }
         GlProgramCompiler.StageResult s = stage == 0 ? this.compiled.vertex() : this.compiled.fragment();
+        if (s == null) {
+            return -1;
+        }
         for (var e : s.extraBlocks.entrySet()) {
             int index = this.blockNames.indexOf(e.getKey());
             if (index >= 0 && this.blockBindings[index] == binding) {
@@ -260,7 +296,7 @@ final class GlProgramObject {
 
     int maxFragmentOutput() {
         int max = -1;
-        if (this.compiled != null) {
+        if (this.compiled != null && this.compiled.fragment() != null) {
             for (GlProgramCompiler.Interface out : this.compiled.fragment().outputs) {
                 max = Math.max(max, out.location());
             }
