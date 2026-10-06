@@ -218,6 +218,7 @@ static int g_noCoalesce = 0; // -Dminemetal.noCoalesce=true: one encoder per pas
     // same attachments without clears continues it instead of storing and reloading every attachment (TBDR).
     int renderLingering;
     int renderStorage;           // the open render encoder wrote storage images/buffers: never continue it
+    int nextDontCare;            // color attachments the next mm_pass_begin may leave unloaded (fully overwritten)
     int rpCount;
     void *rpColor[8];
     void *rpDepth;
@@ -364,9 +365,15 @@ MM_EXPORT void mm_set_depth_flip(void *p, int flip) {
 }
 
 /** Turns the GPU profiler on (returns 0 when the device cannot sample timestamps at encoder boundaries). */
-MM_EXPORT int mm_prof_enable(void *p) {
+MM_EXPORT int mm_prof_enable(void *p, int forceSplit) {
     @autoreleasepool {
         MMContext *ctx = CTX(p);
+        if (forceSplit) {
+            // One command buffer per phase: exact per-phase GPU time (encoder timestamps overlap on Apple GPUs).
+            ctx->profSplit = 1;
+            ctx->profEnabled = 1;
+            return 2;
+        }
         if (ctx->profBuffer != nil || ctx->profSplit) { ctx->profEnabled = 1; return ctx->profSplit ? 2 : 1; }
         id<MTLCounterSet> timestamps = nil;
         for (id<MTLCounterSet> set in ctx.device.counterSets) {
@@ -399,6 +406,10 @@ MM_EXPORT int mm_prof_enable(void *p) {
         ctx->profEnabled = 1;
         return 1;
     }
+}
+
+MM_EXPORT void mm_set_next_pass_dont_care(void *p, int mask) {
+    CTX(p)->nextDontCare = mask;
 }
 
 MM_EXPORT void mm_set_coalesce(int enabled) {
@@ -507,9 +518,14 @@ static void mm_prof_add_cb(MMContext *ctx, int tag, uint32_t encoders, double se
  * Split mode: when a new encoder starts in a different phase than the open command buffer, commits that command
  * buffer on its own so its GPU time can be attributed to its phase (only between encoders, never inside one).
  */
+static void mm_end_encoders(MMContext *ctx);
+
 static void mm_prof_maybe_split(MMContext *ctx) {
-    if (!ctx->profEnabled || !ctx->profSplit || ctx.cmd == nil || ctx.render != nil || ctx.blit != nil || ctx.compute != nil) return;
+    if (!ctx->profEnabled || !ctx->profSplit || ctx.cmd == nil) return;
     if (ctx->profCbTag == ctx->profTag) return;
+    // A lingering render encoder belongs to an already ended pass: close it so the phases split cleanly.
+    if (ctx.render != nil && ctx->renderLingering) mm_end_encoders(ctx);
+    if (ctx.render != nil || ctx.blit != nil || ctx.compute != nil) return;
     id<MTLCommandBuffer> cmd = ctx.cmd;
     int tag = ctx->profCbTag;
     uint32_t encoders = ctx->profCbEncoders;
@@ -519,6 +535,9 @@ static void mm_prof_maybe_split(MMContext *ctx) {
         mm_prof_add_cb(weakCtx, tag, encoders, ge > gs && gs > 0.0 ? ge - gs : 0.0);
     }];
     [cmd commit];
+    // Apple GPUs overlap consecutive command buffers, which makes their start/end times add up to more than the
+    // frame. Waiting serialises them so each phase's time is exact (costs fps while profiling).
+    [cmd waitUntilCompleted];
     ctx.cmd = nil;
 }
 
@@ -658,6 +677,7 @@ MM_EXPORT uint64_t mm_submit(void *p) {
             pthread_mutex_unlock(&weakCtx->completionMutex);
         }];
         [cmd commit];
+        if (profSplit) [cmd waitUntilCompleted]; // see mm_prof_maybe_split
         ctx.cmd = nil;
         return index;
     }
@@ -1032,6 +1052,8 @@ MM_EXPORT int mm_pass_begin(void *p, void **colorViews, int count, int clearMask
                             void *depthView, double clearDepth, int ax, int ay, int aw, int ah, const char *label) {
     @autoreleasepool {
         MMContext *ctx = CTX(p);
+        int dontCare = ctx->nextDontCare;
+        ctx->nextDontCare = 0;
         if (ctx.render != nil && ctx->renderLingering && !ctx->renderStorage && clearMask == 0 && count == ctx->rpCount && count <= 8
             && depthView == ctx->rpDepth && !g_noCoalesce) {
             BOOL same = YES;
@@ -1073,7 +1095,7 @@ MM_EXPORT int mm_pass_begin(void *p, void **colorViews, int count, int clearMask
                 rp.colorAttachments[i].clearColor =
                     MTLClearColorMake(clearColors[i * 4], clearColors[i * 4 + 1], clearColors[i * 4 + 2], clearColors[i * 4 + 3]);
             } else {
-                rp.colorAttachments[i].loadAction = MTLLoadActionLoad;
+                rp.colorAttachments[i].loadAction = (dontCare & (1 << i)) ? MTLLoadActionDontCare : MTLLoadActionLoad;
             }
             width = t.width;
             height = t.height;

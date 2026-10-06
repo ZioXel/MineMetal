@@ -15,7 +15,9 @@ import org.slf4j.LoggerFactory;
  */
 public final class MetalProfiler {
     private static final Logger LOGGER = LoggerFactory.getLogger("MineMetal/Profile");
-    public static final boolean ENABLED = Boolean.getBoolean("minemetal.gpuProfile");
+    /** "true"/"split": one command buffer per phase (exact phase times); "encoders": encoder timestamps (overlapping). */
+    private static final String MODE = System.getProperty("minemetal.gpuProfile", "false");
+    public static final boolean ENABLED = MODE.equals("true") || MODE.equals("split") || MODE.equals("encoders");
     private static final int MAX_TAGS = 16;
     private static final long INTERVAL_NS = 2_000_000_000L;
 
@@ -37,7 +39,7 @@ public final class MetalProfiler {
             return;
         }
         ctx = context;
-        int mode = Native.profEnable(ctx);
+        int mode = Native.profEnable(ctx, !MODE.equals("encoders"));
         active = mode != 0;
         if (active) {
             out = MemoryUtil.nmemCalloc(40, 8);

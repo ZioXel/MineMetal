@@ -79,7 +79,7 @@ public final class Native {
         PASS_BEGIN, PASS_END, PASS_PUSH_DEBUG, PASS_POP_DEBUG, PASS_SET_SCISSOR, PASS_SET_PIPELINE, PASS_SET_VERTEX_BUFFER, PASS_SET_BUFFER,
         PASS_SET_BYTES, PASS_SET_TEXTURE, PASS_SET_SAMPLER, PASS_SET_TEXEL_BUFFER, PASS_SET_INDEX_BUFFER, PASS_DRAW, PASS_DRAW_INDEXED,
         PASS_MULTI_DRAW, PASS_MULTI_DRAW_INDEXED, PASS_DRAW_INDIRECT, PASS_DRAW_INDEXED_INDIRECT, PIPELINE_CREATE, SURFACE_CREATE,
-        SURFACE_CONFIGURE, SURFACE_ACQUIRE, SURFACE_BLIT, SURFACE_DROP, SET_FAST_MATH, SET_COALESCE, SET_GPU_DEBUG, SET_DEPTH_FLIP, PROF_ENABLE, PROF_SET_TAG, PROF_READ, SURFACE_STATS, PASS_SET_VIEWPORT, GENERATE_MIPMAPS, SAMPLER_CREATE_EX,
+        SURFACE_CONFIGURE, SURFACE_ACQUIRE, SURFACE_BLIT, SURFACE_DROP, SET_FAST_MATH, SET_COALESCE, SET_NEXT_PASS_DONT_CARE, SET_GPU_DEBUG, SET_DEPTH_FLIP, PROF_ENABLE, PROF_SET_TAG, PROF_READ, SURFACE_STATS, PASS_SET_VIEWPORT, GENERATE_MIPMAPS, SAMPLER_CREATE_EX,
         COMPUTE_PIPELINE_CREATE, COMPUTE_MAX_THREADS, COMPUTE_SET_PIPELINE, COMPUTE_SET_BUFFER, COMPUTE_SET_BYTES, COMPUTE_SET_TEXTURE, COMPUTE_SET_SAMPLER, COMPUTE_DISPATCH, COMPUTE_DISPATCH_INDIRECT, MEMORY_BARRIER, PASS_MARK_STORAGE, FILL_BUFFER, TEXTURE_ZERO, COPY_TEXTURE_ALL;
 
     private static void bind() {
@@ -138,9 +138,10 @@ public final class Native {
         SURFACE_DROP = h("mm_surface_drop", v(P));
         SET_FAST_MATH = h("mm_set_fast_math", v(JAVA_INT));
         SET_COALESCE = h("mm_set_coalesce", v(JAVA_INT));
+        SET_NEXT_PASS_DONT_CARE = hc("mm_set_next_pass_dont_care", v(P, JAVA_INT));
         SET_GPU_DEBUG = h("mm_set_gpu_debug", v(P, JAVA_INT));
         SET_DEPTH_FLIP = hc("mm_set_depth_flip", v(P, JAVA_INT));
-        PROF_ENABLE = h("mm_prof_enable", f(JAVA_INT, P));
+        PROF_ENABLE = h("mm_prof_enable", f(JAVA_INT, P, JAVA_INT));
         PROF_SET_TAG = hc("mm_prof_set_tag", v(P, JAVA_INT));
         PROF_READ = h("mm_prof_read", v(P, P));
         SURFACE_STATS = h("mm_surface_stats", v(P, P));
@@ -438,6 +439,11 @@ public final class Native {
         try { SURFACE_DROP.invokeExact(surface); } catch (Throwable t) { throw rethrow(t); }
     }
 
+    /** Color attachments (bit mask) the next pass begin does not need to load (they will be fully overwritten). */
+    public static void setNextPassDontCare(long ctx, int mask) {
+        try { SET_NEXT_PASS_DONT_CARE.invokeExact(ctx, mask); } catch (Throwable t) { throw rethrow(t); }
+    }
+
     public static void setCoalesce(boolean enabled) {
         try { SET_COALESCE.invokeExact(b(enabled)); } catch (Throwable t) { throw rethrow(t); }
     }
@@ -454,8 +460,8 @@ public final class Native {
         try { SET_DEPTH_FLIP.invokeExact(ctx, b(flip)); } catch (Throwable t) { throw rethrow(t); }
     }
 
-    public static int profEnable(long ctx) {
-        try { return (int) PROF_ENABLE.invokeExact(ctx); } catch (Throwable t) { throw rethrow(t); }
+    public static int profEnable(long ctx, boolean forceSplit) {
+        try { return (int) PROF_ENABLE.invokeExact(ctx, forceSplit ? 1 : 0); } catch (Throwable t) { throw rethrow(t); }
     }
 
     public static void profSetTag(long ctx, int tag) {

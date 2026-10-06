@@ -148,6 +148,7 @@ final class GlProgramObject {
     }
 
     void setCompiled(final GlProgramCompiler.Result result) {
+        this.discards = -1;
         this.samplerVariants.clear();
         this.computeVariants.clear();
         this.active = result;
@@ -368,6 +369,28 @@ final class GlProgramObject {
             }
         }
         return -1;
+    }
+
+    private int discards = -1;
+
+    /** The fragment shader can discard fragments (then old attachment contents must be kept). */
+    boolean discards() {
+        if (this.discards < 0) {
+            GlProgramCompiler.Result r = this.active != null ? this.active : this.compiled;
+            this.discards = r == null || r.fragment() == null || r.fragment().msl.contains("discard_fragment") ? 1 : 0;
+        }
+        return this.discards == 1;
+    }
+
+    boolean writesOutput(final int location) {
+        if (this.compiled != null && this.compiled.fragment() != null) {
+            for (GlProgramCompiler.Interface out : this.compiled.fragment().outputs) {
+                if (out.location() == location) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     int maxFragmentOutput() {

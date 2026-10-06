@@ -1064,6 +1064,8 @@ public final class MetalGL {
             int count = 0;
             int w = 0;
             int h = 0;
+            int[] attW = new int[MAX_DRAW_BUFFERS];
+            int[] attH = new int[MAX_DRAW_BUFFERS];
             for (int i = 0; i < Math.min(outputs, MAX_DRAW_BUFFERS); i++) {
                 int attachment = fb.drawBuffer(i);
                 GlTextureObject tex = attachment >= 0 ? TEXTURES.get(fb.color[attachment]) : null;
@@ -1075,6 +1077,8 @@ public final class MetalGL {
                 count = i + 1;
                 w = textureWidth(tex.id, fb.colorLevel[attachment]);
                 h = textureHeight(tex.id, fb.colorLevel[attachment]);
+                attW[i] = w;
+                attH[i] = h;
             }
             GlTextureObject depth = TEXTURES.get(fb.depth);
             long depthView = depth != null && depth.texture != null ? depth.levelView(device, 0).handle() : 0L;
@@ -1098,6 +1102,7 @@ public final class MetalGL {
             int vh = viewport[3] > 0 ? viewport[3] : h;
             int[] area = scissorTest ? scissor : new int[]{vx, vy, vw, vh};
             Native.setDepthFlip(ctx, false); // GL depth functions are used as given
+            Native.setNextPassDontCare(ctx, overwriteMask(program, count, attW, attH, vx, vy, vw, vh));
             if (!Native.passBegin(ctx, MemoryUtil.memAddress(views), count, 0, 0L, depthView, 0.0, area[0], area[1], area[2], area[3], 0L)) {
                 return;
             }
@@ -1122,6 +1127,27 @@ public final class MetalGL {
                 Native.passEnd(ctx);
             }
         }
+    }
+
+    private static final boolean NO_LOAD_SKIP = Boolean.getBoolean("minemetal.noLoadSkip");
+
+    /**
+     * Color attachments this fullscreen draw overwrites completely (bit i = draw buffer i): the whole attachment is in
+     * the viewport, no scissor, no blending, all channels written, the program writes that output and never discards.
+     * Their previous contents need not be loaded into tile memory (a full-texture read per attachment per pass).
+     */
+    private static int overwriteMask(final GlProgramObject program, final int count, final int[] attW, final int[] attH, final int vx, final int vy,
+                                     final int vw, final int vh) {
+        if (NO_LOAD_SKIP || scissorTest || colorMask != 15 || vx != 0 || vy != 0 || program.discards()) {
+            return 0;
+        }
+        int mask = 0;
+        for (int i = 0; i < count; i++) {
+            if (attW[i] > 0 && vw >= attW[i] && vh >= attH[i] && !blendEnabled(i) && program.writesOutput(i)) {
+                mask |= 1 << i;
+            }
+        }
+        return mask;
     }
 
     private static void bindUniforms(final MetalDevice device, final GlProgramObject program, final MemoryStack stack) {
