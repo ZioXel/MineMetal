@@ -18,7 +18,7 @@ public final class MetalProfiler {
     /** "true"/"split": one command buffer per phase (exact phase times); "encoders": encoder timestamps (overlapping). */
     private static final String MODE = System.getProperty("minemetal.gpuProfile", "false");
     public static final boolean ENABLED = MODE.equals("true") || MODE.equals("split") || MODE.equals("encoders");
-    private static final int MAX_TAGS = 16;
+    private static final int MAX_TAGS = 48; // = MM_PROF_TAGS
     private static final long INTERVAL_NS = 2_000_000_000L;
 
     private static final List<String> NAMES = new ArrayList<>(List.of("other"));
@@ -42,7 +42,7 @@ public final class MetalProfiler {
         int mode = Native.profEnable(ctx, !MODE.equals("encoders"));
         active = mode != 0;
         if (active) {
-            out = MemoryUtil.nmemCalloc(40, 8);
+            out = MemoryUtil.nmemCalloc(MAX_TAGS * 2 + 4, 8);
             LOGGER.info("GPU profiler on ({}): per-phase times are logged every {} s",
                 mode == 2 ? "one command buffer per phase" : "encoder timestamps", INTERVAL_NS / 1_000_000_000L);
         } else {
@@ -108,8 +108,8 @@ public final class MetalProfiler {
             }
             cpuNs[t] = 0L;
         }
-        double cbMs = MemoryUtil.memGetDouble(out + 32 * 8L) / f;
-        double cbs = MemoryUtil.memGetDouble(out + 33 * 8L) / f;
+        double cbMs = MemoryUtil.memGetDouble(out + MAX_TAGS * 16L) / f;
+        double cbs = MemoryUtil.memGetDouble(out + MAX_TAGS * 16L + 8) / f;
         double seconds = (now - windowStart) / 1.0e9;
         LOGGER.info(String.format("%.1f fps | GPU ms/frame: command buffers %.2f (%.1f per frame), encoders %.2f ->%s | CPU ms/frame:%s",
             frames / seconds, cbMs, cbs, gpuSum, gpu, cpu));

@@ -189,7 +189,7 @@ MM_EXPORT int64_t mm_enum(const char *kind, const char *name) {
 
 static int g_noCoalesce = 0; // -Dminemetal.noCoalesce=true: one encoder per pass (debugging)
 #define MM_PROF_SLOTS 4096
-#define MM_PROF_TAGS 16
+#define MM_PROF_TAGS 48
 #define MM_PROF_BLIT 0x80
 
 @interface MMContext : NSObject {
@@ -437,9 +437,9 @@ MM_EXPORT void mm_prof_read(void *p, double *out) {
         ctx->profTicks[t] = 0.0;
         ctx->profEncoders[t] = 0;
     }
-    out[32] = ctx->profCbSeconds * 1000.0;
-    out[33] = ctx->profCbCount;
-    out[34] = ticksPerNs;
+    out[MM_PROF_TAGS * 2] = ctx->profCbSeconds * 1000.0;
+    out[MM_PROF_TAGS * 2 + 1] = ctx->profCbCount;
+    out[MM_PROF_TAGS * 2 + 2] = ticksPerNs;
     ctx->profCbSeconds = 0.0;
     ctx->profCbCount = 0;
     pthread_mutex_unlock(&ctx->profMutex);
