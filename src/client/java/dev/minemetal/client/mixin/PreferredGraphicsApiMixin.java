@@ -3,6 +3,8 @@ package dev.minemetal.client.mixin;
 import com.mojang.renderpearl.api.device.GpuBackend;
 import dev.minemetal.client.MineMetalClient;
 import dev.minemetal.client.metal.MetalBackend;
+import dev.minemetal.client.metal.MetalDevice;
+import net.minecraft.network.chat.Component;
 import net.minecraft.client.PreferredGraphicsApi;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
@@ -13,14 +15,16 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  * Puts Metal in front of the backends Minecraft tries. If Metal fails to initialise, Minecraft falls through to the
  * remaining (vanilla) backends exactly as before.
  * <p>
- * Escape hatches: choosing "OpenGL" explicitly in Video Settings (or Minecraft's own crash recovery, which forces OpenGL
- * after an unclean start) skips Metal, as does {@code -Dminemetal.disable=true}.
+ * Only the "Default" Graphics API uses Metal (shown as "Default (Metal)"); choosing OpenGL or Vulkan explicitly in Video
+ * Settings (or Minecraft's own crash recovery, which forces OpenGL after an unclean start) skips Metal, as does
+ * {@code -Dminemetal.disable=true}.
  */
 @Mixin(PreferredGraphicsApi.class)
 public abstract class PreferredGraphicsApiMixin {
     @Inject(method = "getBackendsToTry", at = @At("RETURN"), cancellable = true)
     private void minemetal$preferMetal(final CallbackInfoReturnable<GpuBackend[]> cir) {
-        if ((Object) this == PreferredGraphicsApi.OPENGL || !MineMetalClient.isMetalEnabled()) {
+        // "Default" = Metal; choosing OpenGL or Vulkan explicitly gives exactly that backend.
+        if ((Object) this != PreferredGraphicsApi.DEFAULT || !MineMetalClient.isMetalEnabled()) {
             return;
         }
         GpuBackend[] vanilla = cir.getReturnValue();
@@ -28,5 +32,13 @@ public abstract class PreferredGraphicsApiMixin {
         withMetal[0] = new MetalBackend();
         System.arraycopy(vanilla, 0, withMetal, 1, vanilla.length);
         cir.setReturnValue(withMetal);
+    }
+
+    /** Video Settings shows "Default (Metal)" when Default is running MineMetal's Metal backend. */
+    @Inject(method = "caption", at = @At("RETURN"), cancellable = true)
+    private void minemetal$caption(final CallbackInfoReturnable<Component> cir) {
+        if ((Object) this == PreferredGraphicsApi.DEFAULT && MetalDevice.current() != null) {
+            cir.setReturnValue(Component.empty().append(cir.getReturnValue()).append(" (Metal)"));
+        }
     }
 }

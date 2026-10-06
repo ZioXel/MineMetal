@@ -57,7 +57,8 @@ Requirements: Apple Silicon Mac, macOS 14+, Minecraft Java 26.3 with Fabric Load
    [MineMetal-Iris releases](https://github.com/ZioXel/MineMetal-Iris/releases) and use it **instead of** the official
    Iris jar.
 
-To go back to OpenGL, remove the MineMetal jar.
+Video Settings → Graphics API shows **Default (Metal)** while MineMetal is running. Pick OpenGL or Vulkan there
+(and restart) to use those instead.
 
 ## Build & run
 
