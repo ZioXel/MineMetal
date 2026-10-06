@@ -87,6 +87,16 @@ public final class MetalRenderPass implements RenderPassBackend {
     private boolean bindingsDirty;
     private int pushedDebugGroups;
 
+    private static java.util.function.@Nullable BooleanSupplier skipVanillaDraws;
+
+    /**
+     * While the supplier returns true, draws with ordinary (non-override) pipelines are dropped. Iris uses this for its
+     * shadow pass, which records renderpearl passes on the main target but must only draw with shadow programs.
+     */
+    public static void setSkipVanillaDraws(final java.util.function.@Nullable BooleanSupplier supplier) {
+        skipVanillaDraws = supplier;
+    }
+
     MetalRenderPass(final MetalDevice device, final RenderPass.RenderArea renderArea, final int outputWidth, final int outputHeight,
                     final long[] passViews, final long passDepthView) {
         this.device = device;
@@ -246,8 +256,10 @@ public final class MetalRenderPass implements RenderPassBackend {
             for (int i = 0; i < views.length; i++) {
                 p.put(i, views[i]);
             }
-            ok = Native.passBegin(this.ctx, MemoryUtil.memAddress(p), views.length, 0, 0L, depthView, 0.0, this.renderArea.x(), this.renderArea.y(),
-                this.renderArea.width(), this.renderArea.height(), 0L);
+            // Override targets (e.g. Iris' shadow map) can differ in size from the pass: draw over the whole target there.
+            boolean own = views == this.passViews && depthView == this.passDepthView;
+            ok = Native.passBegin(this.ctx, MemoryUtil.memAddress(p), views.length, 0, 0L, depthView, 0.0, own ? this.renderArea.x() : 0,
+                own ? this.renderArea.y() : 0, own ? this.renderArea.width() : 1 << 16, own ? this.renderArea.height() : 1 << 16, 0L);
         }
         this.activeViews = views;
         this.activeDepthView = depthView;
@@ -296,6 +308,10 @@ public final class MetalRenderPass implements RenderPassBackend {
             return ov.bind(this.ctx, target, ov.uniforms(), this.uniforms, push);
         }
         if (this.pipeline == null) {
+            return false;
+        }
+        java.util.function.BooleanSupplier skip = skipVanillaDraws;
+        if (skip != null && skip.getAsBoolean()) {
             return false;
         }
         if (this.activeViews != this.passViews || this.activeDepthView != this.passDepthView) {

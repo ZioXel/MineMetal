@@ -62,6 +62,14 @@ public final class GlOverridePipeline implements MetalRenderPass.OverridePipelin
 
         /** GL uniform buffer binding point of the push-constant block, or -1. */
         int pushConstantBinding();
+
+        /**
+         * True while Iris renders the shadow map. The shadow map uses forward depth (cleared to 1, like Iris on GL),
+         * so the depth compare of the original pipeline is mirrored and back-face culling is off.
+         */
+        default boolean shadowPass() {
+            return false;
+        }
     }
 
     private final MetalRenderPipeline original;
@@ -115,7 +123,7 @@ public final class GlOverridePipeline implements MetalRenderPass.OverridePipelin
         if (p == null || p.compiled == null) {
             return false;
         }
-        long pipeline = this.pipelineFor(p, this.lastFormats, target.depthView() != 0L);
+        long pipeline = this.pipelineFor(p, this.lastFormats, target.depthView() != 0L, this.hooks.shadowPass());
         if (pipeline == 0L || !Native.passSetPipeline(ctx, pipeline)) {
             return false;
         }
@@ -238,23 +246,34 @@ public final class GlOverridePipeline implements MetalRenderPass.OverridePipelin
         this.hooks.clearState();
     }
 
-    private long pipelineFor(final GlProgramObject p, final GpuFormat[] formats, final boolean hasDepth) {
+    /** The compare op for the opposite depth direction (reversed Z of the main view vs forward Z of the shadow map). */
+    private static com.mojang.renderpearl.api.pipeline.CompareOp mirror(final com.mojang.renderpearl.api.pipeline.CompareOp op) {
+        return switch (op) {
+            case LESS_THAN -> com.mojang.renderpearl.api.pipeline.CompareOp.GREATER_THAN;
+            case LESS_THAN_OR_EQUAL -> com.mojang.renderpearl.api.pipeline.CompareOp.GREATER_THAN_OR_EQUAL;
+            case GREATER_THAN -> com.mojang.renderpearl.api.pipeline.CompareOp.LESS_THAN;
+            case GREATER_THAN_OR_EQUAL -> com.mojang.renderpearl.api.pipeline.CompareOp.LESS_THAN_OR_EQUAL;
+            default -> op;
+        };
+    }
+
+    private long pipelineFor(final GlProgramObject p, final GpuFormat[] formats, final boolean hasDepth, final boolean shadow) {
         StringBuilder key = new StringBuilder(48);
         for (GpuFormat f : formats) {
             key.append(f == null ? "-" : f.ordinal()).append(',');
         }
-        key.append(hasDepth).append('|').append(MetalGL.blendKey());
+        key.append(hasDepth).append(shadow ? "|s|" : "|").append(MetalGL.blendKey());
         String k = key.toString();
         long cached = this.pipelines.getOrDefault(k, 0L);
         if (cached != 0L) {
             return cached == -1L ? 0L : cached;
         }
-        long created = this.create(p, formats, hasDepth);
+        long created = this.create(p, formats, hasDepth, shadow);
         this.pipelines.put(k, created != 0L ? created : -1L);
         return created;
     }
 
-    private long create(final GlProgramObject p, final GpuFormat[] formats, final boolean hasDepth) {
+    private long create(final GlProgramObject p, final GpuFormat[] formats, final boolean hasDepth, final boolean shadow) {
         GlProgramCompiler.Result compiled = p.compiled;
         if (compiled == null) {
             return 0L;
@@ -366,12 +385,13 @@ public final class GlOverridePipeline implements MetalRenderPass.OverridePipelin
             DepthStencilState depth = this.info.depthStencilState();
             IntBuffer raster = stack.callocInt(7);
             raster.put(0, this.info.primitiveTopology().ordinal());
-            raster.put(1, this.info.cull() ? 1 : 0);
+            raster.put(1, this.info.cull() && !shadow ? 1 : 0);
             raster.put(2, this.info.polygonMode() == PolygonMode.WIREFRAME ? 1 : 0);
             raster.put(3, Boolean.getBoolean("minemetal.frontFaceCCW") ? 1 : 0); // same winding as the vanilla pipelines
             raster.put(4, hasDepth ? 1 : 0);
-            raster.put(5, (int) MetalEnums.compare(hasDepth && depth != null ? depth.depthTest()
-                : com.mojang.renderpearl.api.pipeline.CompareOp.ALWAYS_PASS));
+            com.mojang.renderpearl.api.pipeline.CompareOp depthTest = hasDepth && depth != null ? depth.depthTest()
+                : com.mojang.renderpearl.api.pipeline.CompareOp.ALWAYS_PASS;
+            raster.put(5, (int) MetalEnums.compare(shadow ? mirror(depthTest) : depthTest));
             raster.put(6, hasDepth && depth != null && depth.writeDepth() ? 1 : 0);
             String noDepth = System.getProperty("minemetal.debugNoDepth");
             if (noDepth != null && !noDepth.isEmpty() && this.name.contains(noDepth)) {
