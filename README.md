@@ -46,6 +46,19 @@ Complementary's colored lighting, which Apple's OpenGL driver cannot do at all.
 
 Heavy packs are GPU-bound at full Retina resolution (BSL ~25 fps fullscreen); that is the next thing being worked on.
 
+## Install (players)
+
+Requirements: Apple Silicon Mac, macOS 14+, Minecraft Java 26.3 with Fabric Loader 0.19.5+, Sodium 0.9.x.
+
+1. Install Fabric for 26.3 with the [Fabric installer](https://fabricmc.net/use/installer/) and start the Fabric profile once.
+2. Download `minemetal-*.jar` from [Releases](https://github.com/ZioXel/MineMetal/releases) and Sodium from Modrinth,
+   put both into `~/Library/Application Support/minecraft/mods`.
+3. For shader packs: also download **Iris (MineMetal)** from
+   [MineMetal-Iris releases](https://github.com/ZioXel/MineMetal-Iris/releases) and use it **instead of** the official
+   Iris jar.
+
+To go back to OpenGL, remove the MineMetal jar.
+
 ## Build & run
 
 Needs a JDK 25 (`brew install openjdk@25`) and Xcode command line tools.
@@ -55,6 +68,7 @@ Needs a JDK 25 (`brew install openjdk@25`) and Xcode command line tools.
 ./mm.sh run          # runs Minecraft from the dev environment
 ./mm.sh kit          # downloads Sodium, Iris and BSL for testing
 ./mm.sh iris         # builds MineMetal + ../MineMetal-Iris, runs with shader packs on Metal
+./release.sh         # release jars of both mods into dist/ (./release.sh publish -> GitHub releases)
 ```
 
 Useful flags: `-PmetalHud` (Apple's performance HUD), `-PmetalValidation` (Metal API validation). JVM flags go in
