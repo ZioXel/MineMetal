@@ -299,7 +299,7 @@ public final class GLDispatch {
     }
 
     public static void glDisablei(final int a0, final int a1) {
-        MetalGL.glDisable(a0);
+        MetalGL.glDisablei(a0, a1);
     }
 
     public static void glDispatchCompute(final int a0, final int a1, final int a2) {
@@ -351,7 +351,7 @@ public final class GLDispatch {
     }
 
     public static void glEnablei(final int a0, final int a1) {
-        MetalGL.glEnable(a0);
+        MetalGL.glEnablei(a0, a1);
     }
 
     public static void glFramebufferTexture2D(final int a0, final int a1, final int a2, final int a3, final int a4) {

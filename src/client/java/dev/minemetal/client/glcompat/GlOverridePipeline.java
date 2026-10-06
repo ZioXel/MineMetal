@@ -123,6 +123,9 @@ public final class GlOverridePipeline implements MetalRenderPass.OverridePipelin
         if (p == null || p.compiled == null) {
             return false;
         }
+        if (p.sharesSamplers() && !this.planSamplers(p, descriptions, values)) {
+            return false;
+        }
         long pipeline = this.pipelineFor(p, this.lastFormats, target.depthView() != 0L, this.hooks.shadowPass());
         if (pipeline == 0L || !Native.passSetPipeline(ctx, pipeline)) {
             return false;
@@ -166,7 +169,7 @@ public final class GlOverridePipeline implements MetalRenderPass.OverridePipelin
                     for (GlProgramObject.Slot slot : p.slots) {
                         if (slot.sampler && slot.unit == unit) {
                             Native.passSetTexture(ctx, 3, ((MetalTextureView) pair.view()).handle(), slot.samplerIndex);
-                            Native.passSetSampler(ctx, 3, ((MetalSampler) pair.sampler()).handle(), slot.samplerIndex);
+                            Native.passSetSampler(ctx, 3, ((MetalSampler) pair.sampler()).handle(), p.samplerSlot(slot.samplerIndex));
                             usedUnits |= 1L << unit;
                         }
                     }
@@ -260,12 +263,31 @@ public final class GlOverridePipeline implements MetalRenderPass.OverridePipelin
         };
     }
 
+    /** Programs with more than 16 samplers: sampler states of this draw (renderpearl-provided first, then GL units). */
+    private boolean planSamplers(final GlProgramObject p, final List<BindGroupLayout.UniformDescription> descriptions, final @Nullable Object[] values) {
+        long[] override = new long[p.compiled.samplers().size()];
+        for (int i = 0; i < descriptions.size(); i++) {
+            Object value = values != null && i < values.length ? values[i] : null;
+            BindGroupLayout.UniformDescription d = descriptions.get(i);
+            if (!(value instanceof TextureViewAndSampler pair) || !d.type().name().equals("COMBINED_IMAGE_SAMPLER")) {
+                continue;
+            }
+            int unit = this.hooks.samplerBinding(d.name());
+            for (GlProgramObject.Slot slot : p.slots) {
+                if (slot.sampler && slot.unit == unit && unit >= 0 && slot.samplerIndex < override.length) {
+                    override[slot.samplerIndex] = ((MetalSampler) pair.sampler()).handle();
+                }
+            }
+        }
+        return MetalGL.planUnitSamplers(p, override);
+    }
+
     private long pipelineFor(final GlProgramObject p, final GpuFormat[] formats, final boolean hasDepth, final boolean shadow) {
         StringBuilder key = new StringBuilder(48);
         for (GpuFormat f : formats) {
             key.append(f == null ? "-" : f.ordinal()).append(',');
         }
-        key.append(hasDepth).append(shadow ? "|s|" : "|").append(MetalGL.blendKey());
+        key.append(hasDepth).append(shadow ? "|s|" : "|").append(MetalGL.blendKey()).append(p.samplerKey);
         String k = key.toString();
         long cached = this.pipelines.getOrDefault(k, 0L);
         if (cached != 0L) {
@@ -277,7 +299,7 @@ public final class GlOverridePipeline implements MetalRenderPass.OverridePipelin
     }
 
     private long create(final GlProgramObject p, final GpuFormat[] formats, final boolean hasDepth, final boolean shadow) {
-        GlProgramCompiler.Result compiled = p.compiled;
+        GlProgramCompiler.Result compiled = p.active != null ? p.active : p.compiled;
         if (compiled == null) {
             return 0L;
         }

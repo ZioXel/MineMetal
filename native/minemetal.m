@@ -203,7 +203,7 @@ static int g_noCoalesce = 0; // -Dminemetal.noCoalesce=true: one encoder per pas
     // Redundant-state filter for the open render encoder ([stage][index]; stage 0 = vertex, 1 = fragment).
     void *boundBuffer[2][31];
     uint64_t boundOffset[2][31];
-    void *boundTexture[2][32];
+    void *boundTexture[2][64];
     void *boundSampler[2][16];
     int scissor[4];
     void *boundDepthState;
@@ -1260,7 +1260,7 @@ MM_EXPORT void mm_pass_set_bytes(void *p, int stages, const void *data, uint64_t
 }
 
 static inline void mm_bind_texture(MMContext *ctx, int stage, id<MTLTexture> t, void *raw, int index) {
-    if (index < 0 || index >= 32 || ctx->boundTexture[stage][index] == raw) return;
+    if (index < 0 || index >= 64 || ctx->boundTexture[stage][index] == raw) return;
     ctx->boundTexture[stage][index] = raw;
     if (stage == 0) [ctx.render setVertexTexture:t atIndex:(NSUInteger)index];
     else [ctx.render setFragmentTexture:t atIndex:(NSUInteger)index];

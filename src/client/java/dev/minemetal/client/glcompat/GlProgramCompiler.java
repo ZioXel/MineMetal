@@ -43,6 +43,9 @@ public final class GlProgramCompiler {
     static final int SSBO_BUFFER_BASE = 10;
     static final int MAX_SSBOS = 9;
     static final int BUFFER_SIZE_BUFFER = 19;
+    /** Metal limits per stage: 16 sampler states; textures (combined samplers + storage images): 32 GL units + 8 images. */
+    static final int MAX_SAMPLER_STATES = 16;
+    static final int MAX_TEXTURES = 40;
     private static final int DECORATION_LOCATION = 30;
     private static final int DECORATION_BINDING = 33;
     private static final int DECORATION_DESCRIPTOR_SET = 34;
@@ -100,19 +103,21 @@ public final class GlProgramCompiler {
 
     /** Program-wide resource numbering shared by all stages. */
     private record Slots(Object2IntLinkedOpenHashMap<String> samplers, Object2IntLinkedOpenHashMap<String> images,
-                         Map<Integer, Integer> ssbos, boolean storage) {
+                         Map<Integer, Integer> ssbos, boolean storage, int @Nullable [] samplerSlots) {
+        /** Metal sampler-state slot of combined sampler {@code index} (its texture slot is {@code index}). */
+        int samplerSlot(final int index) {
+            return this.samplerSlots != null && index < this.samplerSlots.length ? this.samplerSlots[index] : index % MAX_SAMPLER_STATES;
+        }
     }
 
-    private static Slots slots(final String name, final StageResult... infos) throws ShaderCompileException {
+    private static Slots slots(final String name, final int @Nullable [] samplerSlots, final StageResult... infos) throws ShaderCompileException {
         Object2IntLinkedOpenHashMap<String> samplerIndex = new Object2IntLinkedOpenHashMap<>();
         for (StageResult info : infos) {
             for (String sn : info.samplers) {
                 samplerIndex.putIfAbsent(sn, samplerIndex.size());
             }
         }
-        if (samplerIndex.size() > 16) {
-            throw new ShaderCompileException(name + ": " + samplerIndex.size() + " samplers exceed Metal's limit of 16 per stage");
-        }
+
         Object2IntLinkedOpenHashMap<String> imageIndex = new Object2IntLinkedOpenHashMap<>();
         for (StageResult info : infos) {
             for (String im : info.images) {
@@ -130,16 +135,28 @@ public final class GlProgramCompiler {
         for (int b : bindings) {
             ssbos.put(b, SSBO_BUFFER_BASE + ssbos.size());
         }
-        return new Slots(samplerIndex, imageIndex, ssbos, !imageIndex.isEmpty() || !ssbos.isEmpty());
+        if (samplerIndex.size() + imageIndex.size() > MAX_TEXTURES) {
+            throw new ShaderCompileException(name + ": " + (samplerIndex.size() + imageIndex.size()) + " textures exceed Metal's limit of "
+                + MAX_TEXTURES + " per stage");
+        }
+        return new Slots(samplerIndex, imageIndex, ssbos, !imageIndex.isEmpty() || !ssbos.isEmpty(), samplerSlots);
     }
 
     /** Compiles a compute shader. */
     public static Result compileCompute(final String name, final String source) throws ShaderCompileException {
+        return compileCompute(name, source, null);
+    }
+
+    /**
+     * {@code samplerSlots}: Metal sampler-state slot per combined sampler, for programs with more than 16 samplers
+     * (identical sampler states share a slot); null = one slot each.
+     */
+    public static Result compileCompute(final String name, final String source, final int @Nullable [] samplerSlots) throws ShaderCompileException {
         ByteBuffer spv = toSpirv(name + ".csh", renameReserved(source), Shaderc.shaderc_compute_shader);
         try {
             StageResult info = new StageResult(STAGE_VERTEX);
             reflectOnly(spv, EXEC_COMPUTE, info);
-            Slots slots = slots(name, info);
+            Slots slots = slots(name, samplerSlots, info);
             StageResult cs = new StageResult(STAGE_VERTEX);
             toMsl(name, spv, EXEC_COMPUTE, cs, slots, null);
             return new Result(cs, null, new ArrayList<>(slots.samplers().keySet()), new ArrayList<>(slots.images().keySet()), true);
@@ -150,6 +167,12 @@ public final class GlProgramCompiler {
 
     /** Compiles and links a vertex + fragment pair. */
     public static Result compile(final String name, final String vertexSource, final String fragmentSource) throws ShaderCompileException {
+        return compile(name, vertexSource, fragmentSource, null);
+    }
+
+    /** See {@link #compileCompute(String, String, int[])} for {@code samplerSlots}. */
+    public static Result compile(final String name, final String vertexSource, final String fragmentSource, final int @Nullable [] samplerSlots)
+        throws ShaderCompileException {
         ByteBuffer vsSpv = toSpirv(name + ".vsh", renameReserved(vertexSource), Shaderc.shaderc_vertex_shader);
         ByteBuffer fsSpv = null;
         try {
@@ -159,7 +182,7 @@ public final class GlProgramCompiler {
             StageResult fsInfo = new StageResult(STAGE_FRAGMENT);
             reflectOnly(vsSpv, EXEC_VERTEX, vsInfo);
             reflectOnly(fsSpv, EXEC_FRAGMENT, fsInfo);
-            Slots slots = slots(name, vsInfo, fsInfo);
+            Slots slots = slots(name, samplerSlots, vsInfo, fsInfo);
             Map<String, Integer> varyingLocations = new LinkedHashMap<>();
             for (Interface out : vsInfo.outputs) {
                 varyingLocations.put(out.name(), out.location());
@@ -186,6 +209,36 @@ public final class GlProgramCompiler {
         "\\b(new|delete|this|template|typename|namespace|operator|friend|virtual|explicit|mutable|using|constexpr|nullptr|auto|register"
             + "|try|catch|throw|decltype|alignas|alignof|noexcept|static_assert|thread_local|char16_t|char32_t|wchar_t)\\b");
 
+    private static final java.util.regex.Pattern VERSION_LINE = java.util.regex.Pattern.compile("(?m)^[ \\t]*#version[ \\t]+(\\d+)[^\\n]*\\n");
+
+    /**
+     * GL drivers accept layout(binding = N), SSBOs and image load/store in older #versions (420pack / 430 features via
+     * extensions, or leniency); glslang is strict. Enables those extensions for shaders below #version 430.
+     */
+    static String enableModernExtensions(final String source) {
+        java.util.regex.Matcher m = VERSION_LINE.matcher(source);
+        if (!m.find()) {
+            return source;
+        }
+        int version;
+        try {
+            version = Integer.parseInt(m.group(1));
+        } catch (NumberFormatException e) {
+            return source;
+        }
+        if (version >= 430) {
+            return source;
+        }
+        StringBuilder ext = new StringBuilder();
+        for (String e : new String[]{"GL_ARB_shading_language_420pack", "GL_ARB_shader_storage_buffer_object", "GL_ARB_shader_image_load_store",
+            "GL_ARB_explicit_uniform_location"}) {
+            if (!source.contains(e)) {
+                ext.append("#extension ").append(e).append(" : enable\n");
+            }
+        }
+        return source.substring(0, m.end()) + ext + source.substring(m.end());
+    }
+
     static String renameReserved(final String source) {
         java.util.regex.Matcher m = RESERVED.matcher(source);
         return m.find() ? m.replaceAll("mm_$1") : source;
@@ -194,7 +247,7 @@ public final class GlProgramCompiler {
     private static ByteBuffer toSpirv(final String fileName, final String source, final int kind) throws ShaderCompileException {
         long compiler = Shaderc.shaderc_compiler_initialize();
         long options = Shaderc.shaderc_compile_options_initialize();
-        ByteBuffer src = MemoryUtil.memUTF8(source, false);
+        ByteBuffer src = MemoryUtil.memUTF8(enableModernExtensions(source), false);
         ByteBuffer file = MemoryUtil.memUTF8(fileName);
         ByteBuffer entry = MemoryUtil.memUTF8("main");
         long result = 0L;
@@ -365,7 +418,7 @@ public final class GlProgramCompiler {
             for (int i = 0; i < samplers.capacity(); i++) {
                 SpvcReflectedResource r = samplers.get(i);
                 int index = samplerIndex.getInt(r.nameString());
-                bind(compiler, context, model, r, 0, index, index, stack);
+                bind(compiler, context, model, r, 0, index, slots.samplerSlot(index), stack);
             }
             // Storage images: texture slots after the samplers, shared numbering by name.
             for (int i = 0; i < storageImages.capacity(); i++) {
@@ -406,7 +459,73 @@ public final class GlProgramCompiler {
             out.needsBufferSizes = Spvc.spvc_compiler_msl_needs_buffer_size_buffer(compiler);
             String entry = Spvc.spvc_compiler_get_cleansed_entry_point_name(compiler, "main", model);
             out.entryPoint = entry != null ? entry : "main0";
+            if (slots.samplerSlots() != null) {
+                out.msl = mergeSharedSamplers(out.msl, out.entryPoint);
+            }
         });
+    }
+
+    private static final java.util.regex.Pattern SAMPLER_PARAM = java.util.regex.Pattern.compile("sampler (\\w+) \\[\\[sampler\\((\\d+)\\)\\]\\]");
+
+    /**
+     * Combined samplers that share a Metal sampler slot (see GlProgramObject.planSamplers) become several entry-point
+     * parameters with the same [[sampler(n)]], which Metal rejects. Keeps the first parameter per slot and points the
+     * entry function's uses of the others at it (helper functions receive samplers as arguments and are unaffected).
+     */
+    static String mergeSharedSamplers(final String msl, final String entry) {
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("\\b(?:vertex|fragment|kernel)\\b[^;{}]*?\\b"
+            + java.util.regex.Pattern.quote(entry) + "\\s*\\(").matcher(msl);
+        if (!m.find()) {
+            return msl;
+        }
+        int sigStart = m.end();
+        int depth = 1;
+        int i = sigStart;
+        while (i < msl.length() && depth > 0) {
+            char c = msl.charAt(i++);
+            if (c == '(') {
+                depth++;
+            } else if (c == ')') {
+                depth--;
+            }
+        }
+        int sigEnd = i - 1;
+        String sig = msl.substring(sigStart, sigEnd);
+        Map<String, String> firstBySlot = new LinkedHashMap<>();
+        Map<String, String> rename = new LinkedHashMap<>();
+        java.util.regex.Matcher sm = SAMPLER_PARAM.matcher(sig);
+        while (sm.find()) {
+            String keep = firstBySlot.putIfAbsent(sm.group(2), sm.group(1));
+            if (keep != null) {
+                rename.put(sm.group(1), keep);
+            }
+        }
+        if (rename.isEmpty()) {
+            return msl;
+        }
+        for (String dup : rename.keySet()) {
+            sig = sig.replaceFirst(",\\s*sampler " + java.util.regex.Pattern.quote(dup) + " \\[\\[sampler\\(\\d+\\)\\]\\]", "");
+        }
+        int bodyStart = msl.indexOf('{', sigEnd);
+        if (bodyStart < 0) {
+            return msl;
+        }
+        depth = 0;
+        int bodyEnd = bodyStart;
+        for (int j = bodyStart; j < msl.length(); j++) {
+            char c = msl.charAt(j);
+            if (c == '{') {
+                depth++;
+            } else if (c == '}' && --depth == 0) {
+                bodyEnd = j;
+                break;
+            }
+        }
+        String body = msl.substring(bodyStart, bodyEnd + 1);
+        for (Map.Entry<String, String> e : rename.entrySet()) {
+            body = body.replaceAll("\\b" + java.util.regex.Pattern.quote(e.getKey()) + "\\b", java.util.regex.Matcher.quoteReplacement(e.getValue()));
+        }
+        return msl.substring(0, sigStart) + sig + msl.substring(sigEnd, bodyStart) + body + msl.substring(bodyEnd + 1);
     }
 
     private static void bind(final long compiler, final long context, final int model, final SpvcReflectedResource r, final int buffer,

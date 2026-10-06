@@ -67,8 +67,21 @@ final class GlProgramObject {
     final long[] uploadedOffset = new long[2];
     final Object2LongOpenHashMap<String> pipelines = new Object2LongOpenHashMap<>();
     @Nullable String debugName;
+    /** GLSL kept for re-generating MSL with a different sampler-state sharing (programs with &gt; 16 samplers). */
+    @Nullable String vertexSource;
+    @Nullable String fragmentSource;
+    @Nullable String computeSource;
+    /** MSL in use: {@link #compiled}, or a variant with shared sampler states. */
+    GlProgramCompiler.@Nullable Result active;
+    /** Metal sampler-state slot per combined sampler (texture slot = index); null = identity. */
+    int @Nullable [] samplerSlots;
+    /** Cache-key part for the current sampler sharing ("" = identity). */
+    String samplerKey = "";
+    private final Map<String, GlProgramCompiler.Result> samplerVariants = new java.util.HashMap<>();
     /** Compute program: Metal compute pipeline (0 until first dispatch, -1 if Metal rejected it). */
     long computePipeline;
+    /** Compute pipelines of sampler-sharing variants, by {@link #samplerKey}. */
+    final Object2LongOpenHashMap<String> computeVariants = new Object2LongOpenHashMap<>();
     int computeMaxThreads;
 
     GlProgramObject(final int id) {
@@ -76,7 +89,70 @@ final class GlProgramObject {
         this.slotByName.defaultReturnValue(-1);
     }
 
+    int samplerSlot(final int samplerIndex) {
+        int[] map = this.samplerSlots;
+        return map != null && samplerIndex < map.length ? map[samplerIndex] : samplerIndex;
+    }
+
+    boolean sharesSamplers() {
+        return this.compiled != null && this.compiled.samplers().size() > GlProgramCompiler.MAX_SAMPLER_STATES;
+    }
+
+    /**
+     * Metal has 16 sampler-state slots per stage. For programs with more samplers, combined samplers with the same
+     * sampler state share a slot: {@code handles[i]} is the Metal sampler bound for sampler {@code i} this draw.
+     * Selects (compiling on first use) the matching MSL variant. Returns false if the draw cannot be expressed.
+     */
+    boolean planSamplers(final long[] handles) {
+        if (!this.sharesSamplers()) {
+            return true;
+        }
+        java.util.HashMap<Long, Integer> ids = new java.util.HashMap<>();
+        int[] map = new int[handles.length];
+        for (int i = 0; i < handles.length; i++) {
+            Integer existing = ids.get(handles[i]);
+            int slot = existing != null ? existing : ids.size();
+            if (existing == null) {
+                ids.put(handles[i], slot);
+            }
+            if (slot >= GlProgramCompiler.MAX_SAMPLER_STATES) {
+                return false;
+            }
+            map[i] = slot;
+        }
+        String key = java.util.Arrays.toString(map);
+        if (key.equals(this.samplerKey) && this.active != null) {
+            return true;
+        }
+        GlProgramCompiler.Result variant = this.samplerVariants.get(key);
+        if (variant == null) {
+            String name = (this.debugName != null ? this.debugName : "program" + this.id) + " samplers" + key;
+            try {
+                if (this.computeSource != null) {
+                    variant = GlProgramCompiler.compileCompute(name, this.computeSource, map);
+                } else if (this.vertexSource != null && this.fragmentSource != null) {
+                    variant = GlProgramCompiler.compile(name, this.vertexSource, this.fragmentSource, map);
+                } else {
+                    return false;
+                }
+            } catch (com.mojang.renderpearl.util.ShaderCompileException | RuntimeException e) {
+                org.slf4j.LoggerFactory.getLogger("MineMetal/GL").error("Failed to compile sampler variant {}: {}", name, e.getMessage());
+                return false;
+            }
+            this.samplerVariants.put(key, variant);
+        }
+        this.active = variant;
+        this.samplerSlots = map;
+        this.samplerKey = key;
+        return true;
+    }
+
     void setCompiled(final GlProgramCompiler.Result result) {
+        this.samplerVariants.clear();
+        this.computeVariants.clear();
+        this.active = result;
+        this.samplerSlots = null;
+        this.samplerKey = "";
         this.freeBlocks();
         this.slots.clear();
         this.slotByName.clear();

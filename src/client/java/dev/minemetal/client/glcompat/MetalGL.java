@@ -549,6 +549,9 @@ public final class MetalGL {
             String cname = p.debugName != null ? p.debugName : "compute" + p.id;
             try {
                 p.setCompiled(GlProgramCompiler.compileCompute(cname, cs));
+                p.computeSource = cs;
+                p.vertexSource = null;
+                p.fragmentSource = null;
                 p.computePipeline = 0L;
                 p.infoLog = "";
             } catch (ShaderCompileException | RuntimeException e) {
@@ -567,6 +570,9 @@ public final class MetalGL {
         try {
             long t0 = System.nanoTime();
             p.setCompiled(GlProgramCompiler.compile(name, vs, fs));
+            p.vertexSource = vs;
+            p.fragmentSource = fs;
+            p.computeSource = null;
             LOGGER.debug("Compiled {} in {} ms", name, (System.nanoTime() - t0) / 1_000_000);
             p.infoLog = "";
         } catch (ShaderCompileException | RuntimeException e) {
@@ -610,6 +616,12 @@ public final class MetalGL {
                 device().encoder().queueForDestroy(() -> Native.release(pso));
                 p.computePipeline = 0L;
             }
+            for (long pso : p.computeVariants.values()) {
+                if (pso > 0L) {
+                    device().encoder().queueForDestroy(() -> Native.release(pso));
+                }
+            }
+            p.computeVariants.clear();
         }
         if (currentProgram == program) {
             currentProgram = 0;
@@ -755,9 +767,54 @@ public final class MetalGL {
         setCap(cap, false);
     }
 
+    // Per-draw-buffer blending (GL 4.0 glEnablei / glBlendFuncSeparatei); Metal blends per color attachment anyway.
+    /** -1 = follow the global GL_BLEND, 0 = off, 1 = on. */
+    private static final int[] bufferBlend = new int[MAX_DRAW_BUFFERS];
+    /** {srcRgb, dstRgb, srcAlpha, dstAlpha} per buffer, or null = global blend function. */
+    private static final int[][] bufferBlendFunc = new int[MAX_DRAW_BUFFERS][];
+
+    static {
+        java.util.Arrays.fill(bufferBlend, -1);
+    }
+
+    private static void resetBufferBlend() {
+        java.util.Arrays.fill(bufferBlend, -1);
+        java.util.Arrays.fill(bufferBlendFunc, null);
+    }
+
+    public static void glEnablei(final int cap, final int index) {
+        if (cap == GL_BLEND && index >= 0 && index < MAX_DRAW_BUFFERS) {
+            bufferBlend[index] = 1;
+        } else if (cap != GL_BLEND) {
+            setCap(cap, true);
+        }
+    }
+
+    public static void glDisablei(final int cap, final int index) {
+        if (cap == GL_BLEND && index >= 0 && index < MAX_DRAW_BUFFERS) {
+            bufferBlend[index] = 0;
+        } else if (cap != GL_BLEND) {
+            setCap(cap, false);
+        }
+    }
+
+    public static void glBlendFuncSeparatei(final int index, final int srcRgb, final int dstRgb, final int srcAlpha, final int dstAlpha) {
+        if (index >= 0 && index < MAX_DRAW_BUFFERS) {
+            bufferBlendFunc[index] = new int[]{srcRgb, dstRgb, srcAlpha, dstAlpha};
+        }
+    }
+
+    private static boolean blendEnabled(final int buffer) {
+        int b = buffer < MAX_DRAW_BUFFERS ? bufferBlend[buffer] : -1;
+        return b == -1 ? blend : b == 1;
+    }
+
     private static void setCap(final int cap, final boolean on) {
         switch (cap) {
-            case GL_BLEND -> blend = on;
+            case GL_BLEND -> {
+                blend = on;
+                java.util.Arrays.fill(bufferBlend, -1);
+            }
             case GL_DEPTH_TEST -> depthTest = on;
             case GL_SCISSOR_TEST -> scissorTest = on;
             default -> {
@@ -766,6 +823,7 @@ public final class MetalGL {
     }
 
     public static void glBlendFuncSeparate(final int srcRgb, final int dstRgb, final int srcAlpha, final int dstAlpha) {
+        java.util.Arrays.fill(bufferBlendFunc, null);
         blendSrcRgb = srcRgb;
         blendDstRgb = dstRgb;
         blendSrcAlpha = srcAlpha;
@@ -1027,6 +1085,9 @@ public final class MetalGL {
                 w = depth.width;
                 h = depth.height;
             }
+            if (!planUnitSamplers(program, null)) {
+                return;
+            }
             long pipeline = pipelineFor(program, formats, count, depthView != 0L);
             if (pipeline == 0L) {
                 return;
@@ -1093,7 +1154,7 @@ public final class MetalGL {
             GlSamplerObject samplerObject = SAMPLERS.get(boundSamplers[slot.unit]);
             long sampler = samplerObject != null ? samplerObject.handle(device, tex) : tex.sampler(device);
             Native.passSetTexture(ctx, 3, tex.sampleView.handle(), slot.samplerIndex);
-            Native.passSetSampler(ctx, 3, sampler, slot.samplerIndex);
+            Native.passSetSampler(ctx, 3, sampler, program.samplerSlot(slot.samplerIndex));
         }
     }
 
@@ -1107,14 +1168,15 @@ public final class MetalGL {
             targets.put(base, MetalEnums.pixelFormat(formats[i]));
             targets.put(base + 1, colorMask);
             GpuFormat.ComponentType ct = formats[i].componentType();
-            if (blend && ct != GpuFormat.ComponentType.UINT_8 && ct != GpuFormat.ComponentType.UINT_16 && ct != GpuFormat.ComponentType.UINT_32
+            if (blendEnabled(i) && ct != GpuFormat.ComponentType.UINT_8 && ct != GpuFormat.ComponentType.UINT_16 && ct != GpuFormat.ComponentType.UINT_32
                 && ct != GpuFormat.ComponentType.SINT_32) {
+                int[] f = bufferBlendFunc[i] != null ? bufferBlendFunc[i] : new int[]{blendSrcRgb, blendDstRgb, blendSrcAlpha, blendDstAlpha};
                 targets.put(base + 2, 1L);
-                targets.put(base + 3, MetalEnums.blendFactor(GlEnums.blendFactor(blendSrcRgb)));
-                targets.put(base + 4, MetalEnums.blendFactor(GlEnums.blendFactor(blendDstRgb)));
+                targets.put(base + 3, MetalEnums.blendFactor(GlEnums.blendFactor(f[0])));
+                targets.put(base + 4, MetalEnums.blendFactor(GlEnums.blendFactor(f[1])));
                 targets.put(base + 5, MetalEnums.blendOp(GlEnums.blendOp(blendEquationRgb)));
-                targets.put(base + 6, MetalEnums.blendFactor(GlEnums.blendFactor(blendSrcAlpha)));
-                targets.put(base + 7, MetalEnums.blendFactor(GlEnums.blendFactor(blendDstAlpha)));
+                targets.put(base + 6, MetalEnums.blendFactor(GlEnums.blendFactor(f[2])));
+                targets.put(base + 7, MetalEnums.blendFactor(GlEnums.blendFactor(f[3])));
                 targets.put(base + 8, MetalEnums.blendOp(GlEnums.blendOp(blendEquationAlpha)));
             }
         }
@@ -1122,12 +1184,31 @@ public final class MetalGL {
 
     /** Cache key part for the emulated blend/color-mask state. */
     static String blendKey() {
-        return blend ? blendSrcRgb + ":" + blendDstRgb + ":" + blendSrcAlpha + ":" + blendDstAlpha + ":" + blendEquationRgb + ":" + blendEquationAlpha + "/" + colorMask
+        String key = blend ? blendSrcRgb + ":" + blendDstRgb + ":" + blendSrcAlpha + ":" + blendDstAlpha + ":" + blendEquationRgb + ":" + blendEquationAlpha + "/" + colorMask
             : "off/" + colorMask;
+        return key + bufferBlendKey();
+    }
+
+    private static String bufferBlendKey() {
+        StringBuilder sb = null;
+        for (int i = 0; i < MAX_DRAW_BUFFERS; i++) {
+            if (bufferBlend[i] == -1 && bufferBlendFunc[i] == null) {
+                continue;
+            }
+            if (sb == null) {
+                sb = new StringBuilder();
+            }
+            sb.append('|').append(i).append(':').append(bufferBlend[i]);
+            if (bufferBlendFunc[i] != null) {
+                sb.append(java.util.Arrays.toString(bufferBlendFunc[i]));
+            }
+        }
+        return sb == null ? "" : sb.toString();
     }
 
     /** Loads a renderpearl color target state into the emulated blend state (what GL's pipeline bind does before Iris' setup). */
     static void applyColorTargetState(final com.mojang.renderpearl.api.pipeline.@Nullable ColorTargetState target) {
+        resetBufferBlend();
         if (target == null) {
             blend = false;
             colorMask = 15;
@@ -1209,6 +1290,38 @@ public final class MetalGL {
         }
     }
 
+    /** Metal sampler state GL texture unit {@code unit} would sample with (0 if nothing is bound). */
+    static long unitSamplerHandle(final int unit) {
+        if (unit < 0 || unit >= MAX_UNITS) {
+            return 0L;
+        }
+        GlTextureObject tex = TEXTURES.get(boundTextures[unit]);
+        if (tex == null || tex.sampleView == null) {
+            return 0L;
+        }
+        GlSamplerObject samplerObject = SAMPLERS.get(boundSamplers[unit]);
+        return samplerObject != null ? samplerObject.handle(device(), tex) : tex.sampler(device());
+    }
+
+    /** Sampler handles of a program's combined samplers from the GL units (override = handle by sampler index, if non-zero). */
+    static boolean planUnitSamplers(final GlProgramObject program, final long @Nullable [] override) {
+        if (!program.sharesSamplers() || program.compiled == null) {
+            return true;
+        }
+        long[] handles = new long[program.compiled.samplers().size()];
+        for (GlProgramObject.Slot slot : program.slots) {
+            if (slot.sampler && slot.samplerIndex >= 0 && slot.samplerIndex < handles.length) {
+                long o = override != null && slot.samplerIndex < override.length ? override[slot.samplerIndex] : 0L;
+                handles[slot.samplerIndex] = o != 0L ? o : unitSamplerHandle(slot.unit);
+            }
+        }
+        boolean ok = program.planSamplers(handles);
+        if (!ok) {
+            LOGGER.error("{}: more than 16 distinct sampler states in one draw; skipped", program.debugName);
+        }
+        return ok;
+    }
+
     /** Textures/samplers bound to GL texture units, except units in {@code skipUnits} (bit mask). */
     static void bindUnitSamplers(final GlProgramObject program, final long skipUnits) {
         MetalDevice device = device();
@@ -1224,7 +1337,7 @@ public final class MetalGL {
             GlSamplerObject samplerObject = SAMPLERS.get(boundSamplers[slot.unit]);
             long sampler = samplerObject != null ? samplerObject.handle(device, tex) : tex.sampler(device);
             Native.passSetTexture(ctx, 3, tex.sampleView.handle(), slot.samplerIndex);
-            Native.passSetSampler(ctx, 3, sampler, slot.samplerIndex);
+            Native.passSetSampler(ctx, 3, sampler, program.samplerSlot(slot.samplerIndex));
         }
     }
 
@@ -1247,7 +1360,7 @@ public final class MetalGL {
         }
         key.append(hasDepth).append(blend).append(blendSrcRgb).append(':').append(blendDstRgb).append(':').append(blendSrcAlpha).append(':')
             .append(blendDstAlpha).append(':').append(blendEquationRgb).append(':').append(blendEquationAlpha).append(colorMask)
-            .append(depthTest).append(depthMask).append(depthFunc);
+            .append(depthTest).append(depthMask).append(depthFunc).append(bufferBlendKey()).append(program.samplerKey);
         String k = key.toString();
         long cached = program.pipelines.getOrDefault(k, 0L);
         if (cached != 0L) {
@@ -1259,7 +1372,7 @@ public final class MetalGL {
     }
 
     private static long createPipeline(final GlProgramObject program, final GpuFormat[] formats, final int count, final boolean hasDepth) {
-        GlProgramCompiler.Result compiled = program.compiled;
+        GlProgramCompiler.Result compiled = program.active != null ? program.active : program.compiled;
         if (compiled == null) {
             return 0L;
         }
@@ -1438,6 +1551,8 @@ public final class MetalGL {
         int prevSampler = boundSamplers[0];
         int[] prevViewport = viewport.clone();
         boolean prevBlend = blend;
+        int[] prevBufferBlend = bufferBlend.clone();
+        int[][] prevBufferBlendFunc = bufferBlendFunc.clone();
         boolean prevDepthTest = depthTest;
         boolean prevScissor = scissorTest;
         int prevColorMask = colorMask;
@@ -1452,6 +1567,7 @@ public final class MetalGL {
             boundTextures[0] = src;
             boundSamplers[0] = 0;
             blend = false;
+            resetBufferBlend();
             depthTest = false;
             scissorTest = false;
             colorMask = 15;
@@ -1468,6 +1584,8 @@ public final class MetalGL {
             boundSamplers[0] = prevSampler;
             System.arraycopy(prevViewport, 0, viewport, 0, 4);
             blend = prevBlend;
+            System.arraycopy(prevBufferBlend, 0, bufferBlend, 0, bufferBlend.length);
+            System.arraycopy(prevBufferBlendFunc, 0, bufferBlendFunc, 0, bufferBlendFunc.length);
             depthTest = prevDepthTest;
             scissorTest = prevScissor;
             colorMask = prevColorMask;
@@ -1480,7 +1598,8 @@ public final class MetalGL {
 
     public static int glGetInteger(final int pname) {
         return switch (pname) {
-            case GL_MAX_TEXTURE_IMAGE_UNITS -> 16;
+            // Metal allows far more textures per stage (sampler states are limited to 16, see GlProgramObject.planSamplers).
+            case GL_MAX_TEXTURE_IMAGE_UNITS -> MAX_UNITS;
             case GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS, GL_MAX_VERTEX_TEXTURE_IMAGE_UNITS -> MAX_UNITS;
             case GL_MAX_DRAW_BUFFERS, GL_MAX_COLOR_ATTACHMENTS -> MAX_DRAW_BUFFERS;
             case GL_MAX_TEXTURE_SIZE, GL_MAX_RENDERBUFFER_SIZE -> 16384;
@@ -1906,6 +2025,9 @@ public final class MetalGL {
         if (passOpen("glDispatchCompute")) {
             return;
         }
+        if (!planUnitSamplers(p, null)) {
+            return;
+        }
         long pso = computePipeline(p);
         if (pso == 0L) {
             return;
@@ -1934,7 +2056,7 @@ public final class MetalGL {
             GlSamplerObject samplerObject = SAMPLERS.get(boundSamplers[slot.unit]);
             long sampler = samplerObject != null ? samplerObject.handle(device, tex) : tex.sampler(device);
             Native.computeSetTexture(ctx, tex.sampleView.handle(), slot.samplerIndex);
-            Native.computeSetSampler(ctx, sampler, slot.samplerIndex);
+            Native.computeSetSampler(ctx, sampler, p.samplerSlot(slot.samplerIndex));
         }
         bindStorage(p, true);
         int[] local = p.compiled.vertex().localSize;
@@ -1946,10 +2068,25 @@ public final class MetalGL {
     }
 
     private static long computePipeline(final GlProgramObject p) {
+        if (!p.samplerKey.isEmpty()) {
+            long cached = p.computeVariants.getOrDefault(p.samplerKey, 0L);
+            if (cached != 0L) {
+                return cached == -1L ? 0L : cached;
+            }
+            long created = createComputePipeline(p);
+            p.computeVariants.put(p.samplerKey, created != 0L ? created : -1L);
+            return created;
+        }
         if (p.computePipeline != 0L) {
             return p.computePipeline == -1L ? 0L : p.computePipeline;
         }
-        GlProgramCompiler.StageResult cs = p.compiled.vertex();
+        long created = createComputePipeline(p);
+        p.computePipeline = created != 0L ? created : -1L;
+        return created;
+    }
+
+    private static long createComputePipeline(final GlProgramObject p) {
+        GlProgramCompiler.StageResult cs = (p.active != null ? p.active : p.compiled).vertex();
         String name = p.debugName != null ? p.debugName : "compute" + p.id;
         try (MemoryStack stack = MemoryStack.stackPush()) {
             ByteBuffer err = stack.calloc(2048);
@@ -1962,7 +2099,6 @@ public final class MetalGL {
                     if (Boolean.getBoolean("minemetal.dumpShaders")) {
                         LOGGER.error("--- {} compute ---\n{}", name, cs.msl);
                     }
-                    p.computePipeline = -1L;
                     return 0L;
                 }
                 p.computeMaxThreads = Native.computeMaxThreads(pso);
@@ -1970,10 +2106,8 @@ public final class MetalGL {
                 if (threads > p.computeMaxThreads) {
                     LOGGER.error("Compute program {}: work group of {} threads exceeds Metal's limit of {} for it", name, threads, p.computeMaxThreads);
                     device().encoder().queueForDestroy(() -> Native.release(pso));
-                    p.computePipeline = -1L;
                     return 0L;
                 }
-                p.computePipeline = pso;
                 return pso;
             } finally {
                 MemoryUtil.memFree(src);
