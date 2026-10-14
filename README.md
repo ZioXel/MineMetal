@@ -53,11 +53,17 @@ to the window before the GUI is drawn, so menus, chat and the hotbar stay sharp:
 
 | Setting | Values |
 |---|---|
-| Upscaler | Off (default), MetalFX (Apple's spatial scaler), AMD FSR 1 (EASU + RCAS), Bilinear |
+| Upscaler | Off (default), MetalFX Temporal, MetalFX Spatial, AMD FSR 1 (EASU + RCAS), Bilinear |
 | Render Scale | 50–100 % per axis (75 % ≈ 56 % of the pixels) |
 | Upscale Sharpness | 0–100 % AMD RCAS sharpening after FSR 1 or MetalFX |
 
-The settings are stored in `config/minemetal.properties`; `-Dminemetal.upscale=metalfx|fsr1|bilinear|off` and
+**MetalFX Temporal** jitters the camera by a sub-pixel amount every frame and builds motion vectors from the scene
+depth and the camera movement, so it upscales *and* anti-aliases (also usable at 100 % as pure anti-aliasing). Turn the
+shader pack's own TAA off (Complementary: Temporal Filtering and Temporal Jitter OFF). Moving mobs and particles only get
+camera motion. Debug options: `-Dminemetal.taa.depth=reversed|standard|auto`, `-Dminemetal.taa.jitterSign=±1`,
+`-Dminemetal.taa.motionSign=±1`.
+
+The settings are stored in `config/minemetal.properties`; `-Dminemetal.upscale=metalfx_temporal|metalfx|fsr1|bilinear|off` and
 `-Dminemetal.renderScale=67` override them. Works with vanilla and Iris shader packs (packs simply see a smaller
 screen). Sodium replaces Video Settings with its own screen; use the config file there. FSR 1 is © AMD, MIT licensed
 (`tools/fsr/`).

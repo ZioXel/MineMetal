@@ -54,6 +54,11 @@ public final class MetalUpscaler {
     private static boolean standardDepthThisFrame;
     /** Sign conventions for MetalFX (flip with -Dminemetal.taa.jitterSign=1 / -Dminemetal.taa.motionSign=-1 if the image wobbles or ghosts). */
     private static final float JITTER_SIGN = Float.parseFloat(System.getProperty("minemetal.taa.jitterSign", "-1"));
+    /**
+     * Depth convention of the captured depth: reversed (default; Minecraft's reversed Z, which shader packs on MineMetal also
+     * end up with), standard, or auto (shader pack = standard). Tested: reversed is correct with Complementary on Iris.
+     */
+    private static final String DEPTH_MODE = System.getProperty("minemetal.taa.depth", "reversed");
     private static final float MOTION_SIGN = Float.parseFloat(System.getProperty("minemetal.taa.motionSign", "1"));
 
     private MetalUpscaler() {
@@ -190,7 +195,11 @@ public final class MetalUpscaler {
             if (mode.temporal() && camera.initialized) {
                 TEMPORAL.jitter(camera.projectionMatrix, w, h);
                 temporalThisFrame = true;
-                standardDepthThisFrame = IrisCheck.shaderPackInUse();
+                standardDepthThisFrame = switch (DEPTH_MODE) {
+                    case "standard" -> true;
+                    case "reversed" -> false;
+                    default -> IrisCheck.shaderPackInUse();
+                };
             }
             return scaled;
         } catch (RuntimeException e) {
