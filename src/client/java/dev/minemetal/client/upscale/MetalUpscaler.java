@@ -61,6 +61,8 @@ public final class MetalUpscaler {
     private static final String DEPTH_MODE = System.getProperty("minemetal.taa.depth", "reversed");
     /** How much MetalFX should trust the current frame on sky pixels (shader-pack clouds have no depth): 0..1, 0 = off. */
     private static final float SKY_REACTIVE = Float.parseFloat(System.getProperty("minemetal.taa.skyReactive", "0.7"));
+    /** Which view matrix the motion vectors use: level (as LevelRenderer.render receives it), extract (no bobbing), late. */
+    private static final String VIEW_MODE = System.getProperty("minemetal.taa.view", "extract");
     private static final float MOTION_SIGN = Float.parseFloat(System.getProperty("minemetal.taa.motionSign", "1"));
 
     private MetalUpscaler() {
@@ -196,6 +198,9 @@ public final class MetalUpscaler {
             RenderSystem.getDevice().createCommandEncoder().clearColorAndDepthTextures(color, new Vector4f(0.0F, 0.0F, 0.0F, 1.0F), depth, 0.0);
             if (mode.temporal() && camera.initialized) {
                 TEMPORAL.jitter(camera.projectionMatrix, w, h);
+                if (VIEW_MODE.equals("extract")) {
+                    TEMPORAL.captureView(camera.viewRotationMatrix);  // as extracted, before anything adds view bobbing
+                }
                 temporalThisFrame = true;
                 standardDepthThisFrame = switch (DEPTH_MODE) {
                     case "standard" -> true;
@@ -220,7 +225,7 @@ public final class MetalUpscaler {
 
     /** The view matrix the level renders with (includes view bobbing when Iris moved it there). */
     public static void captureView(final Matrix4fc view) {
-        if (temporalThisFrame) {
+        if (temporalThisFrame && VIEW_MODE.equals("level")) {
             TEMPORAL.captureView(view);
         }
     }

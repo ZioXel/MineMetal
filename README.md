@@ -60,8 +60,9 @@ to the window before the GUI is drawn, so menus, chat and the hotbar stay sharp:
 **MetalFX Temporal** jitters the camera by a sub-pixel amount every frame and builds motion vectors from the scene
 depth and the camera movement, so it upscales *and* anti-aliases (also usable at 100 % as pure anti-aliasing). Turn the
 shader pack's own TAA off (Complementary: Temporal Filtering and Temporal Jitter OFF). Moving mobs and particles only get
-camera motion. Debug options: `-Dminemetal.taa.depth=reversed|standard|auto`, `-Dminemetal.taa.jitterSign=±1`,
-`-Dminemetal.taa.motionSign=±1`.
+camera motion, and view bobbing still makes the terrain wobble slightly with Temporal (turn View Bobbing off for the
+cleanest image). Debug options: `-Dminemetal.taa.depth=reversed|standard|auto`, `-Dminemetal.taa.jitterSign=±1`,
+`-Dminemetal.taa.motionSign=±1`, `-Dminemetal.taa.view=extract|level|late`, `-Dminemetal.taa.skyReactive=0..1`.
 
 The settings are stored in `config/minemetal.properties`; `-Dminemetal.upscale=metalfx_temporal|metalfx|fsr1|bilinear|off` and
 `-Dminemetal.renderScale=67` override them. Works with vanilla and Iris shader packs (packs simply see a smaller
