@@ -10,6 +10,9 @@ import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.ModifyArg;
+import net.minecraft.client.renderer.state.level.CameraRenderState;
+import org.joml.Matrix4f;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /**
@@ -25,12 +28,38 @@ public abstract class GameRendererUpscaleMixin {
 
     @Inject(method = "render", at = @At(value = "INVOKE", target = "Lnet/minecraft/client/renderer/GameRenderer;renderLevel()V"))
     private void minemetal$beginLowRes(final CallbackInfo ci) {
-        RenderTarget low = MetalUpscaler.beginWorld(this.mainRenderTarget);
+        RenderTarget low = MetalUpscaler.beginWorld(this.mainRenderTarget, this.minemetal$camera());
         if (low != null) {
             this.minemetal$fullTarget = this.mainRenderTarget;
             this.minemetal$lowTarget = low;
             this.mainRenderTarget = low;
         }
+    }
+
+    @Inject(method = "render", at = @At(value = "INVOKE", target = "Lnet/minecraft/client/renderer/GameRenderer;renderLevel()V", shift = At.Shift.AFTER))
+    private void minemetal$afterLevel(final CallbackInfo ci) {
+        MetalUpscaler.afterLevel(this.minemetal$camera());
+    }
+
+    /** Records the (jittered, view-bobbed) projection the level renders with; MetalFX Temporal needs it unjittered. */
+    @ModifyArg(method = "renderLevel", at = @At(value = "INVOKE",
+        target = "Lnet/minecraft/client/renderer/ProjectionMatrixBuffer;getBuffer(Lorg/joml/Matrix4f;)Lcom/mojang/renderpearl/api/buffers/GpuBufferSlice;"))
+    private Matrix4f minemetal$captureProjection(final Matrix4f projection) {
+        MetalUpscaler.captureProjection(projection);
+        return projection;
+    }
+
+    /** Scene depth for MetalFX Temporal, copied before the hand pass clears or overwrites it. */
+    @Inject(method = "renderLevel", at = @At(value = "INVOKE", target = "Lnet/minecraft/client/renderer/GameRenderer;render3dHud(Lnet/minecraft/client/renderer/state/level/CameraRenderState;Lnet/minecraft/client/renderer/state/level/PlayerRenderState;Lnet/minecraft/client/renderer/state/OptionsRenderState;Z)V"))
+    private void minemetal$captureDepth(final CallbackInfo ci) {
+        if (this.minemetal$lowTarget != null) {
+            MetalUpscaler.captureDepth(this.minemetal$lowTarget);
+        }
+    }
+
+    @Unique
+    private CameraRenderState minemetal$camera() {
+        return ((GameRenderer) (Object) this).gameRenderState().levelRenderState.cameraRenderState;
     }
 
     @Inject(method = "render", at = @At(value = "INVOKE", target = "Lnet/minecraft/client/renderer/GameRenderer;applyPostEffects()V", shift = At.Shift.AFTER))
@@ -55,7 +84,7 @@ public abstract class GameRendererUpscaleMixin {
         this.minemetal$fullTarget = null;
         this.minemetal$lowTarget = null;
         if (upscale) {
-            MetalUpscaler.finishWorld(low, full);
+            MetalUpscaler.finishWorld(low, full, this.minemetal$camera());
         }
     }
 }

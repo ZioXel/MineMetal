@@ -10,6 +10,9 @@ import dev.minemetal.client.metal.MetalProfiler;
 import dev.minemetal.client.metal.MetalTexture;
 import dev.minemetal.client.metal.Native;
 import net.fabricmc.loader.api.FabricLoader;
+import net.minecraft.client.renderer.state.level.CameraRenderState;
+import org.joml.Matrix4fc;
+import org.lwjgl.system.MemoryStack;
 import org.jspecify.annotations.Nullable;
 import org.joml.Vector4f;
 import org.slf4j.Logger;
@@ -45,6 +48,14 @@ public final class MetalUpscaler {
     private static @Nullable TextureTarget scaled;
     private static UpscaleMode lastUsed = UpscaleMode.OFF;
 
+    private static final TemporalState TEMPORAL = new TemporalState();
+    private static boolean temporalThisFrame;
+    private static boolean depthCaptured;
+    private static boolean standardDepthThisFrame;
+    /** Sign conventions for MetalFX (flip with -Dminemetal.taa.jitterSign=1 / -Dminemetal.taa.motionSign=-1 if the image wobbles or ghosts). */
+    private static final float JITTER_SIGN = Float.parseFloat(System.getProperty("minemetal.taa.jitterSign", "-1"));
+    private static final float MOTION_SIGN = Float.parseFloat(System.getProperty("minemetal.taa.motionSign", "1"));
+
     private MetalUpscaler() {
     }
 
@@ -68,6 +79,7 @@ public final class MetalUpscaler {
     public static void setMode(final UpscaleMode m) {
         load();
         mode = m;
+        TEMPORAL.invalidate();
         save();
     }
 
@@ -131,7 +143,7 @@ public final class MetalUpscaler {
         try {
             Files.createDirectories(f.getParent());
             try (Writer w = Files.newBufferedWriter(f)) {
-                p.store(w, "MineMetal settings (upscale: off, metalfx, fsr1, bilinear; renderScale: 50-100 %; sharpness: 0-100 %)");
+                p.store(w, "MineMetal settings (upscale: off, metalfx_temporal, metalfx, fsr1, bilinear; renderScale: 50-100 %; sharpness: 0-100 %)");
             }
         } catch (IOException e) {
             LOGGER.warn("[MineMetal] could not write {}: {}", f, e.toString());
@@ -143,14 +155,16 @@ public final class MetalUpscaler {
     /** True when the world should be rendered at a reduced resolution this frame. */
     public static boolean active() {
         load();
-        return mode != UpscaleMode.OFF && scalePercent < MAX_SCALE && MetalDevice.current() != null;
+        return mode != UpscaleMode.OFF && (scalePercent < MAX_SCALE || mode.temporal()) && MetalDevice.current() != null;
     }
 
     /**
      * Called right before the world renders. Returns the reduced-size target that should stand in for the main target
      * until {@link #finishWorld}, or null to render at full resolution.
      */
-    public static @Nullable RenderTarget beginWorld(final RenderTarget main) {
+    public static @Nullable RenderTarget beginWorld(final RenderTarget main, final CameraRenderState camera) {
+        temporalThisFrame = false;
+        depthCaptured = false;
         if (!active()) {
             lastUsed = UpscaleMode.OFF;
             releaseIfIdle();
@@ -158,7 +172,7 @@ public final class MetalUpscaler {
         }
         int w = Math.max(1, Math.round(main.width * scalePercent / 100.0F));
         int h = Math.max(1, Math.round(main.height * scalePercent / 100.0F));
-        if (w >= main.width && h >= main.height) {
+        if (w >= main.width && h >= main.height && !mode.temporal()) {
             return null;
         }
         try {
@@ -173,6 +187,11 @@ public final class MetalUpscaler {
                 return null;
             }
             RenderSystem.getDevice().createCommandEncoder().clearColorAndDepthTextures(color, new Vector4f(0.0F, 0.0F, 0.0F, 1.0F), depth, 0.0);
+            if (mode.temporal() && camera.initialized) {
+                TEMPORAL.jitter(camera.projectionMatrix, w, h);
+                temporalThisFrame = true;
+                standardDepthThisFrame = IrisCheck.shaderPackInUse();
+            }
             return scaled;
         } catch (RuntimeException e) {
             LOGGER.error("[MineMetal] upscaling disabled: could not create the scaled render target", e);
@@ -181,8 +200,32 @@ public final class MetalUpscaler {
         }
     }
 
+    /** The projection renderLevel actually used (jittered, with view bobbing). */
+    public static void captureProjection(final Matrix4fc projection) {
+        if (temporalThisFrame) {
+            TEMPORAL.capture(projection);
+        }
+    }
+
+    /** Copies the world depth before the hand clears/overwrites it (MetalFX Temporal needs scene depth). */
+    public static void captureDepth(final RenderTarget low) {
+        MetalDevice device = MetalDevice.current();
+        if (!temporalThisFrame || device == null || !(low.getDepthTexture() instanceof MetalTexture depth)) {
+            return;
+        }
+        Native.upscaleCaptureDepth(device.ctx(), depth.handle());
+        depthCaptured = true;
+    }
+
+    /** Puts the unjittered projection back once the world has rendered. */
+    public static void afterLevel(final CameraRenderState camera) {
+        if (temporalThisFrame) {
+            TEMPORAL.restore(camera.projectionMatrix);
+        }
+    }
+
     /** Scales the low-resolution world image up into the real main target. */
-    public static void finishWorld(final RenderTarget low, final RenderTarget main) {
+    public static void finishWorld(final RenderTarget low, final RenderTarget main, final CameraRenderState camera) {
         MetalDevice device = MetalDevice.current();
         GpuTexture src = low.getColorTexture();
         GpuTexture dst = main.getColorTexture();
@@ -190,14 +233,55 @@ public final class MetalUpscaler {
             return;
         }
         MetalProfiler.phase("upscale");
-        int used = Native.upscale(device.ctx(), s.handle(), d.handle(), mode.nativeId, sharpnessPercent / 100.0F);
+        int used = -1;
+        if (temporalThisFrame && depthCaptured
+                && TEMPORAL.prepare(camera.viewRotationMatrix, camera.pos.x, camera.pos.y, camera.pos.z, standardDepthThisFrame, MOTION_SIGN)) {
+            TEMPORAL.params[36] *= JITTER_SIGN;
+            TEMPORAL.params[37] *= JITTER_SIGN;
+            try (MemoryStack stack = MemoryStack.stackPush()) {
+                java.nio.FloatBuffer buf = stack.floats(TEMPORAL.params);
+                used = Native.upscaleTemporal(device.ctx(), s.handle(), d.handle(), org.lwjgl.system.MemoryUtil.memAddress(buf),
+                    TEMPORAL.resetRequested ? 1 : 0, sharpnessPercent / 100.0F);
+            }
+            TEMPORAL.resetRequested = false;
+        }
+        if (used < 0) {
+            used = Native.upscale(device.ctx(), s.handle(), d.handle(), mode.temporal() ? UpscaleMode.METALFX.nativeId : mode.nativeId,
+                sharpnessPercent / 100.0F);
+        }
         lastUsed = switch (used) {
+            case 4 -> UpscaleMode.METALFX_TEMPORAL;
             case 3 -> UpscaleMode.METALFX;
             case 2 -> UpscaleMode.FSR1;
             case 1 -> UpscaleMode.BILINEAR;
             default -> UpscaleMode.OFF;
         };
         MetalProfiler.phase("gui");
+    }
+
+    /** Iris API lookup without a compile-time dependency (shader packs write standard depth, vanilla reversed Z). */
+    private static final class IrisCheck {
+        private static java.lang.reflect.Method inUse;
+        private static Object api;
+        private static boolean looked;
+
+        static boolean shaderPackInUse() {
+            if (!looked) {
+                looked = true;
+                try {
+                    Class<?> c = Class.forName("net.irisshaders.iris.api.v0.IrisApi");
+                    api = c.getMethod("getInstance").invoke(null);
+                    inUse = c.getMethod("isShaderPackInUse");
+                } catch (ReflectiveOperationException | LinkageError e) {
+                    api = null;
+                }
+            }
+            try {
+                return api != null && (Boolean) inUse.invoke(api);
+            } catch (ReflectiveOperationException e) {
+                return false;
+            }
+        }
     }
 
     private static void releaseIfIdle() {

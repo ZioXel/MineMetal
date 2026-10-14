@@ -1954,6 +1954,20 @@ static NSString *const kMMUpscaleCommonMSL =
      "    return o;\n"
      "}\n"
      "struct MMUpConsts { float4 sizes; float4 extra; };\n"
+     "struct MMMotionConsts { float4x4 invCur; float4x4 prevVP; float4 camDelta; float4 jitter; float4 misc; };\n"
+     "fragment float2 mm_motion(float4 pos [[position]], depth2d<float> depth [[texture(0)]], constant MMMotionConsts &c [[buffer(0)]]) {\n"
+     "    float2 size = float2(depth.get_width(), depth.get_height());\n"
+     "    float z = depth.read(uint2(pos.xy));\n"
+     "    if (c.misc.x > 0.5) z = 1.0 - z;  // shader packs: standard depth -> Minecraft's reversed Z\n"
+     "    float2 uv = pos.xy / size;\n"
+     "    float4 p = c.invCur * float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, z, 1.0);\n"
+     "    p /= p.w;\n"
+     "    float4 q = c.prevVP * float4(p.xyz + c.camDelta.xyz, 1.0);\n"
+     "    if (q.w <= 1e-6) return float2(0.0);\n"
+     "    float2 pn = q.xy / q.w;\n"
+     "    float2 prevUv = float2(pn.x * 0.5 + 0.5, 0.5 - pn.y * 0.5);\n"
+     "    return (prevUv - uv) * c.misc.y;\n"
+     "}\n"
      "fragment float4 mm_fs_bilinear(float4 pos [[position]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]],\n"
      "                               constant MMUpConsts &c [[buffer(0)]]) {\n"
      "    return float4(t.sample(s, pos.xy / c.sizes.zw).rgb, 1.0);\n"
@@ -2096,5 +2110,141 @@ MM_EXPORT int mm_upscale(void *p, void *srcPtr, void *dstPtr, int mode, float sh
             }
         }
         return mm_up_draw(ctx, 0, src, dst, 0.0f) ? 1 : -1;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// MetalFX Temporal: jittered low-resolution color + scene depth + camera motion vectors -> anti-aliased, upscaled image.
+// ---------------------------------------------------------------------------------------------------------------------
+
+static id<MTLTexture> g_taDepth, g_taMotion;
+static id<MTLFXTemporalScaler> g_taFx;
+static id<MTLRenderPipelineState> g_taMotionPso;
+static BOOL g_taUnsupported;
+
+/** Copies the world depth (before the hand pass) for the temporal upscaler. */
+MM_EXPORT void mm_upscale_capture_depth(void *p, void *depthPtr) {
+    @autoreleasepool {
+        MMContext *ctx = CTX(p);
+        id<MTLTexture> d = (__bridge id<MTLTexture>)depthPtr;
+        if (d == nil) return;
+        mm_end_encoders(ctx);
+        if (g_taDepth == nil || g_taDepth.width != d.width || g_taDepth.height != d.height || g_taDepth.pixelFormat != d.pixelFormat) {
+            MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:d.pixelFormat width:d.width height:d.height mipmapped:NO];
+            td.usage = MTLTextureUsageShaderRead;
+            td.storageMode = MTLStorageModePrivate;
+            g_taDepth = [ctx.device newTextureWithDescriptor:td];
+            g_taDepth.label = @"MineMetal temporal depth";
+        }
+        [mm_blit(ctx) copyFromTexture:d sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+                           sourceSize:MTLSizeMake(d.width, d.height, 1) toTexture:g_taDepth destinationSlice:0
+                     destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+        mm_end_encoders(ctx);
+    }
+}
+
+/**
+ * params (44 floats): invCur[16], prevVP[16], camDelta[4], jitterX, jitterY, standardDepth, motionSign, (4 unused).
+ * Returns 4 on success, -1 if MetalFX Temporal can't run this frame (the caller falls back to the spatial scaler).
+ */
+MM_EXPORT int mm_upscale_temporal(void *p, void *colorPtr, void *dstPtr, const float *params, int reset, float sharpness) {
+    @autoreleasepool {
+        MMContext *ctx = CTX(p);
+        id<MTLTexture> color = (__bridge id<MTLTexture>)colorPtr;
+        id<MTLTexture> dst = (__bridge id<MTLTexture>)dstPtr;
+        if (g_taUnsupported || color == nil || dst == nil || params == NULL || g_taDepth == nil
+                || g_taDepth.width != color.width || g_taDepth.height != color.height) return -1;
+        mm_end_encoders(ctx);
+        NSUInteger w = color.width, h = color.height;
+
+        // 1. Motion vectors (camera reprojection of the scene depth).
+        if (g_taMotion == nil || g_taMotion.width != w || g_taMotion.height != h) {
+            MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRG16Float width:w height:h mipmapped:NO];
+            td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+            td.storageMode = MTLStorageModePrivate;
+            g_taMotion = [ctx.device newTextureWithDescriptor:td];
+            g_taMotion.label = @"MineMetal motion vectors";
+        }
+        if (g_taMotionPso == nil) {
+            if (g_upCommonLib == nil) g_upCommonLib = mm_up_library(ctx, kMMUpscaleCommonMSL.UTF8String);
+            if (g_upCommonLib == nil) { g_taUnsupported = YES; return -1; }
+            MTLRenderPipelineDescriptor *d = [[MTLRenderPipelineDescriptor alloc] init];
+            d.label = @"MineMetal motion vectors";
+            d.vertexFunction = [g_upCommonLib newFunctionWithName:@"mm_fs_vs"];
+            d.fragmentFunction = [g_upCommonLib newFunctionWithName:@"mm_motion"];
+            d.colorAttachments[0].pixelFormat = MTLPixelFormatRG16Float;
+            NSError *err = nil;
+            g_taMotionPso = [ctx.device newRenderPipelineStateWithDescriptor:d error:&err];
+            if (g_taMotionPso == nil) { NSLog(@"[MineMetal] motion vector pipeline failed: %@", err); g_taUnsupported = YES; return -1; }
+        }
+        float consts[48];
+        memcpy(consts, params, 36 * sizeof(float));                 // invCur, prevVP, camDelta
+        consts[36] = params[36]; consts[37] = params[37]; consts[38] = 0; consts[39] = 0;  // jitter
+        consts[40] = params[38]; consts[41] = params[39]; consts[42] = 0; consts[43] = 0;  // misc
+        {
+            MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+            rp.colorAttachments[0].texture = g_taMotion;
+            rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+            rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+            id<MTLRenderCommandEncoder> enc = mm_render_encoder(ctx, rp);
+            enc.label = @"MineMetal motion vectors";
+            [enc setRenderPipelineState:g_taMotionPso];
+            [enc setFragmentTexture:g_taDepth atIndex:0];
+            [enc setFragmentBytes:consts length:44 * sizeof(float) atIndex:0];
+            [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+            [enc endEncoding];
+        }
+
+        // 2. The temporal scaler (recreated when sizes or formats change).
+        BOOL fresh = NO;
+        if (g_taFx == nil || g_taFx.inputWidth != w || g_taFx.inputHeight != h || g_taFx.outputWidth != dst.width
+                || g_taFx.outputHeight != dst.height || g_taFx.colorTextureFormat != color.pixelFormat
+                || g_taFx.depthTextureFormat != g_taDepth.pixelFormat || g_taFx.outputTextureFormat != dst.pixelFormat) {
+            g_taFx = nil;
+            if (![MTLFXTemporalScalerDescriptor supportsDevice:ctx.device]) {
+                NSLog(@"[MineMetal] MetalFX Temporal is not supported on this GPU; using MetalFX Spatial");
+                g_taUnsupported = YES;
+                return -1;
+            }
+            MTLFXTemporalScalerDescriptor *d = [[MTLFXTemporalScalerDescriptor alloc] init];
+            d.colorTextureFormat = color.pixelFormat;
+            d.depthTextureFormat = g_taDepth.pixelFormat;
+            d.motionTextureFormat = MTLPixelFormatRG16Float;
+            d.outputTextureFormat = dst.pixelFormat;
+            d.inputWidth = w;
+            d.inputHeight = h;
+            d.outputWidth = dst.width;
+            d.outputHeight = dst.height;
+            d.autoExposureEnabled = NO;
+            g_taFx = [d newTemporalScalerWithDevice:ctx.device];
+            if (g_taFx == nil) {
+                NSLog(@"[MineMetal] MetalFX Temporal scaler creation failed (%lux%lu -> %lux%lu); using MetalFX Spatial",
+                      (unsigned long)w, (unsigned long)h, (unsigned long)dst.width, (unsigned long)dst.height);
+                g_taUnsupported = YES;
+                return -1;
+            }
+            g_taFx.motionVectorScaleX = (float)w;
+            g_taFx.motionVectorScaleY = (float)h;
+            fresh = YES;
+        }
+        id<MTLTexture> out = mm_up_tmp(ctx, dst.width, dst.height, dst.pixelFormat, g_taFx.outputTextureUsage | MTLTextureUsageShaderRead);
+        g_taFx.colorTexture = color;
+        g_taFx.depthTexture = g_taDepth;
+        g_taFx.motionTexture = g_taMotion;
+        g_taFx.outputTexture = out;
+        g_taFx.inputContentWidth = w;
+        g_taFx.inputContentHeight = h;
+        g_taFx.jitterOffsetX = params[36];
+        g_taFx.jitterOffsetY = params[37];
+        g_taFx.depthReversed = params[38] < 0.5f;
+        g_taFx.reset = (reset != 0) || fresh;
+        mm_prof_maybe_split(ctx);
+        [g_taFx encodeToCommandBuffer:mm_cmd(ctx)];
+
+        // 3. Optional RCAS sharpening into the main target, else a straight copy.
+        if (sharpness > 0.001f && mm_up_draw(ctx, 2, out, dst, (1.0f - fminf(sharpness, 1.0f)) * 2.0f)) return 4;
+        [mm_blit(ctx) copyFromTexture:out toTexture:dst];
+        mm_end_encoders(ctx);
+        return 4;
     }
 }
