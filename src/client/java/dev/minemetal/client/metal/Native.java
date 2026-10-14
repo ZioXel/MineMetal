@@ -80,7 +80,7 @@ public final class Native {
         PASS_SET_BYTES, PASS_SET_TEXTURE, PASS_SET_SAMPLER, PASS_SET_TEXEL_BUFFER, PASS_SET_INDEX_BUFFER, PASS_DRAW, PASS_DRAW_INDEXED,
         PASS_MULTI_DRAW, PASS_MULTI_DRAW_INDEXED, PASS_DRAW_INDIRECT, PASS_DRAW_INDEXED_INDIRECT, PIPELINE_CREATE, SURFACE_CREATE,
         SURFACE_CONFIGURE, SURFACE_ACQUIRE, SURFACE_BLIT, SURFACE_DROP, SET_FAST_MATH, SET_COALESCE, SET_NEXT_PASS_DONT_CARE, SET_GPU_DEBUG, SET_DEPTH_FLIP, PROF_ENABLE, PROF_SET_TAG, PROF_READ, SURFACE_STATS, PASS_SET_VIEWPORT, GENERATE_MIPMAPS, SAMPLER_CREATE_EX,
-        COMPUTE_PIPELINE_CREATE, COMPUTE_MAX_THREADS, COMPUTE_SET_PIPELINE, COMPUTE_SET_BUFFER, COMPUTE_SET_BYTES, COMPUTE_SET_TEXTURE, COMPUTE_SET_SAMPLER, COMPUTE_DISPATCH, COMPUTE_DISPATCH_INDIRECT, MEMORY_BARRIER, PASS_MARK_STORAGE, FILL_BUFFER, TEXTURE_ZERO, COPY_TEXTURE_ALL;
+        COMPUTE_PIPELINE_CREATE, COMPUTE_MAX_THREADS, COMPUTE_SET_PIPELINE, COMPUTE_SET_BUFFER, COMPUTE_SET_BYTES, COMPUTE_SET_TEXTURE, COMPUTE_SET_SAMPLER, COMPUTE_DISPATCH, COMPUTE_DISPATCH_INDIRECT, MEMORY_BARRIER, PASS_MARK_STORAGE, FILL_BUFFER, TEXTURE_ZERO, COPY_TEXTURE_ALL, UPSCALE;
 
     private static void bind() {
         ENUM = h("mm_enum", f(JAVA_LONG, P, P));
@@ -161,6 +161,7 @@ public final class Native {
         FILL_BUFFER = h("mm_fill_buffer", v(P, P, JAVA_LONG, JAVA_LONG, JAVA_INT));
         TEXTURE_ZERO = h("mm_texture_zero", v(P, P, JAVA_INT, JAVA_INT));
         COPY_TEXTURE_ALL = h("mm_copy_texture_all", v(P, P, P));
+        UPSCALE = h("mm_upscale", f(JAVA_INT, P, P, P, JAVA_INT, JAVA_FLOAT));
         SAMPLER_CREATE_EX = h("mm_sampler_create_ex",
             f(P, P, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_FLOAT, JAVA_FLOAT, JAVA_LONG));
     }
@@ -529,6 +530,11 @@ public final class Native {
 
     public static void copyTextureAll(long ctx, long src, long dst) {
         try { COPY_TEXTURE_ALL.invokeExact(ctx, src, dst); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    /** Scales src up into dst (mode 1 bilinear, 2 FSR 1, 3 MetalFX spatial). Returns the mode actually used, or -1. */
+    public static int upscale(long ctx, long src, long dst, int mode, float sharpness) {
+        try { return (int) UPSCALE.invokeExact(ctx, src, dst, mode, sharpness); } catch (Throwable t) { throw rethrow(t); }
     }
 
     public static void surfaceStats(long surface, long out) {

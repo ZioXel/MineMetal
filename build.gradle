@@ -129,12 +129,13 @@ tasks.register('compileMetalNative', Exec) {
 	def src = file('native/minemetal.m')
 	def outFile = nativeOutDir.get().file('natives/macos/libminemetal.dylib').asFile
 	inputs.file(src)
+	inputs.file(file('native/fsr_shaders.h'))
 	outputs.file(outFile)
 	onlyIf { System.getProperty('os.name').toLowerCase().contains('mac') }
 	doFirst { outFile.parentFile.mkdirs() }
 	commandLine 'xcrun', 'clang', '-dynamiclib', '-fobjc-arc', '-O2', '-Wall', '-Wno-unused-function',
 		'-arch', 'arm64', '-mmacosx-version-min=14.0',
-		'-framework', 'Metal', '-framework', 'QuartzCore', '-framework', 'CoreGraphics', '-framework', 'Foundation',
+		'-framework', 'Metal', '-framework', 'MetalFX', '-framework', 'QuartzCore', '-framework', 'CoreGraphics', '-framework', 'Foundation',
 		'-install_name', '@rpath/libminemetal.dylib',
 		'-o', outFile.absolutePath, src.absolutePath
 }

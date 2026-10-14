@@ -46,6 +46,22 @@ Complementary's colored lighting, which Apple's OpenGL driver cannot do at all.
 
 Heavy packs are GPU-bound at full Retina resolution (BSL ~25 fps fullscreen); that is the next thing being worked on.
 
+## Upscaling (MetalFX / AMD FSR 1)
+
+Video Settings → **MineMetal** (shown while Metal is running) renders the world at a lower resolution and scales it up
+to the window before the GUI is drawn, so menus, chat and the hotbar stay sharp:
+
+| Setting | Values |
+|---|---|
+| Upscaler | Off (default), MetalFX (Apple's spatial scaler), AMD FSR 1 (EASU + RCAS), Bilinear |
+| Render Scale | 50–100 % per axis (75 % ≈ 56 % of the pixels) |
+| Upscale Sharpness | 0–100 % AMD RCAS sharpening after FSR 1 or MetalFX |
+
+The settings are stored in `config/minemetal.properties`; `-Dminemetal.upscale=metalfx|fsr1|bilinear|off` and
+`-Dminemetal.renderScale=67` override them. Works with vanilla and Iris shader packs (packs simply see a smaller
+screen). Sodium replaces Video Settings with its own screen; use the config file there. FSR 1 is © AMD, MIT licensed
+(`tools/fsr/`).
+
 ## Install (players)
 
 Requirements: Apple Silicon Mac, macOS 14+, Minecraft Java 26.3 with Fabric Loader 0.19.5+, Sodium 0.9.x.

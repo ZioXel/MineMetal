@@ -3,7 +3,11 @@
   "package": "dev.minemetal.client.mixin",
   "compatibilityLevel": "JAVA_25",
   "client": [
-    "PreferredGraphicsApiMixin"
+    "PreferredGraphicsApiMixin",
+    "GameRendererUpscaleMixin",
+    "VideoSettingsScreenMixin"
   ],
-  "injectors": { "defaultRequire": 1 }
+  "injectors": {
+    "defaultRequire": 1
+  }
 }

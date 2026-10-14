@@ -12,6 +12,8 @@
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
 #import <CoreGraphics/CoreGraphics.h>
+#import <MetalFX/MetalFX.h>
+#include "fsr_shaders.h"
 #include <pthread.h>
 #include <stdatomic.h>
 #include <math.h>
@@ -1933,5 +1935,166 @@ MM_EXPORT void mm_copy_texture_all(void *p, void *src, void *dst) {
         id<MTLTexture> d = (__bridge id<MTLTexture>)dst;
         if (s == nil || d == nil) return;
         [mm_blit(ctx) copyFromTexture:s toTexture:d];
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Upscaling: the world is rendered into a smaller target and scaled up to the window before the GUI is drawn.
+// Modes: 1 = bilinear, 2 = AMD FSR 1 (EASU + RCAS), 3 = MetalFX spatial (+ optional RCAS sharpening).
+// ---------------------------------------------------------------------------------------------------------------------
+
+static NSString *const kMMUpscaleCommonMSL =
+    @"#include <metal_stdlib>\n"
+     "using namespace metal;\n"
+     "struct MMFsOut { float4 pos [[position]]; };\n"
+     "vertex MMFsOut mm_fs_vs(uint vid [[vertex_id]]) {\n"
+     "    float2 p = float2(float((vid << 1) & 2), float(vid & 2));\n"
+     "    MMFsOut o;\n"
+     "    o.pos = float4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+     "    return o;\n"
+     "}\n"
+     "struct MMUpConsts { float4 sizes; float4 extra; };\n"
+     "fragment float4 mm_fs_bilinear(float4 pos [[position]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]],\n"
+     "                               constant MMUpConsts &c [[buffer(0)]]) {\n"
+     "    return float4(t.sample(s, pos.xy / c.sizes.zw).rgb, 1.0);\n"
+     "}\n";
+
+static id<MTLLibrary> g_upCommonLib, g_upEasuLib, g_upRcasLib;
+static NSMutableDictionary<NSString *, id<MTLRenderPipelineState>> *g_upPipelines;
+static id<MTLSamplerState> g_upLinear;
+static id<MTLTexture> g_upTmp;          // EASU output / MetalFX output (full size)
+static id<MTLFXSpatialScaler> g_upFx;
+static int g_upFailed;                  // bit per mode that failed to initialise (falls back to bilinear)
+
+static id<MTLLibrary> mm_up_library(MMContext *ctx, const char *src) {
+    NSError *err = nil;
+    MTLCompileOptions *o = [[MTLCompileOptions alloc] init];
+    o.languageVersion = MTLLanguageVersion2_3;
+    id<MTLLibrary> lib = [ctx.device newLibraryWithSource:[NSString stringWithUTF8String:src] options:o error:&err];
+    if (lib == nil) NSLog(@"[MineMetal] upscaler shader compile failed: %@", err);
+    return lib;
+}
+
+static id<MTLRenderPipelineState> mm_up_pipeline(MMContext *ctx, int which, MTLPixelFormat fmt) {
+    if (g_upPipelines == nil) g_upPipelines = [NSMutableDictionary dictionary];
+    NSString *key = [NSString stringWithFormat:@"%d/%lu", which, (unsigned long)fmt];
+    id<MTLRenderPipelineState> pso = g_upPipelines[key];
+    if (pso != nil) return pso;
+    if (g_upCommonLib == nil) g_upCommonLib = mm_up_library(ctx, kMMUpscaleCommonMSL.UTF8String);
+    id<MTLLibrary> fragLib = nil;
+    NSString *fragName = nil;
+    if (which == 0) { fragLib = g_upCommonLib; fragName = @"mm_fs_bilinear"; }
+    else if (which == 1) { if (g_upEasuLib == nil) g_upEasuLib = mm_up_library(ctx, MM_FSR_EASU_MSL); fragLib = g_upEasuLib; fragName = @"main_easu"; }
+    else { if (g_upRcasLib == nil) g_upRcasLib = mm_up_library(ctx, MM_FSR_RCAS_MSL); fragLib = g_upRcasLib; fragName = @"main_rcas"; }
+    if (g_upCommonLib == nil || fragLib == nil) return nil;
+    MTLRenderPipelineDescriptor *d = [[MTLRenderPipelineDescriptor alloc] init];
+    d.label = [NSString stringWithFormat:@"MineMetal upscale %@", fragName];
+    d.vertexFunction = [g_upCommonLib newFunctionWithName:@"mm_fs_vs"];
+    d.fragmentFunction = [fragLib newFunctionWithName:fragName];
+    d.colorAttachments[0].pixelFormat = fmt;
+    NSError *err = nil;
+    pso = [ctx.device newRenderPipelineStateWithDescriptor:d error:&err];
+    if (pso == nil) { NSLog(@"[MineMetal] upscaler pipeline %@ failed: %@", fragName, err); return nil; }
+    g_upPipelines[key] = pso;
+    return pso;
+}
+
+/** One fullscreen-triangle pass: dst = shader(src). Overwrites every pixel of dst. */
+static BOOL mm_up_draw(MMContext *ctx, int which, id<MTLTexture> src, id<MTLTexture> dst, float sharpStops) {
+    id<MTLRenderPipelineState> pso = mm_up_pipeline(ctx, which, dst.pixelFormat);
+    if (pso == nil) return NO;
+    if (g_upLinear == nil) {
+        MTLSamplerDescriptor *sd = [[MTLSamplerDescriptor alloc] init];
+        sd.minFilter = MTLSamplerMinMagFilterLinear;
+        sd.magFilter = MTLSamplerMinMagFilterLinear;
+        sd.sAddressMode = MTLSamplerAddressModeClampToEdge;
+        sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
+        g_upLinear = [ctx.device newSamplerStateWithDescriptor:sd];
+    }
+    float consts[8] = { (float)src.width, (float)src.height, (float)dst.width, (float)dst.height, sharpStops, 0, 0, 0 };
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = dst;
+    rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    id<MTLRenderCommandEncoder> enc = mm_render_encoder(ctx, rp);
+    enc.label = @"MineMetal upscale";
+    [enc setRenderPipelineState:pso];
+    [enc setFragmentTexture:src atIndex:0];
+    [enc setFragmentSamplerState:g_upLinear atIndex:0];
+    [enc setFragmentBytes:consts length:sizeof(consts) atIndex:0];
+    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [enc endEncoding];
+    return YES;
+}
+
+static id<MTLTexture> mm_up_tmp(MMContext *ctx, NSUInteger w, NSUInteger h, MTLPixelFormat fmt, MTLTextureUsage usage) {
+    if (g_upTmp != nil && g_upTmp.width == w && g_upTmp.height == h && g_upTmp.pixelFormat == fmt && (g_upTmp.usage & usage) == usage) return g_upTmp;
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt width:w height:h mipmapped:NO];
+    td.usage = usage;
+    td.storageMode = MTLStorageModePrivate;
+    g_upTmp = [ctx.device newTextureWithDescriptor:td];
+    g_upTmp.label = @"MineMetal upscale intermediate";
+    return g_upTmp;
+}
+
+/**
+ * Scales src (the low-resolution world image) up into dst (the window-sized main color target).
+ * sharpness: 0..1 (1 = strongest RCAS sharpening, 0 = none). Returns the mode actually used (falls back to bilinear).
+ */
+MM_EXPORT int mm_upscale(void *p, void *srcPtr, void *dstPtr, int mode, float sharpness) {
+    @autoreleasepool {
+        MMContext *ctx = CTX(p);
+        id<MTLTexture> src = (__bridge id<MTLTexture>)srcPtr;
+        id<MTLTexture> dst = (__bridge id<MTLTexture>)dstPtr;
+        if (src == nil || dst == nil) return -1;
+        mm_end_encoders(ctx);
+        if (sharpness < 0.0f) sharpness = 0.0f;
+        if (sharpness > 1.0f) sharpness = 1.0f;
+        float stops = (1.0f - sharpness) * 2.0f;  // RCAS: 0 stops = maximum sharpening
+        BOOL sharpen = sharpness > 0.001f;
+        if (mode == 3 && !(g_upFailed & 8)) {
+            if (g_upFx == nil || g_upFx.inputWidth != src.width || g_upFx.inputHeight != src.height
+                    || g_upFx.outputWidth != dst.width || g_upFx.outputHeight != dst.height
+                    || g_upFx.colorTextureFormat != src.pixelFormat || g_upFx.outputTextureFormat != dst.pixelFormat) {
+                g_upFx = nil;
+                if ([MTLFXSpatialScalerDescriptor supportsDevice:ctx.device]) {
+                    MTLFXSpatialScalerDescriptor *d = [[MTLFXSpatialScalerDescriptor alloc] init];
+                    d.inputWidth = src.width;
+                    d.inputHeight = src.height;
+                    d.outputWidth = dst.width;
+                    d.outputHeight = dst.height;
+                    d.colorTextureFormat = src.pixelFormat;
+                    d.outputTextureFormat = dst.pixelFormat;
+                    d.colorProcessingMode = MTLFXSpatialScalerColorProcessingModePerceptual;
+                    g_upFx = [d newSpatialScalerWithDevice:ctx.device];
+                }
+                if (g_upFx == nil) { NSLog(@"[MineMetal] MetalFX spatial scaler unavailable; using FSR"); g_upFailed |= 8; }
+            }
+            if (g_upFx != nil) {
+                id<MTLTexture> out = mm_up_tmp(ctx, dst.width, dst.height, dst.pixelFormat,
+                                               g_upFx.outputTextureUsage | MTLTextureUsageShaderRead);
+                g_upFx.colorTexture = src;
+                g_upFx.outputTexture = out;
+                g_upFx.inputContentWidth = src.width;
+                g_upFx.inputContentHeight = src.height;
+                mm_prof_maybe_split(ctx);
+                [g_upFx encodeToCommandBuffer:mm_cmd(ctx)];
+                if (sharpen && mm_up_draw(ctx, 2, out, dst, stops)) return 3;
+                [mm_blit(ctx) copyFromTexture:out toTexture:dst];
+                mm_end_encoders(ctx);
+                return 3;
+            }
+            mode = 2;
+        }
+        if (mode == 2 || mode == 3) {
+            id<MTLTexture> tmp = mm_up_tmp(ctx, dst.width, dst.height, MTLPixelFormatRGBA16Float,
+                                           MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
+            if (sharpen) {
+                if (mm_up_draw(ctx, 1, src, tmp, stops) && mm_up_draw(ctx, 2, tmp, dst, stops)) return 2;
+            } else if (mm_up_draw(ctx, 1, src, dst, stops)) {
+                return 2;
+            }
+        }
+        return mm_up_draw(ctx, 0, src, dst, 0.0f) ? 1 : -1;
     }
 }
