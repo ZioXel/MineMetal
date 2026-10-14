@@ -22,6 +22,9 @@ final class TemporalState {
     private final Matrix4f capturedProjection = new Matrix4f();
     private boolean captured;
 
+    private final Matrix4f capturedView = new Matrix4f();
+    private boolean viewCaptured;
+
     private final Matrix4f prevViewProj = new Matrix4f();
     private double prevX, prevY, prevZ;
     private boolean hasPrev;
@@ -55,6 +58,7 @@ final class TemporalState {
         new Matrix4f().translation(2.0F * this.jitterX / w, -2.0F * this.jitterY / h, 0.0F).mul(projection, projection);
         this.projectionJittered = true;
         this.captured = false;
+        this.viewCaptured = false;
     }
 
     void restore(final Matrix4f projection) {
@@ -62,6 +66,11 @@ final class TemporalState {
             projection.set(this.originalProjection);
             this.projectionJittered = false;
         }
+    }
+
+    void captureView(final Matrix4fc view) {
+        this.capturedView.set(view);
+        this.viewCaptured = true;
     }
 
     /** The final (jittered, view-bobbed) projection the level was rendered with. */
@@ -82,7 +91,7 @@ final class TemporalState {
             // Remove the jitter again: motion vectors describe the unjittered scene.
             new Matrix4f().translation(-2.0F * this.jitterX / this.renderW, 2.0F * this.jitterY / this.renderH, 0.0F).mul(proj, proj);
         }
-        Matrix4f viewProj = proj.mul(viewRotation, new Matrix4f());
+        Matrix4f viewProj = proj.mul(this.viewCaptured ? this.capturedView : viewRotation, new Matrix4f());
         Matrix4f inv = viewProj.invert(new Matrix4f());
         if (!Float.isFinite(inv.m00())) {
             return false;

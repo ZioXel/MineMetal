@@ -5,7 +5,8 @@
   "client": [
     "PreferredGraphicsApiMixin",
     "GameRendererUpscaleMixin",
-    "VideoSettingsScreenMixin"
+    "VideoSettingsScreenMixin",
+    "LevelRendererUpscaleMixin"
   ],
   "injectors": {
     "defaultRequire": 1

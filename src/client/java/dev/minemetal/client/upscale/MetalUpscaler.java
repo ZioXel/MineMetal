@@ -218,6 +218,13 @@ public final class MetalUpscaler {
         }
     }
 
+    /** The view matrix the level renders with (includes view bobbing when Iris moved it there). */
+    public static void captureView(final Matrix4fc view) {
+        if (temporalThisFrame) {
+            TEMPORAL.captureView(view);
+        }
+    }
+
     /** Copies the world depth before the hand clears/overwrites it (MetalFX Temporal needs scene depth). */
     public static void captureDepth(final RenderTarget low) {
         MetalDevice device = MetalDevice.current();
