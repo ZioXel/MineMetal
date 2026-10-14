@@ -29,6 +29,10 @@ dependencies {
 
 	// Fabric API. This is technically optional, but you probably want it anyway.
 	implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+
+	// Sodium's config API (MineMetal page in Sodium's Video Settings). Optional at runtime; the jar comes from the
+	// stage-0 test kit download (run/mods-stage0).
+	compileOnly fileTree('run/mods-stage0') { include 'sodium-*.jar' }
 }
 
 processResources {

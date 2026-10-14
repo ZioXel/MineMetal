@@ -13,6 +13,9 @@
   "entrypoints": {
     "client": [
       "dev.minemetal.client.MineMetalClient"
+    ],
+    "sodium:config_api_user": [
+      "dev.minemetal.client.compat.MineMetalSodiumConfig"
     ]
   },
   "mixins": [
