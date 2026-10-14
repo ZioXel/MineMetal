@@ -52,6 +52,7 @@ public final class MetalUpscaler {
     private static boolean temporalThisFrame;
     private static boolean depthCaptured;
     private static boolean standardDepthThisFrame;
+    private static boolean packMovesBob;
     /**
      * Sign conventions for MetalFX's jitter offset per axis (tested on macOS 27: X as applied, Y negated) and motion
      * vectors. Overridable with -Dminemetal.taa.jitterSignX/Y=±1 and -Dminemetal.taa.motionSign=±1.
@@ -207,10 +208,11 @@ public final class MetalUpscaler {
                     TEMPORAL.captureView(camera.viewRotationMatrix);  // as extracted, before anything adds view bobbing
                 }
                 temporalThisFrame = true;
+                packMovesBob = IrisCheck.shaderPackInUse();  // Iris applies bobbing to the view matrix instead
                 standardDepthThisFrame = switch (DEPTH_MODE) {
                     case "standard" -> true;
                     case "reversed" -> false;
-                    default -> IrisCheck.shaderPackInUse();
+                    default -> packMovesBob;
                 };
             }
             return scaled;
@@ -225,6 +227,13 @@ public final class MetalUpscaler {
     public static void captureProjection(final Matrix4fc projection) {
         if (temporalThisFrame) {
             TEMPORAL.capture(projection);
+        }
+    }
+
+    /** View bobbing / hurt shake of this frame (as multiplied onto the projection by vanilla). */
+    public static void captureBob(final Matrix4fc bob) {
+        if (temporalThisFrame) {
+            TEMPORAL.captureBob(bob, packMovesBob && !VIEW_MODE.equals("level"));
         }
     }
 

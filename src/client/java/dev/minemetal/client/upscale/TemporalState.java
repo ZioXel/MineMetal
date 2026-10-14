@@ -22,6 +22,8 @@ final class TemporalState {
     private final Matrix4f capturedProjection = new Matrix4f();
     private boolean captured;
 
+    private final Matrix4f bob = new Matrix4f();
+    private boolean bobInView;
     private final Matrix4f capturedView = new Matrix4f();
     private boolean viewCaptured;
 
@@ -59,6 +61,7 @@ final class TemporalState {
         this.projectionJittered = true;
         this.captured = false;
         this.viewCaptured = false;
+        this.bobInView = false;
     }
 
     void restore(final Matrix4f projection) {
@@ -66,6 +69,12 @@ final class TemporalState {
             projection.set(this.originalProjection);
             this.projectionJittered = false;
         }
+    }
+
+    /** With a shader pack, Iris renders with view = bob * view instead of projection * bob. */
+    void captureBob(final Matrix4fc m, final boolean inView) {
+        this.bob.set(m);
+        this.bobInView = inView;
     }
 
     void captureView(final Matrix4fc view) {
@@ -91,7 +100,11 @@ final class TemporalState {
             // Remove the jitter again: motion vectors describe the unjittered scene.
             new Matrix4f().translation(-2.0F * this.jitterX / this.renderW, 2.0F * this.jitterY / this.renderH, 0.0F).mul(proj, proj);
         }
-        Matrix4f viewProj = proj.mul(this.viewCaptured ? this.capturedView : viewRotation, new Matrix4f());
+        Matrix4f view = new Matrix4f(this.viewCaptured ? this.capturedView : viewRotation);
+        if (this.bobInView) {
+            view.mulLocal(this.bob);
+        }
+        Matrix4f viewProj = proj.mul(view, new Matrix4f());
         Matrix4f inv = viewProj.invert(new Matrix4f());
         if (!Float.isFinite(inv.m00())) {
             return false;

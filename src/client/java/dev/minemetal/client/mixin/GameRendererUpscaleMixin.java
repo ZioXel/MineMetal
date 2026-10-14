@@ -13,6 +13,7 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.ModifyArg;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
 import org.joml.Matrix4f;
+import org.joml.Matrix4fc;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /**
@@ -47,6 +48,13 @@ public abstract class GameRendererUpscaleMixin {
     private Matrix4f minemetal$captureProjection(final Matrix4f projection) {
         MetalUpscaler.captureProjection(projection);
         return projection;
+    }
+
+    /** The view-bobbing / hurt-shake matrix (Iris moves it from the projection into the view matrix with shader packs). */
+    @ModifyArg(method = "renderLevel", at = @At(value = "INVOKE", target = "Lorg/joml/Matrix4f;mul(Lorg/joml/Matrix4fc;)Lorg/joml/Matrix4f;"))
+    private Matrix4fc minemetal$captureBob(final Matrix4fc bob) {
+        MetalUpscaler.captureBob(bob);
+        return bob;
     }
 
     /** Scene depth for MetalFX Temporal, copied before the hand pass clears or overwrites it. */
