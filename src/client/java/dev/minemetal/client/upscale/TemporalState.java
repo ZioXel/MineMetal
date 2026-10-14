@@ -77,7 +77,11 @@ final class TemporalState {
         this.bobInView = inView;
     }
 
+    /** First call per frame wins: later LevelRenderer.render calls in the same frame (e.g. a shader pack's shadow pass) use other cameras. */
     void captureView(final Matrix4fc view) {
+        if (this.viewCaptured) {
+            return;
+        }
         this.capturedView.set(view);
         this.viewCaptured = true;
     }
