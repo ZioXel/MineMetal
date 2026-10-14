@@ -57,7 +57,7 @@ to the window before the GUI is drawn, so menus, chat and the hotbar stay sharp:
 | Render Scale | 50–100 % per axis (75 % ≈ 56 % of the pixels) |
 | Upscale Sharpness | 0–100 % AMD RCAS sharpening after FSR 1 or MetalFX |
 
-**MetalFX Temporal** jitters the camera by a sub-pixel amount every frame and builds motion vectors from the scene
+**MetalFX Spatial** is the recommended choice. **MetalFX Temporal** (experimental) jitters the camera by a sub-pixel amount every frame and builds motion vectors from the scene
 depth and the camera movement, so it upscales *and* anti-aliases (also usable at 100 % as pure anti-aliasing). Turn the
 shader pack's own TAA off (Complementary: Temporal Filtering and Temporal Jitter OFF). Moving mobs and particles only get
 camera motion, and view bobbing still makes the terrain wobble slightly with Temporal (turn View Bobbing off for the

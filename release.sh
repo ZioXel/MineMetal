@@ -32,6 +32,8 @@ $REQS
 
 Install: put the jar into your .minecraft/mods folder (Fabric profile). For shader packs also install Iris (MineMetal) from https://github.com/ZioXel/MineMetal-Iris/releases instead of the official Iris.
 Video Settings -> Graphics API shows \"Default (Metal)\" while MineMetal runs; pick OpenGL or Vulkan there (and restart) to switch back.
+
+New in this version: world upscaling. Video Settings -> MineMetal (with Sodium: the MineMetal page in Sodium's settings) -> Upscaler: MetalFX Spatial (recommended), AMD FSR 1, or MetalFX Temporal (experimental: also anti-aliases; turn the shader pack's TAA off, e.g. Complementary Temporal Filtering + Temporal Jitter; slight wobble with view bobbing/jumping). Render Scale 50-100 %. Roughly 2x fps with heavy shader packs at 50-67 %.
 If the game does not start, remove the jar."
 fi
 if gh release view "v$IRIS_VERSION" --repo ZioXel/MineMetal-Iris >/dev/null 2>&1; then echo "Iris v$IRIS_VERSION already released, skipping"; else
