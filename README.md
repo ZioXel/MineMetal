@@ -61,7 +61,7 @@ to the window before the GUI is drawn, so menus, chat and the hotbar stay sharp:
 depth and the camera movement, so it upscales *and* anti-aliases (also usable at 100 % as pure anti-aliasing). Turn the
 shader pack's own TAA off (Complementary: Temporal Filtering and Temporal Jitter OFF). Moving mobs and particles only get
 camera motion, and view bobbing still makes the terrain wobble slightly with Temporal (turn View Bobbing off for the
-cleanest image). Debug options: `-Dminemetal.taa.depth=reversed|standard|auto`, `-Dminemetal.taa.jitterSign=±1`,
+cleanest image). Debug options: `-Dminemetal.taa.depth=reversed|standard|auto`, `-Dminemetal.taa.jitterSignX=±1` / `jitterSignY`,
 `-Dminemetal.taa.motionSign=±1`, `-Dminemetal.taa.view=extract|level|late`, `-Dminemetal.taa.skyReactive=0..1`.
 
 The settings are stored in `config/minemetal.properties`; `-Dminemetal.upscale=metalfx_temporal|metalfx|fsr1|bilinear|off` and

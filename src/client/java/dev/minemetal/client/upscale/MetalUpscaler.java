@@ -52,8 +52,13 @@ public final class MetalUpscaler {
     private static boolean temporalThisFrame;
     private static boolean depthCaptured;
     private static boolean standardDepthThisFrame;
-    /** Sign conventions for MetalFX (flip with -Dminemetal.taa.jitterSign=1 / -Dminemetal.taa.motionSign=-1 if the image wobbles or ghosts). */
+    /**
+     * Sign conventions for MetalFX's jitter offset per axis (tested on macOS 27: X as applied, Y negated) and motion
+     * vectors. Overridable with -Dminemetal.taa.jitterSignX/Y=±1 and -Dminemetal.taa.motionSign=±1.
+     */
     private static final float JITTER_SIGN = Float.parseFloat(System.getProperty("minemetal.taa.jitterSign", "-1"));
+    private static final float JITTER_SIGN_X = Float.parseFloat(System.getProperty("minemetal.taa.jitterSignX", System.getProperty("minemetal.taa.jitterSign", "1")));
+    private static final float JITTER_SIGN_Y = Float.parseFloat(System.getProperty("minemetal.taa.jitterSignY", Float.toString(JITTER_SIGN)));
     /**
      * Depth convention of the captured depth: reversed (default; Minecraft's reversed Z, which shader packs on MineMetal also
      * end up with), standard, or auto (shader pack = standard). Tested: reversed is correct with Complementary on Iris.
@@ -259,8 +264,8 @@ public final class MetalUpscaler {
         int used = -1;
         if (temporalThisFrame && depthCaptured
                 && TEMPORAL.prepare(camera.viewRotationMatrix, camera.pos.x, camera.pos.y, camera.pos.z, standardDepthThisFrame, MOTION_SIGN, SKY_REACTIVE)) {
-            TEMPORAL.params[36] *= JITTER_SIGN;
-            TEMPORAL.params[37] *= JITTER_SIGN;
+            TEMPORAL.params[36] *= JITTER_SIGN_X;
+            TEMPORAL.params[37] *= JITTER_SIGN_Y;
             try (MemoryStack stack = MemoryStack.stackPush()) {
                 java.nio.FloatBuffer buf = stack.floats(TEMPORAL.params);
                 used = Native.upscaleTemporal(device.ctx(), s.handle(), d.handle(), org.lwjgl.system.MemoryUtil.memAddress(buf),
