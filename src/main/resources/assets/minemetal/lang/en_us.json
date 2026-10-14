@@ -5,5 +5,6 @@
   "minemetal.options.renderScale": "Render Scale",
   "minemetal.options.renderScale.tooltip": "World resolution in percent of the window (per axis). 75% renders about 56% of the pixels. Only used when an upscaler is on.",
   "minemetal.options.sharpness": "Upscale Sharpness",
-  "minemetal.options.sharpness.tooltip": "AMD FidelityFX RCAS sharpening applied after FSR 1 or MetalFX. 0% turns it off."
+  "minemetal.options.sharpness.tooltip": "AMD FidelityFX RCAS sharpening applied after FSR 1 or MetalFX. 0% turns it off.",
+  "options.graphicsApi.default": "Default (Metal)"
 }

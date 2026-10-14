@@ -37,7 +37,9 @@ public abstract class PreferredGraphicsApiMixin {
     /** Video Settings shows "Default (Metal)" when Default is running MineMetal's Metal backend. */
     @Inject(method = "caption", at = @At("RETURN"), cancellable = true)
     private void minemetal$caption(final CallbackInfoReturnable<Component> cir) {
-        if ((Object) this == PreferredGraphicsApi.DEFAULT && MetalDevice.current() != null) {
+        // en_us also renames "Default" to "Default (Metal)" (that is what Sodium's settings screen shows); don't add it twice.
+        if ((Object) this == PreferredGraphicsApi.DEFAULT && MetalDevice.current() != null
+                && !cir.getReturnValue().getString().contains("Metal")) {
             cir.setReturnValue(Component.empty().append(cir.getReturnValue()).append(" (Metal)"));
         }
     }
