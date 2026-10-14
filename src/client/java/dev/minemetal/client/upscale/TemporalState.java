@@ -73,10 +73,10 @@ final class TemporalState {
     /**
      * Fills {@link #params} for mm_upscale_temporal. Returns false if this frame has no usable matrices.
      * Layout: [0..15] inverse(current unjittered view-projection), [16..31] previous view-projection,
-     * [32..34] camera movement since last frame (current - previous), [36..37] jitter, [38] standard depth, [39] motion sign.
+     * [32..34] camera movement since last frame (current - previous), [36..37] jitter, [38] standard depth, [39] motion sign, [40] sky reactive-mask value.
      */
     boolean prepare(final Matrix4fc viewRotation, final double camX, final double camY, final double camZ,
-                    final boolean standardDepth, final float motionSign) {
+                    final boolean standardDepth, final float motionSign, final float skyReactive) {
         Matrix4f proj = this.captured ? new Matrix4f(this.capturedProjection) : new Matrix4f(this.originalProjection);
         if (this.captured) {
             // Remove the jitter again: motion vectors describe the unjittered scene.
@@ -103,6 +103,7 @@ final class TemporalState {
         this.params[37] = this.jitterY;
         this.params[38] = standardDepth ? 1.0F : 0.0F;
         this.params[39] = motionSign;
+        this.params[40] = skyReactive;
         this.prevViewProj.set(viewProj);
         this.prevX = camX;
         this.prevY = camY;

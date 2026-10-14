@@ -1955,18 +1955,22 @@ static NSString *const kMMUpscaleCommonMSL =
      "}\n"
      "struct MMUpConsts { float4 sizes; float4 extra; };\n"
      "struct MMMotionConsts { float4x4 invCur; float4x4 prevVP; float4 camDelta; float4 jitter; float4 misc; };\n"
-     "fragment float2 mm_motion(float4 pos [[position]], depth2d<float> depth [[texture(0)]], constant MMMotionConsts &c [[buffer(0)]]) {\n"
+     "struct MMMotionOut { float2 mv [[color(0)]]; float reactive [[color(1)]]; };\n"
+     "fragment MMMotionOut mm_motion(float4 pos [[position]], depth2d<float> depth [[texture(0)]], constant MMMotionConsts &c [[buffer(0)]]) {\n"
      "    float2 size = float2(depth.get_width(), depth.get_height());\n"
      "    float z = depth.read(uint2(pos.xy));\n"
-     "    if (c.misc.x > 0.5) z = 1.0 - z;  // shader packs: standard depth -> Minecraft's reversed Z\n"
+     "    if (c.misc.x > 0.5) z = 1.0 - z;  // standard depth -> Minecraft's reversed Z\n"
+     "    MMMotionOut o;\n"
+     "    o.reactive = z <= 1e-7 ? c.misc.z : 0.0;  // sky / shader clouds: no depth, lean on the current frame\n"
      "    float2 uv = pos.xy / size;\n"
      "    float4 p = c.invCur * float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, z, 1.0);\n"
      "    p /= p.w;\n"
      "    float4 q = c.prevVP * float4(p.xyz + c.camDelta.xyz, 1.0);\n"
-     "    if (q.w <= 1e-6) return float2(0.0);\n"
+     "    if (q.w <= 1e-6) { o.mv = float2(0.0); return o; }\n"
      "    float2 pn = q.xy / q.w;\n"
      "    float2 prevUv = float2(pn.x * 0.5 + 0.5, 0.5 - pn.y * 0.5);\n"
-     "    return (prevUv - uv) * c.misc.y;\n"
+     "    o.mv = (prevUv - uv) * c.misc.y;\n"
+     "    return o;\n"
      "}\n"
      "fragment float4 mm_fs_bilinear(float4 pos [[position]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]],\n"
      "                               constant MMUpConsts &c [[buffer(0)]]) {\n"
@@ -2117,7 +2121,8 @@ MM_EXPORT int mm_upscale(void *p, void *srcPtr, void *dstPtr, int mode, float sh
 // MetalFX Temporal: jittered low-resolution color + scene depth + camera motion vectors -> anti-aliased, upscaled image.
 // ---------------------------------------------------------------------------------------------------------------------
 
-static id<MTLTexture> g_taDepth, g_taMotion;
+static id<MTLTexture> g_taDepth, g_taMotion, g_taReactive;
+static BOOL g_taReactiveOn;
 static id<MTLFXTemporalScaler> g_taFx;
 static id<MTLRenderPipelineState> g_taMotionPso;
 static BOOL g_taUnsupported;
@@ -2144,7 +2149,7 @@ MM_EXPORT void mm_upscale_capture_depth(void *p, void *depthPtr) {
 }
 
 /**
- * params (44 floats): invCur[16], prevVP[16], camDelta[4], jitterX, jitterY, standardDepth, motionSign, (4 unused).
+ * params (44 floats): invCur[16], prevVP[16], camDelta[4], jitterX, jitterY, standardDepth, motionSign, skyReactive, (3 unused).
  * Returns 4 on success, -1 if MetalFX Temporal can't run this frame (the caller falls back to the spatial scaler).
  */
 MM_EXPORT int mm_upscale_temporal(void *p, void *colorPtr, void *dstPtr, const float *params, int reset, float sharpness) {
@@ -2164,6 +2169,11 @@ MM_EXPORT int mm_upscale_temporal(void *p, void *colorPtr, void *dstPtr, const f
             td.storageMode = MTLStorageModePrivate;
             g_taMotion = [ctx.device newTextureWithDescriptor:td];
             g_taMotion.label = @"MineMetal motion vectors";
+            MTLTextureDescriptor *rd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm width:w height:h mipmapped:NO];
+            rd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+            rd.storageMode = MTLStorageModePrivate;
+            g_taReactive = [ctx.device newTextureWithDescriptor:rd];
+            g_taReactive.label = @"MineMetal reactive mask";
         }
         if (g_taMotionPso == nil) {
             if (g_upCommonLib == nil) g_upCommonLib = mm_up_library(ctx, kMMUpscaleCommonMSL.UTF8String);
@@ -2173,6 +2183,7 @@ MM_EXPORT int mm_upscale_temporal(void *p, void *colorPtr, void *dstPtr, const f
             d.vertexFunction = [g_upCommonLib newFunctionWithName:@"mm_fs_vs"];
             d.fragmentFunction = [g_upCommonLib newFunctionWithName:@"mm_motion"];
             d.colorAttachments[0].pixelFormat = MTLPixelFormatRG16Float;
+            d.colorAttachments[1].pixelFormat = MTLPixelFormatR8Unorm;
             NSError *err = nil;
             g_taMotionPso = [ctx.device newRenderPipelineStateWithDescriptor:d error:&err];
             if (g_taMotionPso == nil) { NSLog(@"[MineMetal] motion vector pipeline failed: %@", err); g_taUnsupported = YES; return -1; }
@@ -2180,12 +2191,15 @@ MM_EXPORT int mm_upscale_temporal(void *p, void *colorPtr, void *dstPtr, const f
         float consts[48];
         memcpy(consts, params, 36 * sizeof(float));                 // invCur, prevVP, camDelta
         consts[36] = params[36]; consts[37] = params[37]; consts[38] = 0; consts[39] = 0;  // jitter
-        consts[40] = params[38]; consts[41] = params[39]; consts[42] = 0; consts[43] = 0;  // misc
+        consts[40] = params[38]; consts[41] = params[39]; consts[42] = params[40]; consts[43] = 0;  // misc: depth, sign, sky reactive
         {
             MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
             rp.colorAttachments[0].texture = g_taMotion;
             rp.colorAttachments[0].loadAction = MTLLoadActionDontCare;
             rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+            rp.colorAttachments[1].texture = g_taReactive;
+            rp.colorAttachments[1].loadAction = MTLLoadActionDontCare;
+            rp.colorAttachments[1].storeAction = MTLStoreActionStore;
             id<MTLRenderCommandEncoder> enc = mm_render_encoder(ctx, rp);
             enc.label = @"MineMetal motion vectors";
             [enc setRenderPipelineState:g_taMotionPso];
@@ -2216,6 +2230,17 @@ MM_EXPORT int mm_upscale_temporal(void *p, void *colorPtr, void *dstPtr, const f
             d.outputWidth = dst.width;
             d.outputHeight = dst.height;
             d.autoExposureEnabled = NO;
+            // Reactive mask (newer MetalFX): set through KVC so older SDKs still compile; skipped where unsupported.
+            g_taReactiveOn = NO;
+            if (params[40] > 0.0f && [d respondsToSelector:NSSelectorFromString(@"setReactiveMaskTextureEnabled:")]) {
+                @try {
+                    [d setValue:@YES forKey:@"reactiveMaskTextureEnabled"];
+                    [d setValue:@(MTLPixelFormatR8Unorm) forKey:@"reactiveMaskTextureFormat"];
+                    g_taReactiveOn = YES;
+                } @catch (NSException *e) {
+                    NSLog(@"[MineMetal] MetalFX reactive mask unavailable: %@", e.reason);
+                }
+            }
             g_taFx = [d newTemporalScalerWithDevice:ctx.device];
             if (g_taFx == nil) {
                 NSLog(@"[MineMetal] MetalFX Temporal scaler creation failed (%lux%lu -> %lux%lu); using MetalFX Spatial",
@@ -2231,6 +2256,10 @@ MM_EXPORT int mm_upscale_temporal(void *p, void *colorPtr, void *dstPtr, const f
         g_taFx.colorTexture = color;
         g_taFx.depthTexture = g_taDepth;
         g_taFx.motionTexture = g_taMotion;
+        if (g_taReactiveOn) {
+            @try { [(NSObject *)g_taFx setValue:g_taReactive forKey:@"reactiveMaskTexture"]; }
+            @catch (NSException *e) { g_taReactiveOn = NO; }
+        }
         g_taFx.outputTexture = out;
         g_taFx.inputContentWidth = w;
         g_taFx.inputContentHeight = h;

@@ -59,6 +59,8 @@ public final class MetalUpscaler {
      * end up with), standard, or auto (shader pack = standard). Tested: reversed is correct with Complementary on Iris.
      */
     private static final String DEPTH_MODE = System.getProperty("minemetal.taa.depth", "reversed");
+    /** How much MetalFX should trust the current frame on sky pixels (shader-pack clouds have no depth): 0..1, 0 = off. */
+    private static final float SKY_REACTIVE = Float.parseFloat(System.getProperty("minemetal.taa.skyReactive", "0.7"));
     private static final float MOTION_SIGN = Float.parseFloat(System.getProperty("minemetal.taa.motionSign", "1"));
 
     private MetalUpscaler() {
@@ -244,7 +246,7 @@ public final class MetalUpscaler {
         MetalProfiler.phase("upscale");
         int used = -1;
         if (temporalThisFrame && depthCaptured
-                && TEMPORAL.prepare(camera.viewRotationMatrix, camera.pos.x, camera.pos.y, camera.pos.z, standardDepthThisFrame, MOTION_SIGN)) {
+                && TEMPORAL.prepare(camera.viewRotationMatrix, camera.pos.x, camera.pos.y, camera.pos.z, standardDepthThisFrame, MOTION_SIGN, SKY_REACTIVE)) {
             TEMPORAL.params[36] *= JITTER_SIGN;
             TEMPORAL.params[37] *= JITTER_SIGN;
             try (MemoryStack stack = MemoryStack.stackPush()) {
