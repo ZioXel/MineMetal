@@ -14,7 +14,9 @@ Complementary's colored lighting, which Apple's OpenGL driver cannot do at all.
 - **Metal backend:** Minecraft's own rendering layer (renderpearl) implemented on Metal through a small Objective-C
   library called from Java (FFM). Shaders are translated GLSL → SPIR-V → Metal Shading Language at load time.
 - **Frame pacing:** VSync off renders without limit and shows the newest frame on every display refresh (no tearing,
-  no blocking).
+  no blocking); below the refresh rate frames are spaced evenly (`-Dminemetal.pacing=smooth|paced|raw`).
+- **Shader cache:** shader-pack shaders compiled once are kept in `.minecraft/minemetal-cache/` (fewer stutters from
+  the second launch on; safe to delete).
 - **Sodium:** works, using Sodium's multidraw terrain path.
 - **GL emulation for Iris:** enough of OpenGL 4.3 is emulated on Metal for Iris to run shader packs: textures
   (1D/2D/3D), framebuffers, GLSL programs with loose uniforms, per-buffer blending, **compute shaders, image
@@ -45,6 +47,8 @@ Complementary's colored lighting, which Apple's OpenGL driver cannot do at all.
 | MakeUp Ultra Fast 9.5g | ✅ |
 | Sildur's Vibrant 2.02 | ✅ |
 
+Fullscreen on an M2 Pro (3600×2260), Complementary Reimagined (Medium) with MetalFX Spatial at 50 % runs at **~80 fps**.
+
 Heavy packs are GPU-bound at full Retina resolution. Upscaling fixes most of that, e.g. Complementary Unbound
 (VERYHIGH) fullscreen at 3600×2260 on an M2 Pro: **~17 fps native → ~40 fps with MetalFX at 50 % render scale**,
 GUI still at full resolution (see below).
@@ -59,6 +63,7 @@ to the window before the GUI is drawn, so menus, chat and the hotbar stay sharp:
 | Upscaler | Off (default), MetalFX Temporal, MetalFX Spatial, AMD FSR 1 (EASU + RCAS), Bilinear |
 | Render Scale | 50–100 % per axis (75 % ≈ 56 % of the pixels) |
 | Upscale Sharpness | 0–100 % AMD RCAS sharpening after FSR 1 or MetalFX |
+| Shadows Every 2nd Frame | Shader packs: reuse the shadow map every other frame (needs Iris (MineMetal) 1.11.6-minemetal.2+). The shadow pass is often the most expensive part of a pack; shadows of moving mobs/leaves lag one frame |
 
 **MetalFX Spatial** is the recommended choice. **MetalFX Temporal** (experimental) jitters the camera by a sub-pixel amount every frame and builds motion vectors from the scene
 depth and the camera movement, so it upscales *and* anti-aliases (also usable at 100 % as pure anti-aliasing). Turn the
