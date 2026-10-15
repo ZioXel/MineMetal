@@ -14,7 +14,7 @@ cp "build/libs/minemetal-$MM_VERSION.jar" dist/
 
 echo "== MineMetal-Iris"
 (cd ../MineMetal-Iris && ./gradlew :fabric:clean :fabric:build -x test -Pbuild.release)
-IRIS_JAR=$( (ls ../MineMetal-Iris/fabric/build/libs/iris-fabric-*.jar ../MineMetal-Iris/build/libs/iris-fabric-*.jar 2>/dev/null || true) | grep -v -- -sources | grep -v -- -snapshot | head -1 || true)
+IRIS_JAR=$( (ls -t ../MineMetal-Iris/fabric/build/libs/iris-fabric-*.jar ../MineMetal-Iris/build/libs/iris-fabric-*.jar 2>/dev/null || true) | grep -v -- -sources | grep -v -- -snapshot | head -1 || true)
 [ -n "$IRIS_JAR" ] || { echo "Iris release jar not found"; exit 1; }
 cp "$IRIS_JAR" dist/
 IRIS_VERSION=$(basename "$IRIS_JAR" .jar | sed 's/^iris-fabric-//')

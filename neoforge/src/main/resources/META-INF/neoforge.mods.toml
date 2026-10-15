@@ -1,0 +1,27 @@
+modLoader = "javafml"
+loaderVersion = "[4,)"
+license = "LGPL-3.0-only"
+
+[[mods]]
+modId = "minemetal"
+version = "${mod_version}"
+displayName = "MineMetal"
+authors = "ZioXel"
+description = '''Native Apple Metal renderer for Minecraft (NeoForge 1.21.1 port, early development).'''
+
+[[mixins]]
+config = "minemetal.mixins.json"
+
+[[dependencies.minemetal]]
+modId = "neoforge"
+type = "required"
+versionRange = "[21.1,)"
+ordering = "NONE"
+side = "CLIENT"
+
+[[dependencies.minemetal]]
+modId = "minecraft"
+type = "required"
+versionRange = "[1.21.1,1.21.2)"
+ordering = "NONE"
+side = "CLIENT"

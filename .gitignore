@@ -45,3 +45,6 @@ native/build/
 run/
 .kotlin/
 dist/
+neoforge/build/
+neoforge/run/
+neoforge/.gradle/
