@@ -43,6 +43,7 @@ public final class MetalUpscaler {
     private static UpscaleMode mode = UpscaleMode.OFF;
     private static int scalePercent = 75;
     private static int sharpnessPercent = 80;
+    private static boolean shadowHalfRate;
     private static boolean loaded;
 
     private static @Nullable TextureTarget scaled;
@@ -94,6 +95,23 @@ public final class MetalUpscaler {
         return sharpnessPercent;
     }
 
+    /** Shader packs: render the shadow map only every 2nd frame (the Iris fork reuses it with corrected matrices). */
+    public static boolean shadowHalfRate() {
+        load();
+        return shadowHalfRate && MetalDevice.current() != null;
+    }
+
+    public static boolean shadowHalfRateSetting() {
+        load();
+        return shadowHalfRate;
+    }
+
+    public static void setShadowHalfRate(final boolean v) {
+        load();
+        shadowHalfRate = v;
+        save();
+    }
+
     public static void setMode(final UpscaleMode m) {
         load();
         mode = m;
@@ -139,6 +157,7 @@ public final class MetalUpscaler {
         mode = UpscaleMode.parse(System.getProperty("minemetal.upscale", p.getProperty("upscale", "off")));
         scalePercent = Math.clamp(parseInt(System.getProperty("minemetal.renderScale", p.getProperty("renderScale")), 75), MIN_SCALE, MAX_SCALE);
         sharpnessPercent = Math.clamp(parseInt(p.getProperty("sharpness"), 80), 0, 100);
+        shadowHalfRate = Boolean.parseBoolean(System.getProperty("minemetal.shadowHalfRate", p.getProperty("shadowHalfRate", "false")));
     }
 
     private static int parseInt(final @Nullable String s, final int def) {
@@ -157,11 +176,12 @@ public final class MetalUpscaler {
         p.setProperty("upscale", mode.name().toLowerCase());
         p.setProperty("renderScale", Integer.toString(scalePercent));
         p.setProperty("sharpness", Integer.toString(sharpnessPercent));
+        p.setProperty("shadowHalfRate", Boolean.toString(shadowHalfRate));
         Path f = file();
         try {
             Files.createDirectories(f.getParent());
             try (Writer w = Files.newBufferedWriter(f)) {
-                p.store(w, "MineMetal settings (upscale: off, metalfx_temporal, metalfx, fsr1, bilinear; renderScale: 50-100 %; sharpness: 0-100 %)");
+                p.store(w, "MineMetal settings (upscale: off, metalfx_temporal, metalfx, fsr1, bilinear; renderScale: 50-100 %; sharpness: 0-100 %; shadowHalfRate: true/false)");
             }
         } catch (IOException e) {
             LOGGER.warn("[MineMetal] could not write {}: {}", f, e.toString());

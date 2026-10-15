@@ -51,7 +51,10 @@ public abstract class VideoSettingsScreenMixin extends OptionsSubScreen {
             new OptionInstance.IntRange(0, 100, false),
             MetalUpscaler.sharpnessPercent(),
             MetalUpscaler::setSharpnessPercent);
+        OptionInstance<Boolean> shadows = OptionInstance.createBoolean("minemetal.options.shadowHalfRate",
+            value -> Tooltip.create(Component.translatable("minemetal.options.shadowHalfRate.tooltip")),
+            MetalUpscaler.shadowHalfRateSetting(), MetalUpscaler::setShadowHalfRate);
         this.list.addHeader(Component.translatable("minemetal.options.header"));
-        this.list.addSmall(upscaler, scale, sharpness);
+        this.list.addSmall(upscaler, scale, sharpness, shadows);
     }
 }

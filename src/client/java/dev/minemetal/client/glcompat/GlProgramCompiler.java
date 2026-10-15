@@ -245,9 +245,23 @@ public final class GlProgramCompiler {
     }
 
     private static ByteBuffer toSpirv(final String fileName, final String source, final int kind) throws ShaderCompileException {
+        String finalSource = enableModernExtensions(source);
+        String key = SpirvCache.key(finalSource, kind);
+        ByteBuffer cached = SpirvCache.load(key);
+        if (cached != null) {
+            return cached;
+        }
+        long t0 = System.nanoTime();
+        ByteBuffer spv = toSpirvUncached(fileName, finalSource, kind);
+        SpirvCache.store(key, spv);
+        CompileTiming.spirv(fileName, System.nanoTime() - t0);
+        return spv;
+    }
+
+    private static ByteBuffer toSpirvUncached(final String fileName, final String finalSource, final int kind) throws ShaderCompileException {
         long compiler = Shaderc.shaderc_compiler_initialize();
         long options = Shaderc.shaderc_compile_options_initialize();
-        ByteBuffer src = MemoryUtil.memUTF8(enableModernExtensions(source), false);
+        ByteBuffer src = MemoryUtil.memUTF8(finalSource, false);
         ByteBuffer file = MemoryUtil.memUTF8(fileName);
         ByteBuffer entry = MemoryUtil.memUTF8("main");
         long result = 0L;

@@ -441,11 +441,13 @@ public final class GlOverridePipeline implements MetalRenderPass.OverridePipelin
                 ? "#include <metal_stdlib>\nusing namespace metal;\nfragment float4 mmDebugSolid() { return float4(1.0, 0.0, 1.0, 1.0); }\n"
                 : compiled.fragment().msl);
             try {
+                long tPipe = System.nanoTime();
                 long handle = Native.pipelineCreate(device.ctx(), MemoryUtil.memAddress(stack.UTF8(this.name)), MemoryUtil.memAddress(vs),
                     MemoryUtil.memAddress(stack.UTF8(compiled.vertex().entryPoint)), MemoryUtil.memAddress(fs),
                     MemoryUtil.memAddress(stack.UTF8(debugSolid ? "mmDebugSolid" : compiled.fragment().entryPoint)), MemoryUtil.memAddress(layouts), layoutCount,
                     MemoryUtil.memAddress(attribs), attribCount, MemoryUtil.memAddress(targets), formats.length, MemoryUtil.memAddress(raster),
                     MemoryUtil.memAddress(bias), hasDepth, MemoryUtil.memAddress(err), err.capacity());
+                CompileTiming.pipeline(this.name, System.nanoTime() - tPipe);
                 if (handle == 0L) {
                     LOGGER.error("Metal rejected override pipeline {}: {}", this.name, MemoryUtil.memUTF8(MemoryUtil.memAddress(err)));
                 }

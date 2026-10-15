@@ -1453,11 +1453,13 @@ public final class MetalGL {
             ByteBuffer vs = MemoryUtil.memUTF8(compiled.vertex().msl);
             ByteBuffer fs = MemoryUtil.memUTF8(compiled.fragment().msl);
             try {
+                long tPipe = System.nanoTime();
                 long handle = Native.pipelineCreate(device.ctx(), MemoryUtil.memAddress(stack.UTF8(name)), MemoryUtil.memAddress(vs),
                     MemoryUtil.memAddress(stack.UTF8(compiled.vertex().entryPoint)), MemoryUtil.memAddress(fs),
                     MemoryUtil.memAddress(stack.UTF8(compiled.fragment().entryPoint)), MemoryUtil.memAddress(layouts), 1, MemoryUtil.memAddress(attribs),
                     attribCount, MemoryUtil.memAddress(targets), count, MemoryUtil.memAddress(raster), MemoryUtil.memAddress(bias), hasDepth,
                     MemoryUtil.memAddress(err), err.capacity());
+                CompileTiming.pipeline(name, System.nanoTime() - tPipe);
                 if (handle == 0L) {
                     LOGGER.error("Metal rejected pipeline for {}: {}", name, MemoryUtil.memUTF8(MemoryUtil.memAddress(err)));
                     if (Boolean.getBoolean("minemetal.dumpShaders")) {

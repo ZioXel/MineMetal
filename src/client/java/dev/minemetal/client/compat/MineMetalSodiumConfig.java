@@ -50,6 +50,14 @@ public final class MineMetalSodiumConfig implements ConfigEntryPoint {
                         .setValueFormatter(v -> Component.literal(v + "%"))
                         .setDefaultValue(80)
                         .setBinding(MetalUpscaler::setSharpnessPercent, MetalUpscaler::sharpnessPercent)
+                        .setStorageHandler(() -> { })))
+                .addOptionGroup(builder.createOptionGroup()
+                    .addOption(builder.createBooleanOption(id("shadow_half_rate"))
+                        .setName(Component.translatable("minemetal.options.shadowHalfRate"))
+                        .setTooltip(Component.translatable("minemetal.options.shadowHalfRate.tooltip"))
+                        .setImpact(OptionImpact.HIGH)
+                        .setDefaultValue(false)
+                        .setBinding(MetalUpscaler::setShadowHalfRate, MetalUpscaler::shadowHalfRateSetting)
                         .setStorageHandler(() -> { }))));
     }
 }
