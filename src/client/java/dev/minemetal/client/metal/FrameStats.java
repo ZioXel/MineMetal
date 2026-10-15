@@ -86,9 +86,11 @@ final class FrameStats {
                         mode, out.get(6) > 0 ? 1e6 / out.get(6) : 0.0, out.get(0), out.get(1), out.get(2), ms(out.get(4)), out.get(5));
                 }
             }
-            LOGGER.info("MineMetal stats: {} fps, frame max {} ms, gpu-wait avg {} / max {} ms, hitches {}{} | {}",
+            long[] clears = Native.clearDeferredStats();
+            LOGGER.info("MineMetal stats: {} fps, frame max {} ms, gpu-wait avg {} / max {} ms, hitches {}{} | {} | clears folded {}, flushed {}",
                 String.format("%.0f", this.frames / seconds), ms(this.maxFrameNs),
-                ms(this.frames > 0 ? this.totalWaitNs / this.frames : 0), ms(this.maxWaitNs), this.hitches, surfaceInfo, poolStats);
+                ms(this.frames > 0 ? this.totalWaitNs / this.frames : 0), ms(this.maxWaitNs), this.hitches, surfaceInfo, poolStats,
+                clears[0], clears[1]);
             this.summaryStart = now;
             this.frames = 0;
             this.maxFrameNs = 0L;

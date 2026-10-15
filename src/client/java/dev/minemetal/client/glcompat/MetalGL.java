@@ -917,10 +917,22 @@ public final class MetalGL {
             if (count == 0 && depthView == 0L) {
                 return;
             }
+            if (DEFER_CLEARS && (mask & GL_STENCIL_BUFFER_BIT) == 0) {
+                // Folded into the next pass that renders to these images (no separate full-image write).
+                Native.clearDeferred(device.ctx(), MemoryUtil.memAddress(views), count, MemoryUtil.memAddress(colors), depthView, clearDepth);
+                return;
+            }
             Native.passBegin(device.ctx(), MemoryUtil.memAddress(views), count, clearMask, MemoryUtil.memAddress(colors), depthView, clearDepth, 0, 0, w, h, 0L);
             Native.passEnd(device.ctx());
         }
     }
+
+    /**
+     * -Dminemetal.deferClears=true: record glClear and fold it into the load action of the next pass that renders to the
+     * image. Off by default: with Iris every other encoder in between (shadow pass, compute) has to flush the pending
+     * clears first, so in practice nothing got folded (measured: 0 folded / all flushed, same fps).
+     */
+    private static final boolean DEFER_CLEARS = Boolean.getBoolean("minemetal.deferClears");
 
     /** glCopyTexSubImage2D: copies from the read framebuffer's read buffer into the bound texture (same pixel format). */
     public static void glCopyTexSubImage2D(final int target, final int level, final int xoffset, final int yoffset, final int x, final int y,

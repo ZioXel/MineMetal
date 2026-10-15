@@ -25,17 +25,17 @@ public final class FrameTrace {
             return;
         }
         last = what;
-        if (count++ < 600) {
+        if (count++ < 3000) {
             LOG.append("\n  ").append(what);
         }
     }
 
-    /** Called at every present: starts recording 25 s after launch, logs the recorded frame at the next present. */
+    /** Called at every present: starts recording 90 s after launch (-Dminemetal.traceFrameAt=seconds), logs that frame. */
     public static void framePresented() {
         if (!ENABLED) {
             return;
         }
-        if (state == 0 && System.nanoTime() - START_NANOS > 25_000_000_000L) {
+        if (state == 0 && System.nanoTime() - START_NANOS > Long.getLong("minemetal.traceFrameAt", 90L) * 1_000_000_000L) {
             state = 1;
         } else if (state == 1) {
             state = 2;

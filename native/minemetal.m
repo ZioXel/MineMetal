@@ -564,7 +564,156 @@ static void mm_prof_attach_render(MMContext *ctx, MTLRenderPassDescriptor *rp) {
     a.endOfFragmentSampleIndex = s * 4 + 3;
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Deferred clears (glClear from the GL emulation, e.g. Iris clearing its colortex buffers every frame).
+// Instead of a separate pass that writes the whole image, the clear is folded into the load action of the next render
+// pass that attaches the image (Apple GPUs clear in tile memory for free). Any other GPU work first flushes the
+// remaining clears as plain clear passes, so sampling, copies, compute and readback always see cleared contents.
+// ---------------------------------------------------------------------------------------------------------------------
+
+#define MM_MAX_PENDING_CLEARS 32
+static id<MTLTexture> g_pcTex[MM_MAX_PENDING_CLEARS];
+static BOOL g_pcIsDepth[MM_MAX_PENDING_CLEARS];
+static MTLClearColor g_pcColor[MM_MAX_PENDING_CLEARS];
+static double g_pcDepth[MM_MAX_PENDING_CLEARS];
+static int g_pcCount;
+static int g_pcFlushing;
+static int64_t g_pcFolded, g_pcFlushed;
+
+static BOOL mm_same_image(id<MTLTexture> a, id<MTLTexture> b) {
+    if (a == b) return YES;
+    if (a == nil || b == nil) return NO;
+    id<MTLTexture> ba = a.parentTexture ?: a, bb = b.parentTexture ?: b;
+    if (ba != bb) return NO;
+    NSUInteger la = a.parentTexture ? a.parentRelativeLevel : 0, lb = b.parentTexture ? b.parentRelativeLevel : 0;
+    NSUInteger sa = a.parentTexture ? a.parentRelativeSlice : 0, sb = b.parentTexture ? b.parentRelativeSlice : 0;
+    return la == lb && sa == sb;
+}
+
+static void mm_pc_remove(int i) {
+    g_pcCount--;
+    g_pcTex[i] = g_pcTex[g_pcCount];
+    g_pcIsDepth[i] = g_pcIsDepth[g_pcCount];
+    g_pcColor[i] = g_pcColor[g_pcCount];
+    g_pcDepth[i] = g_pcDepth[g_pcCount];
+    g_pcTex[g_pcCount] = nil;
+}
+
+/** Turns pending clears of images this pass attaches into its load actions. */
+static void mm_pc_fold(MTLRenderPassDescriptor *rp) {
+    for (int a = 0; a < 8 && g_pcCount > 0; a++) {
+        MTLRenderPassColorAttachmentDescriptor *ca = rp.colorAttachments[a];
+        if (ca.texture == nil || ca.level != 0 || ca.slice != 0) continue;
+        for (int i = 0; i < g_pcCount; i++) {
+            if (g_pcIsDepth[i] || !mm_same_image(ca.texture, g_pcTex[i])) continue;
+            if (ca.loadAction == MTLLoadActionLoad) {
+                ca.loadAction = MTLLoadActionClear;
+                ca.clearColor = g_pcColor[i];
+            }
+            mm_pc_remove(i);
+            g_pcFolded++;
+            break;
+        }
+    }
+    MTLRenderPassDepthAttachmentDescriptor *da = rp.depthAttachment;
+    if (da.texture != nil && g_pcCount > 0 && da.level == 0 && da.slice == 0) {
+        for (int i = 0; i < g_pcCount; i++) {
+            if (!g_pcIsDepth[i] || !mm_same_image(da.texture, g_pcTex[i])) continue;
+            if (da.loadAction == MTLLoadActionLoad) {
+                da.loadAction = MTLLoadActionClear;
+                da.clearDepth = g_pcDepth[i];
+            }
+            mm_pc_remove(i);
+            g_pcFolded++;
+            break;
+        }
+    }
+}
+
+static id<MTLRenderCommandEncoder> mm_render_encoder(MMContext *ctx, MTLRenderPassDescriptor *rp);
+
+/** Encodes all remaining pending clears as clear passes. Callers must not have an encoder open. */
+static void mm_pc_flush(MMContext *ctx) {
+    if (g_pcCount == 0 || g_pcFlushing) return;
+    g_pcFlushing = 1;
+    for (int i = 0; i < g_pcCount; i++) {
+        id<MTLTexture> t = g_pcTex[i];
+        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        if (g_pcIsDepth[i]) {
+            rp.depthAttachment.texture = t;
+            rp.depthAttachment.loadAction = MTLLoadActionClear;
+            rp.depthAttachment.clearDepth = g_pcDepth[i];
+            rp.depthAttachment.storeAction = MTLStoreActionStore;
+            if (t.pixelFormat == MTLPixelFormatDepth32Float_Stencil8) {
+                rp.stencilAttachment.texture = t;
+                rp.stencilAttachment.loadAction = MTLLoadActionLoad;
+                rp.stencilAttachment.storeAction = MTLStoreActionStore;
+            }
+        } else {
+            rp.colorAttachments[0].texture = t;
+            rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+            rp.colorAttachments[0].clearColor = g_pcColor[i];
+            rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        }
+        id<MTLRenderCommandEncoder> enc = mm_render_encoder(ctx, rp);
+        enc.label = @"MineMetal deferred clear";
+        [enc endEncoding];
+        g_pcTex[i] = nil;
+        g_pcFlushed++;
+    }
+    g_pcCount = 0;
+    g_pcFlushing = 0;
+}
+
+static void mm_pc_add(id<MTLTexture> t, BOOL depth, MTLClearColor color, double depthValue) {
+    for (int i = 0; i < g_pcCount; i++) {
+        if (g_pcIsDepth[i] == depth && mm_same_image(g_pcTex[i], t)) {
+            g_pcColor[i] = color;
+            g_pcDepth[i] = depthValue;
+            return;
+        }
+    }
+    g_pcTex[g_pcCount] = t;
+    g_pcIsDepth[g_pcCount] = depth;
+    g_pcColor[g_pcCount] = color;
+    g_pcDepth[g_pcCount] = depthValue;
+    g_pcCount++;
+}
+
+/**
+ * glClear without scissor/stencil: records the clears instead of encoding a pass. Always succeeds (returns 1).
+ * colors: count * 4 floats; NULL views are skipped; depthView may be NULL.
+ */
+MM_EXPORT int mm_clear_deferred(void *p, void **views, int count, const float *colors, void *depthView, double depth) {
+    @autoreleasepool {
+        MMContext *ctx = CTX(p);
+        int needed = (depthView != NULL ? 1 : 0);
+        for (int i = 0; i < count; i++) if (views[i] != NULL) needed++;
+        if (g_pcCount + needed > MM_MAX_PENDING_CLEARS) {
+            mm_end_encoders(ctx);
+            mm_pc_flush(ctx);
+        }
+        for (int i = 0; i < count; i++) {
+            if (views[i] == NULL) continue;
+            mm_pc_add((__bridge id<MTLTexture>)views[i], NO,
+                      MTLClearColorMake(colors[i * 4], colors[i * 4 + 1], colors[i * 4 + 2], colors[i * 4 + 3]), 0.0);
+        }
+        if (depthView != NULL) mm_pc_add((__bridge id<MTLTexture>)depthView, YES, MTLClearColorMake(0, 0, 0, 0), depth);
+        return 1;
+    }
+}
+
+/** out: [0] folded into a pass, [1] flushed as separate clear passes (since start). */
+MM_EXPORT void mm_clear_deferred_stats(int64_t *out) {
+    out[0] = g_pcFolded;
+    out[1] = g_pcFlushed;
+}
+
 static id<MTLRenderCommandEncoder> mm_render_encoder(MMContext *ctx, MTLRenderPassDescriptor *rp) {
+    if (g_pcCount > 0 && !g_pcFlushing) {
+        mm_pc_fold(rp);
+        mm_pc_flush(ctx);
+    }
     mm_prof_maybe_split(ctx);
     mm_prof_attach_render(ctx, rp);
     mm_cmd(ctx);
@@ -573,6 +722,7 @@ static id<MTLRenderCommandEncoder> mm_render_encoder(MMContext *ctx, MTLRenderPa
 }
 
 static id<MTLBlitCommandEncoder> mm_new_blit_encoder(MMContext *ctx) {
+    mm_pc_flush(ctx);
     mm_prof_maybe_split(ctx);
     mm_cmd(ctx);
     ctx->profCbEncoders++;
@@ -637,6 +787,7 @@ MM_EXPORT uint64_t mm_submit(void *p) {
     @autoreleasepool {
         MMContext *ctx = CTX(p);
         mm_end_encoders(ctx);
+        mm_pc_flush(ctx);
         uint64_t index = ctx->submitIndex++;
         id<MTLCommandBuffer> cmd = mm_cmd(ctx);  // creates an empty one if nothing was recorded
         MMContext *weakCtx = ctx;  // the context outlives all command buffers (destroy waits)
@@ -1057,7 +1208,7 @@ MM_EXPORT int mm_pass_begin(void *p, void **colorViews, int count, int clearMask
         int dontCare = ctx->nextDontCare;
         ctx->nextDontCare = 0;
         if (ctx.render != nil && ctx->renderLingering && !ctx->renderStorage && clearMask == 0 && count == ctx->rpCount && count <= 8
-            && depthView == ctx->rpDepth && !g_noCoalesce) {
+            && depthView == ctx->rpDepth && !g_noCoalesce && g_pcCount == 0) {
             BOOL same = YES;
             for (int i = 0; i < count; i++) {
                 if (colorViews[i] != ctx->rpColor[i]) { same = NO; break; }
@@ -1603,6 +1754,7 @@ MM_EXPORT void *mm_pipeline_create(void *p, const char *name, const char *vsSrc,
     double avgFrameTime;
     double lastTargetVsync;
     int64_t statPacedSkips;
+    BOOL smooth;                        // paced + even frame spacing (presentDrawable:afterMinimumDuration:)
 }
 @property(nonatomic, strong) CAMetalLayer *layer;
 @property(nonatomic, strong) id<CAMetalDrawable> drawable;
@@ -1616,6 +1768,7 @@ MM_EXPORT void *mm_pipeline_create(void *p, const char *name, const char *vsSrc,
 #define MM_PRESENT_FIFO 0      // VSync on: block for a drawable every frame
 #define MM_PRESENT_PACED 1     // VSync off: render unlimited, present the newest frame once per refresh
 #define MM_PRESENT_IMMEDIATE 2 // VSync off, unpaced: present whenever a drawable is free (old behaviour)
+#define MM_PRESENT_SMOOTH 3    // VSync off, paced, frames spaced evenly by the measured frame time (ProMotion-friendly)
 #define MM_GPU_MARGIN 0.0025   // time from commit to "on glass" budget (GPU work + compositor)
 
 MM_EXPORT void *mm_surface_create(void *p, void *layerPtr) {
@@ -1645,6 +1798,8 @@ MM_EXPORT void *mm_surface_create(void *p, void *layerPtr) {
 MM_EXPORT void mm_surface_configure(void *surfacePtr, int width, int height, int mode) {
     MMSurface *s = (__bridge MMSurface *)surfacePtr;
     s.layer.drawableSize = CGSizeMake(MAX(width, 1), MAX(height, 1));
+    s->smooth = mode == MM_PRESENT_SMOOTH;
+    if (mode == MM_PRESENT_SMOOTH) mode = MM_PRESENT_PACED;
     s.mode = mode;
     s.vsync = mode == MM_PRESENT_FIFO;
     // Paced mode presents at most once per refresh, so it can keep display sync on (no tearing) without blocking.
@@ -1766,7 +1921,19 @@ MM_EXPORT void mm_surface_blit(void *p, void *surfacePtr, void *srcView, int cop
             [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
         }
         [enc endEncoding];
-        [mm_cmd(ctx) presentDrawable:s.drawable];
+        if (s->smooth && s.mode == MM_PRESENT_PACED) {
+            // Even frame spacing: never show a frame sooner than the average frame time after the previous one.
+            // At e.g. 34 fps on a 120 Hz panel this avoids the 3-3-4-3 refresh cadence that reads as stutter; on
+            // ProMotion in fullscreen the display adapts its refresh to this spacing.
+            double iv = atomic_load(&s->refreshInterval);
+            double dur = s->avgFrameTime * 0.97;
+            if (dur < iv * 0.9) dur = 0.0;           // fast frame rates: plain once-per-refresh pacing
+            if (dur > 0.1) dur = 0.1;
+            if (dur > 0.0) [mm_cmd(ctx) presentDrawable:s.drawable afterMinimumDuration:dur];
+            else [mm_cmd(ctx) presentDrawable:s.drawable];
+        } else {
+            [mm_cmd(ctx) presentDrawable:s.drawable];
+        }
         s->statPresented++;
         s.drawable = nil;
     }
@@ -1823,6 +1990,7 @@ MM_EXPORT int mm_compute_max_threads(void *psoPtr) {
 static id<MTLComputeCommandEncoder> mm_compute_encoder(MMContext *ctx) {
     if (ctx.compute == nil) {
         mm_end_encoders(ctx);
+        mm_pc_flush(ctx);
         ctx.compute = [mm_cmd(ctx) computeCommandEncoder];
     }
     return ctx.compute;
@@ -2066,6 +2234,7 @@ MM_EXPORT int mm_upscale(void *p, void *srcPtr, void *dstPtr, int mode, float sh
         id<MTLTexture> dst = (__bridge id<MTLTexture>)dstPtr;
         if (src == nil || dst == nil) return -1;
         mm_end_encoders(ctx);
+        mm_pc_flush(ctx);
         if (sharpness < 0.0f) sharpness = 0.0f;
         if (sharpness > 1.0f) sharpness = 1.0f;
         float stops = (1.0f - sharpness) * 2.0f;  // RCAS: 0 stops = maximum sharpening
@@ -2160,6 +2329,7 @@ MM_EXPORT int mm_upscale_temporal(void *p, void *colorPtr, void *dstPtr, const f
         if (g_taUnsupported || color == nil || dst == nil || params == NULL || g_taDepth == nil
                 || g_taDepth.width != color.width || g_taDepth.height != color.height) return -1;
         mm_end_encoders(ctx);
+        mm_pc_flush(ctx);
         NSUInteger w = color.width, h = color.height;
 
         // 1. Motion vectors (camera reprojection of the scene depth).
@@ -2276,4 +2446,12 @@ MM_EXPORT int mm_upscale_temporal(void *p, void *colorPtr, void *dstPtr, const f
         mm_end_encoders(ctx);
         return 4;
     }
+}
+
+/** Debug: out = [width, height, pixelFormat, usage, storageMode, mipmapLevelCount, arrayLength, textureType]. */
+MM_EXPORT void mm_texture_describe(void *texPtr, int64_t *out) {
+    id<MTLTexture> t = (__bridge id<MTLTexture>)texPtr;
+    if (t == nil || out == NULL) return;
+    out[0] = (int64_t)t.width; out[1] = (int64_t)t.height; out[2] = (int64_t)t.pixelFormat; out[3] = (int64_t)t.usage;
+    out[4] = (int64_t)t.storageMode; out[5] = (int64_t)t.mipmapLevelCount; out[6] = (int64_t)t.arrayLength; out[7] = (int64_t)t.textureType;
 }

@@ -56,6 +56,9 @@ public final class MetalProfiler {
 
     /** Marks the start of a phase (render thread). Cheap no-op when profiling is off. */
     public static void phase(final String name) {
+        if (FrameTrace.active()) {
+            FrameTrace.event("== " + name);
+        }
         if (!active) {
             return;
         }

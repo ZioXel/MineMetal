@@ -54,8 +54,14 @@ public final class MetalSurface implements GpuSurfaceBackend {
         if (config.presentMode() == GpuSurface.PresentMode.FIFO) {
             mode = Native.PRESENT_FIFO;
         } else {
-            // VSync off: unlimited rendering, newest frame shown once per refresh. -Dminemetal.unpaced=true = raw mode.
-            mode = Boolean.getBoolean("minemetal.unpaced") ? Native.PRESENT_IMMEDIATE : Native.PRESENT_PACED;
+            // VSync off: unlimited rendering, newest frame shown once per refresh, evenly spaced when the frame rate is
+            // below the refresh rate. -Dminemetal.pacing=paced (no even spacing) / raw (= -Dminemetal.unpaced=true).
+            String pacing = System.getProperty("minemetal.pacing", Boolean.getBoolean("minemetal.unpaced") ? "raw" : "smooth");
+            mode = switch (pacing) {
+                case "raw" -> Native.PRESENT_IMMEDIATE;
+                case "paced" -> Native.PRESENT_PACED;
+                default -> Native.PRESENT_SMOOTH;
+            };
         }
         Native.surfaceConfigure(this.handle, config.width(), config.height(), mode);
     }

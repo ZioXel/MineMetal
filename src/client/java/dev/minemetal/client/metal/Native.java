@@ -80,7 +80,7 @@ public final class Native {
         PASS_SET_BYTES, PASS_SET_TEXTURE, PASS_SET_SAMPLER, PASS_SET_TEXEL_BUFFER, PASS_SET_INDEX_BUFFER, PASS_DRAW, PASS_DRAW_INDEXED,
         PASS_MULTI_DRAW, PASS_MULTI_DRAW_INDEXED, PASS_DRAW_INDIRECT, PASS_DRAW_INDEXED_INDIRECT, PIPELINE_CREATE, SURFACE_CREATE,
         SURFACE_CONFIGURE, SURFACE_ACQUIRE, SURFACE_BLIT, SURFACE_DROP, SET_FAST_MATH, SET_COALESCE, SET_NEXT_PASS_DONT_CARE, SET_GPU_DEBUG, SET_DEPTH_FLIP, PROF_ENABLE, PROF_SET_TAG, PROF_READ, SURFACE_STATS, PASS_SET_VIEWPORT, GENERATE_MIPMAPS, SAMPLER_CREATE_EX,
-        COMPUTE_PIPELINE_CREATE, COMPUTE_MAX_THREADS, COMPUTE_SET_PIPELINE, COMPUTE_SET_BUFFER, COMPUTE_SET_BYTES, COMPUTE_SET_TEXTURE, COMPUTE_SET_SAMPLER, COMPUTE_DISPATCH, COMPUTE_DISPATCH_INDIRECT, MEMORY_BARRIER, PASS_MARK_STORAGE, FILL_BUFFER, TEXTURE_ZERO, COPY_TEXTURE_ALL, UPSCALE, UPSCALE_CAPTURE_DEPTH, UPSCALE_TEMPORAL;
+        COMPUTE_PIPELINE_CREATE, COMPUTE_MAX_THREADS, COMPUTE_SET_PIPELINE, COMPUTE_SET_BUFFER, COMPUTE_SET_BYTES, COMPUTE_SET_TEXTURE, COMPUTE_SET_SAMPLER, COMPUTE_DISPATCH, COMPUTE_DISPATCH_INDIRECT, MEMORY_BARRIER, PASS_MARK_STORAGE, FILL_BUFFER, TEXTURE_ZERO, COPY_TEXTURE_ALL, UPSCALE, UPSCALE_CAPTURE_DEPTH, UPSCALE_TEMPORAL, TEXTURE_DESCRIBE, CLEAR_DEFERRED, CLEAR_DEFERRED_STATS;
 
     private static void bind() {
         ENUM = h("mm_enum", f(JAVA_LONG, P, P));
@@ -163,6 +163,9 @@ public final class Native {
         COPY_TEXTURE_ALL = h("mm_copy_texture_all", v(P, P, P));
         UPSCALE = h("mm_upscale", f(JAVA_INT, P, P, P, JAVA_INT, JAVA_FLOAT));
         UPSCALE_CAPTURE_DEPTH = h("mm_upscale_capture_depth", v(P, P));
+        TEXTURE_DESCRIBE = h("mm_texture_describe", v(P, P));
+        CLEAR_DEFERRED = h("mm_clear_deferred", f(JAVA_INT, P, P, JAVA_INT, P, P, JAVA_DOUBLE));
+        CLEAR_DEFERRED_STATS = h("mm_clear_deferred_stats", v(P));
         UPSCALE_TEMPORAL = h("mm_upscale_temporal", f(JAVA_INT, P, P, P, P, JAVA_INT, JAVA_FLOAT));
         SAMPLER_CREATE_EX = h("mm_sampler_create_ex",
             f(P, P, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_FLOAT, JAVA_FLOAT, JAVA_LONG));
@@ -283,6 +286,7 @@ public final class Native {
     }
 
     public static void copyTextureToTexture(long ctx, long src, long dst, int mip, int srcX, int srcY, int dstX, int dstY, int w, int h) {
+        trace("copyTextureToTexture");
         try {
             COPY_TEXTURE_TO_TEXTURE.invokeExact(ctx, src, dst, mip, srcX, srcY, dstX, dstY, w, h);
         } catch (Throwable t) {
@@ -291,15 +295,18 @@ public final class Native {
     }
 
     public static void clearColorTexture(long ctx, long texture, float r, float g, float b, float a) {
+        trace("clearColorTexture");
         try { CLEAR_COLOR_TEXTURE.invokeExact(ctx, texture, r, g, b, a); } catch (Throwable t) { throw rethrow(t); }
     }
 
     public static void clearDepthTexture(long ctx, long texture, double depth) {
+        trace("clearDepthTexture");
         try { CLEAR_DEPTH_TEXTURE.invokeExact(ctx, texture, depth); } catch (Throwable t) { throw rethrow(t); }
     }
 
     public static void clearRegion(long ctx, long color, long depth, int mip, float r, float g, float b, float a, double clearDepth,
                                    int x, int y, int w, int h) {
+        trace("clearRegion");
         try {
             CLEAR_REGION.invokeExact(ctx, color, depth, mip, r, g, b, a, clearDepth, x, y, w, h);
         } catch (Throwable t) {
@@ -311,8 +318,72 @@ public final class Native {
 
     public static boolean passBegin(long ctx, long colorViews, int count, int clearMask, long clearColors, long depthView,
                                     double clearDepth, int x, int y, int w, int h, long label) {
+        if (FrameTrace.active()) {
+            tracePass(colorViews, count, clearMask, depthView, x, y, w, h);
+        }
         try {
             return (int) PASS_BEGIN.invokeExact(ctx, colorViews, count, clearMask, clearColors, depthView, clearDepth, x, y, w, h, label) != 0;
+        } catch (Throwable t) {
+            throw rethrow(t);
+        }
+    }
+
+    // --- frame trace (-Dminemetal.traceFrame=true): what each render pass loads/stores ------------------------------
+
+    private static long[] lastPassViews = new long[0];
+    private static long lastPassDepth;
+
+    /** "1708x960 fmt115 private rt|sr" for a texture handle (debug only). */
+    public static String describeTexture(long tex) {
+        if (tex == 0L) {
+            return "-";
+        }
+        try (org.lwjgl.system.MemoryStack stack = org.lwjgl.system.MemoryStack.stackPush()) {
+            java.nio.LongBuffer out = stack.callocLong(8);
+            TEXTURE_DESCRIBE.invokeExact(tex, org.lwjgl.system.MemoryUtil.memAddress(out));
+            return out.get(0) + "x" + out.get(1) + " fmt" + out.get(2) + " usage" + out.get(3) + " storage" + out.get(4)
+                + (out.get(5) > 1 ? " mips" + out.get(5) : "");
+        } catch (Throwable t) {
+            return "?";
+        }
+    }
+
+    private static void tracePass(long colorViews, int count, int clearMask, long depthView, int x, int y, int w, int h) {
+        long[] views = new long[count];
+        for (int i = 0; i < count; i++) {
+            views[i] = colorViews == 0L ? 0L : org.lwjgl.system.MemoryUtil.memGetAddress(colorViews + (long) i * 8L);
+        }
+        boolean same = java.util.Arrays.equals(views, lastPassViews) && depthView == lastPassDepth;
+        StringBuilder b = new StringBuilder("pass ").append(same ? "SAME-TARGETS " : "NEW-TARGETS ");
+        b.append("clear=").append(Integer.toHexString(clearMask)).append(" area=").append(x).append(',').append(y).append(' ')
+            .append(w).append('x').append(h).append(" |");
+        for (int i = 0; i < count; i++) {
+            b.append(" c").append(i).append('[').append(describeTexture(views[i])).append(']');
+        }
+        b.append(" d[").append(describeTexture(depthView)).append(']');
+        lastPassViews = views;
+        lastPassDepth = depthView;
+        FrameTrace.event(b.toString());
+    }
+
+    private static void trace(final String what) {
+        if (FrameTrace.active()) {
+            FrameTrace.event(what);
+        }
+    }
+
+    /** Records clears to be folded into the next pass that attaches each image (see mm_clear_deferred). */
+    public static void clearDeferred(long ctx, long views, int count, long colors, long depthView, double depth) {
+        trace("clearDeferred");
+        try { int ignored = (int) CLEAR_DEFERRED.invokeExact(ctx, views, count, colors, depthView, depth); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    /** [folded, flushed] deferred clears since start. */
+    public static long[] clearDeferredStats() {
+        try (org.lwjgl.system.MemoryStack stack = org.lwjgl.system.MemoryStack.stackPush()) {
+            java.nio.LongBuffer out = stack.callocLong(2);
+            CLEAR_DEFERRED_STATS.invokeExact(org.lwjgl.system.MemoryUtil.memAddress(out));
+            return new long[]{out.get(0), out.get(1)};
         } catch (Throwable t) {
             throw rethrow(t);
         }
@@ -425,6 +496,7 @@ public final class Native {
     public static final int PRESENT_FIFO = 0;
     public static final int PRESENT_PACED = 1;
     public static final int PRESENT_IMMEDIATE = 2;
+    public static final int PRESENT_SMOOTH = 3;
 
     public static void surfaceConfigure(long surface, int width, int height, int presentMode) {
         try { SURFACE_CONFIGURE.invokeExact(surface, width, height, presentMode); } catch (Throwable t) { throw rethrow(t); }
@@ -435,6 +507,7 @@ public final class Native {
     }
 
     public static void surfaceBlit(long ctx, long surface, long srcView, int copyWidth, int copyHeight) {
+        trace("present");
         try { SURFACE_BLIT.invokeExact(ctx, surface, srcView, copyWidth, copyHeight); } catch (Throwable t) { throw rethrow(t); }
     }
 
@@ -507,6 +580,7 @@ public final class Native {
     }
 
     public static void computeDispatch(long ctx, int gx, int gy, int gz, int tx, int ty, int tz) {
+        trace("computeDispatch");
         try { COMPUTE_DISPATCH.invokeExact(ctx, gx, gy, gz, tx, ty, tz); } catch (Throwable t) { throw rethrow(t); }
     }
 
@@ -515,6 +589,7 @@ public final class Native {
     }
 
     public static void memoryBarrier(long ctx) {
+        trace("memoryBarrier");
         try { MEMORY_BARRIER.invokeExact(ctx); } catch (Throwable t) { throw rethrow(t); }
     }
 
@@ -527,10 +602,12 @@ public final class Native {
     }
 
     public static void textureZero(long ctx, long texture, int level, int bytesPerPixel) {
+        trace("textureZero");
         try { TEXTURE_ZERO.invokeExact(ctx, texture, level, bytesPerPixel); } catch (Throwable t) { throw rethrow(t); }
     }
 
     public static void copyTextureAll(long ctx, long src, long dst) {
+        trace("copyTextureAll");
         try { COPY_TEXTURE_ALL.invokeExact(ctx, src, dst); } catch (Throwable t) { throw rethrow(t); }
     }
 
