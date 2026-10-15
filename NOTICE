@@ -1,0 +1,19 @@
+MineMetal - native Apple Metal renderer for Minecraft Java Edition
+Copyright (C) 2026 ZioXel  (https://github.com/ZioXel/MineMetal)
+
+MineMetal is free software: you can redistribute it and/or modify it under the terms of the
+GNU Lesser General Public License, version 3 only (see LICENSE), which builds on the
+GNU General Public License, version 3 (see LICENSE-GPL-3.0).
+
+Additional term (GPL-3.0 section 7(b), applies to MineMetal and works based on it):
+anyone who distributes MineMetal, a modified version of it, or a work that includes parts of it
+must preserve this NOTICE file and visibly credit the original author, e.g.
+"Based on MineMetal by ZioXel - https://github.com/ZioXel/MineMetal", in the place where the
+work is described to its users (mod page, README or about screen).
+
+Third-party code:
+- AMD FidelityFX Super Resolution 1.0 shaders (native/fsr_shaders.h, tools/fsr/):
+  Copyright (c) 2021 Advanced Micro Devices, Inc., MIT license (tools/fsr/LICENSE-FSR.txt).
+
+Minecraft is a trademark of Mojang/Microsoft. MineMetal is not affiliated with Mojang, Microsoft,
+Apple, AMD or the Iris team.

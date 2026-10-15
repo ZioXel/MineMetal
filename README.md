@@ -32,7 +32,8 @@ Complementary's colored lighting, which Apple's OpenGL driver cannot do at all.
 | Shader packs: world (terrain, entities, particles, sky, hand) | ✅ |
 | Shader packs: shadows | ✅ |
 | Compute shaders / image load-store / SSBOs | ✅ |
-| Fullscreen performance with heavy packs | 🚧 being optimised |
+| Fullscreen performance with heavy packs | ✅ with upscaling (MetalFX / AMD FSR 1), ~2× fps |
+| MetalFX Temporal (upscaling + anti-aliasing) | 🧪 experimental (slight wobble with view bobbing/jumping) |
 
 ### Shader packs tested (M2 MacBook Air, 1708×960 window)
 
@@ -44,7 +45,9 @@ Complementary's colored lighting, which Apple's OpenGL driver cannot do at all.
 | MakeUp Ultra Fast 9.5g | ✅ |
 | Sildur's Vibrant 2.02 | ✅ |
 
-Heavy packs are GPU-bound at full Retina resolution (BSL ~25 fps fullscreen); that is the next thing being worked on.
+Heavy packs are GPU-bound at full Retina resolution. Upscaling fixes most of that, e.g. Complementary Unbound
+(VERYHIGH) fullscreen at 3600×2260 on an M2 Pro: **~17 fps native → ~40 fps with MetalFX at 50 % render scale**,
+GUI still at full resolution (see below).
 
 ## Upscaling (MetalFX / AMD FSR 1)
 
@@ -108,4 +111,7 @@ Useful flags: `-PmetalHud` (Apple's performance HUD), `-PmetalValidation` (Metal
 
 ## License
 
-CC0-1.0. Minecraft is a trademark of Mojang/Microsoft; this project is not affiliated with them, Apple or the Iris team.
+Copyright (C) 2026 ZioXel. Licensed under the **GNU LGPL-3.0** (see `LICENSE`, `LICENSE-GPL-3.0` and
+`NOTICE`). You may use, modify and redistribute MineMetal, but you must keep the license, publish your changes under the
+same license and **credit the original author**, e.g. *"Based on MineMetal by ZioXel - https://github.com/ZioXel/MineMetal"*.
+Minecraft is a trademark of Mojang/Microsoft; this project is not affiliated with them, Apple or the Iris team.
