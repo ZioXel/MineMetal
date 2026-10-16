@@ -2455,3 +2455,44 @@ MM_EXPORT void mm_texture_describe(void *texPtr, int64_t *out) {
     out[0] = (int64_t)t.width; out[1] = (int64_t)t.height; out[2] = (int64_t)t.pixelFormat; out[3] = (int64_t)t.usage;
     out[4] = (int64_t)t.storageMode; out[5] = (int64_t)t.mipmapLevelCount; out[6] = (int64_t)t.arrayLength; out[7] = (int64_t)t.textureType;
 }
+
+// --- NeoForge 1.21.1 port: GLFW NO_API window + CAMetalLayer ---------------------------------------------------------
+#include <objc/message.h>
+
+/** Attaches a new CAMetalLayer to an NSWindow's content view (GLFW window created with GLFW_NO_API). Main thread. */
+MM_EXPORT void *mm_layer_for_nswindow(void *nswindow) {
+    @autoreleasepool {
+        id win = (__bridge id)nswindow;
+        if (win == nil) return NULL;
+        id view = ((id (*)(id, SEL))objc_msgSend)(win, sel_registerName("contentView"));
+        if (view == nil) return NULL;
+        CGFloat scale = ((CGFloat (*)(id, SEL))objc_msgSend)(win, sel_registerName("backingScaleFactor"));
+        CAMetalLayer *layer = [CAMetalLayer layer];
+        layer.contentsScale = scale > 0 ? scale : 1.0;
+        ((void (*)(id, SEL, id))objc_msgSend)(view, sel_registerName("setLayer:"), layer);
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(view, sel_registerName("setWantsLayer:"), YES);
+        return (__bridge_retained void *)layer;
+    }
+}
+
+/** Milestone-1 present: clears a drawable to the given colour and presents it. */
+MM_EXPORT void mm_neo_present_clear(void *p, void *surfacePtr, float r, float g, float b, float a) {
+    @autoreleasepool {
+        MMContext *ctx = CTX(p);
+        MMSurface *s = (__bridge MMSurface *)surfacePtr;
+        if (s.drawable == nil && !mm_surface_take_drawable(s)) return;
+        mm_end_encoders(ctx);
+        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+        rp.colorAttachments[0].texture = s.drawable.texture;
+        rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+        rp.colorAttachments[0].clearColor = MTLClearColorMake(r, g, b, a);
+        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+        id<MTLRenderCommandEncoder> enc = mm_render_encoder(ctx, rp);
+        enc.label = @"MineMetal neo clear";
+        [enc endEncoding];
+        [mm_cmd(ctx) presentDrawable:s.drawable];
+        s->statPresented++;
+        s.drawable = nil;
+    }
+    mm_submit(p);
+}

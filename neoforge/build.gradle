@@ -27,6 +27,30 @@ neoForge {
     }
 }
 
+// GLSL -> SPIR-V -> MSL (shaderc + SPIRV-Cross). Minecraft 1.21.1 ships LWJGL 3.3.3 without these modules.
+def lwjglVersion = '3.3.3'
+configurations {
+    shaderNatives { transitive = false }
+}
+dependencies {
+    implementation "org.lwjgl:lwjgl-spvc:${lwjglVersion}"
+    additionalRuntimeClasspath "org.lwjgl:lwjgl-spvc:${lwjglVersion}"
+    jarJar("org.lwjgl:lwjgl-spvc:[${lwjglVersion}]") { transitive = false }
+    // newer libshaderc (vulkan_rules_relaxed); called through our own FFM binding, not LWJGL's class
+    shaderNatives "org.lwjgl:lwjgl-shaderc:3.3.6:natives-macos-arm64"
+    shaderNatives "org.lwjgl:lwjgl-spvc:${lwjglVersion}:natives-macos-arm64"
+}
+// The dylibs are shipped as plain resources and loaded by absolute path (LWJGL's classpath lookup does not see
+// other modules' resources under the module layer).
+tasks.register('extractShaderNatives', Copy) {
+    from({ configurations.shaderNatives.collect { zipTree(it) } }) {
+        include '**/*.dylib'
+        eachFile { path = name }
+    }
+    includeEmptyDirs = false
+    into layout.buildDirectory.dir('native/natives/macos')
+}
+
 // Native Metal bridge, shared with the 26.3 Fabric mod (../native).
 def nativeOut = layout.buildDirectory.dir('native')
 tasks.register('compileMetalNative', Exec) {
@@ -44,11 +68,15 @@ tasks.register('compileMetalNative', Exec) {
         '-install_name', '@rpath/libminemetal.dylib', '-o', outFile.absolutePath, src.absolutePath
 }
 processResources {
-    dependsOn 'compileMetalNative'
+    dependsOn 'compileMetalNative', 'extractShaderNatives'
     from(nativeOut)
     def props = [mod_version: project.mod_version, minecraft_version: project.minecraft_version, neo_version: project.neo_version]
     inputs.properties props
     filesMatching('META-INF/neoforge.mods.toml') { expand props }
 }
 
-tasks.withType(JavaCompile).configureEach { options.encoding = 'UTF-8' }
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    // FFM is final since 22; class files stay readable by the ASM in NeoForge 21.1
+    options.release = 22
+}

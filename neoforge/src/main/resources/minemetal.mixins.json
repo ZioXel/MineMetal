@@ -1,7 +1,7 @@
 {
   "required": true,
   "package": "dev.minemetal.neo.mixin",
-  "compatibilityLevel": "JAVA_21",
-  "client": [],
+  "compatibilityLevel": "JAVA_22",
+  "client": ["WindowMixin", "RenderSystemMixin"],
   "injectors": { "defaultRequire": 1 }
 }

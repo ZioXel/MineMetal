@@ -10,3 +10,19 @@ Plan:
 1. Window: no OpenGL context, a CAMetalLayer instead; LWJGL's OpenGL function pointers point at MineMetal (FFM upcalls).
 2. Vanilla 1.21.1 renders through MetalGL (reports OpenGL 4.1 core, like Apple's driver, so mods take their Mac paths).
 3. Sodium, Iris, Create/Flywheel, then the rest of ATM10.
+
+## Milestone 1 (in progress): Metal window + null GL driver
+- `WindowMixin`: window created with `GLFW_NO_API`, no `glfwMakeContextCurrent`; `GL.createCapabilities()` is
+  replaced by `MetalBootstrap.init` (CAMetalLayer on the NSWindow, LWJGL `GL.create(NeoGL.PROVIDER)`).
+- `NeoGL`: LWJGL FunctionProvider made of FFM upcall stubs. Reports OpenGL 4.1 core, hands out object names,
+  every shader compiles. Unimplemented functions are logged (`[MineMetal GL] unimplemented: ...`) with call counts.
+- `RenderSystemMixin`: `glfwSwapBuffers` → Metal present (clears to the last `glClearColor`).
+- Needs `earlyWindowControl = false` in `run/config/fml.toml` (NeoForge's early loading window is OpenGL).
+
+## Milestone 2 (in progress): real rendering through Metal
+- `gl/Gl.java`: GL state machine → Metal. Buffers (new MTLBuffer per glBufferData, old ones released when the GPU is
+  done), textures (+ samplers from texture parameters), framebuffers (default framebuffer = backbuffer textures),
+  programs (GLSL → SPIR-V → MSL at link time via the shared `GlProgramCompiler`), VAOs, draws, clears, blits.
+- `gl/GlEntry.java`: the upcall targets (C signatures); `NeoGL` guards them so an exception never kills the JVM.
+- shaderc + SPIRV-Cross (LWJGL 3.3.3) are jar-in-jar'd; their macOS dylibs ship as resources.
+- GL CCW front faces map to MTLWindingClockwise (verified). Debug env vars: MM_FLIPWINDING, MM_NOCULL, MM_NOBLEND, MM_NODEPTH.
