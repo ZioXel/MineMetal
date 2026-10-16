@@ -519,19 +519,50 @@ final class GlEntry {
         Gl.draw(mode, count, type, indices, 0, true);
     }
 
+    static void glDrawElementsBaseVertex(int mode, int count, int type, long indices, int base) {
+        Gl.drawElementsBaseVertex(mode, count, type, indices, base);
+    }
+
+    static void glMultiDrawElementsBaseVertex(int mode, long counts, int type, long indices, int drawCount, long base) {
+        Gl.multiDrawElements(mode, counts, type, indices, drawCount, base);
+    }
+
+    static void glMultiDrawElements(int mode, long counts, int type, long indices, int drawCount) {
+        Gl.multiDrawElements(mode, counts, type, indices, drawCount, 0L);
+    }
+
+    static void glCopyBufferSubData(int readTarget, int writeTarget, long readOffset, long writeOffset, long size) {
+        Gl.copyBufferSubData(readTarget, writeTarget, readOffset, writeOffset, size);
+    }
+
+    static void ignoreIIJ(int a, int b, long c) {
+    }
+
+    static void glDeleteSync(long sync) {
+        Gl.deleteSync(sync);
+    }
+
     // ---- sync / queries / no-ops -----------------------------------------------------------------------------------
 
     static long glFenceSync(int condition, int flags) {
-        return Gl.gen();
+        return Gl.fenceSync();
     }
 
     static int glClientWaitSync(long sync, int flags, long timeout) {
-        return 0x911A; // ALREADY_SIGNALED (commands are ordered on one queue)
+        return Gl.clientWaitSync(sync, flags, timeout);
     }
 
     static void glGetSynciv(long sync, int pname, int bufSize, long length, long values) {
         if (length != 0L) MemoryUtil.memPutInt(length, 1);
-        if (values != 0L && bufSize > 0) MemoryUtil.memPutInt(values, pname == 0x9114 ? 0x9119 : 0);
+        if (values != 0L && bufSize > 0) {
+            int v = switch (pname) {
+                case 0x9114 -> Gl.fenceSignaled(sync) ? 0x9119 : 0x9118; // SYNC_STATUS: SIGNALED / UNSIGNALED
+                case 0x9112 -> 0x9116;                                  // OBJECT_TYPE: SYNC_FENCE
+                case 0x9113 -> 0x9117;                                  // SYNC_CONDITION: GPU_COMMANDS_COMPLETE
+                default -> 0;
+            };
+            MemoryUtil.memPutInt(values, v);
+        }
     }
 
     static void queryObject(int id, int pname, long ptr) {

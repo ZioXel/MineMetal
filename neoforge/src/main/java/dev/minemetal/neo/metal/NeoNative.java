@@ -32,7 +32,7 @@ public final class NeoNative {
     private static MethodHandle COPY_BUFFER_TO_TEXTURE, COPY_TEXTURE_TO_TEXTURE, COPY_TEXTURE_TO_BUFFER;
     private static MethodHandle PASS_BEGIN, PASS_END, PASS_SET_VIEWPORT, PASS_SET_SCISSOR, PASS_SET_PIPELINE, PASS_SET_VERTEX_BUFFER;
     private static MethodHandle PASS_SET_BYTES, PASS_SET_TEXTURE, PASS_SET_SAMPLER, PASS_SET_INDEX_BUFFER, PASS_DRAW, PASS_DRAW_INDEXED;
-    private static MethodHandle PIPELINE_CREATE, SURFACE_ACQUIRE, SURFACE_BLIT;
+    private static MethodHandle PIPELINE_CREATE, SURFACE_ACQUIRE, SURFACE_BLIT, MULTI_DRAW_INDEXED, COPY_BUFFER, WAIT;
 
     private NeoNative() {
     }
@@ -92,6 +92,9 @@ public final class NeoNative {
         PASS_DRAW = hc("mm_pass_draw", FunctionDescriptor.ofVoid(P, I, I, I, I));
         PASS_DRAW_INDEXED = hc("mm_pass_draw_indexed", FunctionDescriptor.ofVoid(P, I, I, I, I, I));
         PIPELINE_CREATE = h("mm_pipeline_create", FunctionDescriptor.of(P, P, P, P, P, P, P, P, I, P, I, P, I, P, P, I, P, I));
+        MULTI_DRAW_INDEXED = hc("mm_pass_multi_draw_indexed", FunctionDescriptor.ofVoid(P, P, I, I, I));
+        COPY_BUFFER = h("mm_copy_buffer", FunctionDescriptor.ofVoid(P, P, J, P, J, J));
+        WAIT = h("mm_wait", FunctionDescriptor.of(I, P, J, J));
         SURFACE_ACQUIRE = h("mm_surface_acquire", FunctionDescriptor.of(I, P));
         SURFACE_BLIT = h("mm_surface_blit", FunctionDescriptor.ofVoid(P, P, P, I, I));
     }
@@ -280,5 +283,19 @@ public final class NeoNative {
 
     public static void surfaceBlit(long ctx, long surface, long srcView, int w, int h) {
         try { SURFACE_BLIT.invokeExact(ctx, surface, srcView, w, h); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    /** params: drawCount triples (firstIndex, indexCount, vertexOffset). */
+    public static void passMultiDrawIndexed(long ctx, long params, int instances, int firstInstance, int drawCount) {
+        try { MULTI_DRAW_INDEXED.invokeExact(ctx, params, instances, firstInstance, drawCount); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    public static void copyBuffer(long ctx, long src, long srcOffset, long dst, long dstOffset, long size) {
+        try { COPY_BUFFER.invokeExact(ctx, src, srcOffset, dst, dstOffset, size); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    /** Waits until submit {@code index} completed; returns true if it did within the timeout. */
+    public static boolean waitFor(long ctx, long index, long timeoutNs) {
+        try { return (int) WAIT.invokeExact(ctx, index, timeoutNs) != 0; } catch (Throwable t) { throw rethrow(t); }
     }
 }

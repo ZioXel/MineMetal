@@ -1253,6 +1253,78 @@ public final class Gl {
         if (TRACED.add(currentProgram)) LOG.info("[MineMetal GL] fragment MSL of program {}:\n{}", currentProgram, p.result.fragment().msl);
     }
 
+    // multi-draw / base-vertex arguments for the next draw() (set by the entry points, cleared after)
+    static int multiCount, baseVertex;
+    static long multiCounts, multiIndices, multiBase;
+
+    /** glMultiDrawElements(BaseVertex): one pass, one pipeline, many indexed draws. */
+    static void multiDrawElements(int mode, long counts, int type, long indices, int drawCount, long baseVertices) {
+        if (drawCount <= 0) return;
+        if (drawCount > 2048) {
+            for (int off = 0; off < drawCount; off += 2048) {
+                multiDrawElements(mode, counts + off * 4L, type, indices + off * 8L, Math.min(2048, drawCount - off),
+                    baseVertices != 0L ? baseVertices + off * 4L : 0L);
+            }
+            return;
+        }
+        multiCount = drawCount;
+        multiCounts = counts;
+        multiIndices = indices;
+        multiBase = baseVertices;
+        try {
+            draw(mode, 1, type, 0L, 0, true);
+        } finally {
+            multiCount = 0;
+        }
+    }
+
+    static void drawElementsBaseVertex(int mode, int count, int type, long indices, int base) {
+        baseVertex = base;
+        try {
+            draw(mode, count, type, indices, 0, true);
+        } finally {
+            baseVertex = 0;
+        }
+    }
+
+    static void copyBufferSubData(int readTarget, int writeTarget, long readOffset, long writeOffset, long size) {
+        Buf src = buffer(readTarget), dst = buffer(writeTarget);
+        if (src == null || dst == null || src.mtl == 0L || dst.mtl == 0L || size <= 0) return;
+        if (readOffset + size > src.size || writeOffset + size > dst.size) return;
+        NeoNative.copyBuffer(ctx, src.mtl, readOffset, dst.mtl, writeOffset, size);
+    }
+
+    // ---- fences ----------------------------------------------------------------------------------------------------
+
+    private static final it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap FENCES = new it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap();
+    private static long nextFence = 1;
+
+    /** A GL sync object is the submit index of the command buffer being recorded when it was created. */
+    static long fenceSync() {
+        long id = nextFence++;
+        FENCES.put(id, NeoNative.currentSubmitIndex(ctx));
+        return id;
+    }
+
+    static boolean fenceSignaled(long sync) {
+        long idx = FENCES.get(sync);
+        return idx == 0L || NeoNative.completedIndex(ctx) >= idx;
+    }
+
+    /** glClientWaitSync: flushes (submits) the fence's command buffer if needed, then waits. */
+    static int clientWaitSync(long sync, int flags, long timeoutNs) {
+        long idx = FENCES.get(sync);
+        if (idx == 0L || NeoNative.completedIndex(ctx) >= idx) return 0x911A; // ALREADY_SIGNALED
+        if (timeoutNs <= 0L && (flags & 1) == 0) return 0x911B;           // TIMEOUT_EXPIRED
+        if (NeoNative.currentSubmitIndex(ctx) <= idx) NeoNative.submit(ctx);
+        if (timeoutNs <= 0L) return 0x911B;
+        return NeoNative.waitFor(ctx, idx, timeoutNs) ? 0x911C : 0x911B; // CONDITION_SATISFIED / TIMEOUT_EXPIRED
+    }
+
+    static void deleteSync(long sync) {
+        FENCES.remove(sync);
+    }
+
     static void draw(int mode, int count, int indexType, long indexOffset, int first, boolean indexed) {
         if (count <= 0) return;
         Program p = PROGRAMS.get(currentProgram);
@@ -1318,10 +1390,22 @@ public final class Gl {
                     NeoNative.passSetTexture(ctx, 3, tex, i);
                     NeoNative.passSetSampler(ctx, 3, smp, i % 16);
                 }
-                if (indexed) {
+                if (indexed && multiCount > 0) {
+                    boolean is32 = indexType == 0x1405;
+                    int isz = is32 ? 4 : 2;
+                    NeoNative.passSetIndexBuffer(ctx, ebo.mtl, is32);
+                    long params = stack.nmalloc(4, multiCount * 12);
+                    for (int i = 0; i < multiCount; i++) {
+                        long base = params + i * 12L;
+                        MemoryUtil.memPutInt(base, (int) (MemoryUtil.memGetAddress(multiIndices + i * 8L) / isz));
+                        MemoryUtil.memPutInt(base + 4, MemoryUtil.memGetInt(multiCounts + i * 4L));
+                        MemoryUtil.memPutInt(base + 8, multiBase != 0L ? MemoryUtil.memGetInt(multiBase + i * 4L) : 0);
+                    }
+                    NeoNative.passMultiDrawIndexed(ctx, params, 1, 0, multiCount);
+                } else if (indexed) {
                     boolean is32 = indexType == 0x1405;
                     NeoNative.passSetIndexBuffer(ctx, ebo.mtl, is32);
-                    NeoNative.passDrawIndexed(ctx, count, 1, (int) (indexOffset / (is32 ? 4 : 2)), 0, 0);
+                    NeoNative.passDrawIndexed(ctx, count, 1, (int) (indexOffset / (is32 ? 4 : 2)), baseVertex, 0);
                 } else {
                     NeoNative.passDraw(ctx, count, 1, first, 0);
                 }

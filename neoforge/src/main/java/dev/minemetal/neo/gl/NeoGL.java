@@ -196,6 +196,11 @@ public final class NeoGL {
         // draws
         reg("glDrawArrays", v(I, I, I));
         reg("glDrawElements", v(I, I, I, J));
+        reg("glDrawElementsBaseVertex", v(I, I, I, J, I));
+        reg("glMultiDrawElementsBaseVertex", v(I, J, I, J, I, J));
+        reg("glMultiDrawElements", v(I, J, I, J, I));
+        reg("glCopyBufferSubData", v(I, I, J, J, J));
+        reg("glBindFragDataLocation", v(I, I, J), "ignoreIIJ");
         // sync and queries
         reg("glFenceSync", f(J, I, I));
         reg("glClientWaitSync", f(I, J, I, J));
@@ -210,7 +215,7 @@ public final class NeoGL {
         for (String g : new String[]{"glDrawBuffer", "glReadBuffer", "glLogicOp", "glProvokingVertex"}) reg(g, v(I), "ignore1");
         for (String g : new String[]{"glPolygonMode", "glBeginQuery", "glHint"}) reg(g, v(I, I), "ignore2");
         reg("glEndQuery", v(I), "ignore1");
-        reg("glDeleteSync", v(J), "ignoreJ");
+        reg("glDeleteSync", v(J));
         reg("glDrawBuffers", v(I, J), "ignoreNames");
     }
 
