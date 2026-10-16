@@ -190,6 +190,13 @@ public final class NeoGL {
         reg("glTexBuffer", v(I, I, I));
         reg("glTexBufferRange", v(I, I, I, J, J));
         reg("glVertexAttribDivisor", v(I, I));
+        reg("glBindSampler", v(I, I));
+        reg("glTexParameteriv", v(I, I, J));
+        reg("glCopyTexSubImage2D", v(I, I, I, I, I, I, I, I));
+        reg("glCopyTexImage2D", v(I, I, I, I, I, I, I, I));
+        reg("glSamplerParameteri", v(I, I, I));
+        reg("glSamplerParameterf", v(I, I, F));
+        reg("glDeleteSamplers", v(I, J), "ignoreNames");
         reg("glDrawArraysInstanced", v(I, I, I, I));
         reg("glDrawElementsInstanced", v(I, I, I, J, I));
         reg("glDrawElementsInstancedBaseVertex", v(I, I, I, J, I, I));

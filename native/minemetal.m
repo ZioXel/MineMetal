@@ -1601,10 +1601,21 @@ static id<MTLFunction> mm_compile_function(MMContext *ctx, const char *src, cons
         options.fastMathEnabled = g_fastMath ? YES : NO;
 #pragma clang diagnostic pop
     }
-    id<MTLLibrary> lib = [ctx.device newLibraryWithSource:[NSString stringWithUTF8String:src] options:options error:&error];
+    // Same MSL is compiled once per process: GL programs get one pipeline per blend/depth/format combination, and
+    // recompiling the source for each of them dominated the first-use hitches with shader packs.
+    static NSMutableDictionary<NSString *, id<MTLLibrary>> *libCache;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ libCache = [NSMutableDictionary dictionary]; });
+    NSString *source = [NSString stringWithUTF8String:src];
+    id<MTLLibrary> lib;
+    @synchronized (libCache) { lib = libCache[source]; }
     if (lib == nil) {
-        mm_copy_error(err, errLen, [NSString stringWithFormat:@"%@ shader: %@", what, error.localizedDescription]);
-        return nil;
+        lib = [ctx.device newLibraryWithSource:source options:options error:&error];
+        if (lib == nil) {
+            mm_copy_error(err, errLen, [NSString stringWithFormat:@"%@ shader: %@", what, error.localizedDescription]);
+            return nil;
+        }
+        @synchronized (libCache) { libCache[source] = lib; }
     }
     id<MTLFunction> fn = [lib newFunctionWithName:[NSString stringWithUTF8String:entry]];
     if (fn == nil) {

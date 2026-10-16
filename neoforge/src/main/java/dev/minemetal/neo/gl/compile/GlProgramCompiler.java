@@ -43,7 +43,7 @@ public final class GlProgramCompiler {
     static final int MAX_SSBOS = 9;
     static final int BUFFER_SIZE_BUFFER = 19;
     /** Metal limits per stage: 16 sampler states; textures (combined samplers + storage images): 32 GL units + 8 images. */
-    static final int MAX_SAMPLER_STATES = 16;
+    public static final int MAX_SAMPLER_STATES = 16;
     static final int MAX_TEXTURES = 40;
     private static final int DECORATION_LOCATION = 30;
     private static final int DECORATION_BINDING = 33;

@@ -138,6 +138,7 @@ public final class Gl {
         h = mix(h, polygonOffset ? Float.floatToIntBits(offsetFactor) | (long) Float.floatToIntBits(offsetUnits) << 32 : 3);
         for (int i = 0; i < colorCount; i++) h = mix(h, A_FORMATS[i]);
         h = mix(h, A_DEPTH[0] != 0L ? 1 : 2);
+        h = mix(h, p.samplerKey.hashCode());
         return h;
     }
 
@@ -192,6 +193,11 @@ public final class Gl {
         final it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap pipelinesByHash = new it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap();
         // last pipeline used, valid while nothing that feeds the pipeline key changed
         int[] inputLocs = new int[0];
+        String vsSrc, fsSrc;
+        GlProgramCompiler.Result active;
+        int[] samplerSlots;
+        String samplerKey = "";
+        final Map<String, GlProgramCompiler.Result> samplerVariants = new HashMap<>();
         final List<String> blockNames = new ArrayList<>();
         int[] blockBindings = new int[0];
         int memoVersion = -1, memoVao = -1, memoMode = -1, memoFbo = -1, memoSlots;
@@ -227,7 +233,9 @@ public final class Gl {
     // ---- state -----------------------------------------------------------------------------------------------------
 
     static int activeUnit;
-    static final int[] units = new int[32];
+    static final int[] units = new int[48];
+    static final int[] boundSamplerObjs = new int[48];
+    static final Int2ObjectOpenHashMap<Tex> SAMPLER_OBJS = new Int2ObjectOpenHashMap<>();
     static int arrayBuffer, currentProgram, vao, drawFbo, readFbo, renderbuffer;
     static final Map<Integer, Integer> otherBuffers = new HashMap<>();
     static final int[] viewport = new int[4];
@@ -593,9 +601,41 @@ public final class Gl {
 
     static long sampler(Tex t) {
         if (t.sampler != 0L) return t.sampler;
+        t.sampler = samplerState(t, t.mips);
+        return t.sampler;
+    }
+
+    /** Sampler state for texture {@code tex} on {@code unit}: a bound sampler object overrides the texture's own parameters. */
+    static long samplerFor(Tex tex, int unit) {
+        int so = unit >= 0 && unit < boundSamplerObjs.length ? boundSamplerObjs[unit] : 0;
+        Tex params = so != 0 ? SAMPLER_OBJS.get(so) : null;
+        return params == null ? sampler(tex) : samplerState(params, tex.mips);
+    }
+
+    static Tex samplerObject(int id) {
+        return SAMPLER_OBJS.computeIfAbsent(id, k -> new Tex());
+    }
+
+    static void samplerParameter(int sampler, int pname, float value) {
+        Tex t = samplerObject(sampler);
+        switch (pname) {
+            case 0x2801 -> t.minFilter = (int) value;
+            case 0x2800 -> t.magFilter = (int) value;
+            case 0x2802 -> t.wrapS = (int) value;
+            case 0x2803 -> t.wrapT = (int) value;
+            case 0x884C -> t.compareMode = (int) value;
+            case 0x884D -> t.compareFunc = (int) value;
+            case 0x84FE -> t.aniso = value;
+            case 0x813B -> t.maxLevel = (int) value;
+            default -> {
+            }
+        }
+    }
+
+    private static long samplerState(Tex t, int mips) {
         int min = t.minFilter;
         boolean minLinear = min == 0x2601 || min == 0x2701 || min == 0x2703;
-        int mip = t.mips <= 1 ? 0 : (min == 0x2700 || min == 0x2701) ? 1 : (min == 0x2702 || min == 0x2703) ? 2 : 0;
+        int mip = mips <= 1 ? 0 : (min == 0x2700 || min == 0x2701) ? 1 : (min == 0x2702 || min == 0x2703) ? 2 : 0;
         int aniso = Math.max(1, Math.min(16, (int) t.aniso));
         long compare = t.compareMode == 0x884E ? t.compareFunc - 0x200 : -1;
         long key = addr(t.wrapS) | (long) addr(t.wrapT) << 2 | (minLinear ? 1L : 0) << 4 | (t.magFilter == 0x2601 ? 1L : 0) << 5
@@ -606,7 +646,6 @@ public final class Gl {
                 0f, Math.min(t.maxLevel, 1000), compare);
             SAMPLERS.put(key, s);
         }
-        t.sampler = s;
         return s;
     }
 
@@ -744,6 +783,29 @@ public final class Gl {
         }
     }
 
+    /** glCopyTexSubImage2D: read framebuffer's first color attachment → bound texture (same pixel format only). */
+    static void copyTexSubImage(int level, int dx, int dy, int sx, int sy, int w, int h) {
+        Tex t = boundTexture();
+        if (t == null || t.mtl == 0L || w <= 0 || h <= 0) return;
+        long[] sc = new long[8], sf = new long[8], sd = new long[1];
+        if (attachments(readFbo, sc, sf, sd) < 0) return;
+        long src = t.depth ? sd[0] : sc[0];
+        long srcFormat = t.depth ? PF_D32 : sf[0];
+        if (src == 0L) return;
+        if (srcFormat != t.pf) {
+            warnOnce("copytex" + srcFormat + "_" + t.pf, "glCopyTexSubImage2D between formats " + srcFormat + " and " + t.pf + " is not supported yet");
+            return;
+        }
+        NeoNative.copyTextureToTexture(ctx, src, view(t, level), 0, sx, sy, dx, dy, w, h);
+    }
+
+    static void copyTexImage(int level, int ifmt, int x, int y, int w, int h) {
+        Tex t = boundTexture();
+        if (t == null) return;
+        if (t.mtl == 0L || t.w != w || t.h != h || t.pf != internalFormat(ifmt)[0]) allocate(t, ifmt, w, h, Math.max(level + 1, 1));
+        copyTexSubImage(level, 0, 0, x, y, w, h);
+    }
+
     // ---- shaders and programs --------------------------------------------------------------------------------------
 
     static int createShader(int type) {
@@ -815,6 +877,12 @@ public final class Gl {
         }
         try {
             p.result = GlProgramCompiler.compile("program" + program, vs, fs);
+            p.vsSrc = vs;
+            p.fsSrc = fs;
+            p.active = p.result;
+            p.samplerSlots = null;
+            p.samplerKey = "";
+            p.samplerVariants.clear();
         } catch (ShaderCompileException | RuntimeException e) {
             p.error = e.getMessage();
             LOG.error("[MineMetal GL] program {} failed to translate: {}", program, e.getMessage());
@@ -978,6 +1046,14 @@ public final class Gl {
         a.offset = offset;
     }
 
+    /** Metal requires the format's signedness to match the shader input (GL reinterprets freely). */
+    private static String vertexFormatName(Attrib a, int shaderBaseType) {
+        String n = vertexFormatName(a);
+        if (shaderBaseType == 7) n = n.replace("_UINT", "_SINT");
+        else if (shaderBaseType == 8) n = n.replace("_SINT", "_UINT");
+        return n;
+    }
+
     private static String vertexFormatName(Attrib a) {
         String c = switch (a.size) {
             case 1 -> "R";
@@ -1116,7 +1192,7 @@ public final class Gl {
             }
             if (slot < 0) continue;
             key.append(in.location()).append(':').append(slot).append(':').append(stride).append(':').append(a.offset).append(':')
-                .append(vertexFormatName(a)).append(',');
+                .append(vertexFormatName(a, in.baseType())).append(',');
         }
         // fixed-function state + attachment formats
         key.append('|').append(blend ? blendSrcRgb + "," + blendDstRgb + "," + blendSrcA + "," + blendDstA + "," + blendOpRgb + "," + blendOpA : "-")
@@ -1124,7 +1200,7 @@ public final class Gl {
             .append('|').append(cullFace ? cullMode : 0).append(frontFace).append('|')
             .append(polygonOffset ? offsetFactor + "," + offsetUnits : "-").append('|');
         for (int i = 0; i < colorCount; i++) key.append(A_FORMATS[i]).append(',');
-        key.append(A_DEPTH[0] != 0L ? 'D' : 'N');
+        key.append(A_DEPTH[0] != 0L ? 'D' : 'N').append(p.samplerKey);
         String k = key.toString();
         Long cached = p.pipelines.get(k);
         if (cached != null) return cached;
@@ -1134,7 +1210,7 @@ public final class Gl {
     }
 
     private static long createPipeline(Program p, Vao va, int mode, int colorCount, int slots, boolean needZero) {
-        GlProgramCompiler.StageResult vs = p.result.vertex(), fs = p.result.fragment();
+        GlProgramCompiler.StageResult vs = p.active.vertex(), fs = p.active.fragment();
         try (MemoryStack stack = MemoryStack.stackPush()) {
             int layoutCount = slots + (needZero ? 1 : 0);
             long layouts = stack.nmalloc(4, Math.max(layoutCount, 1) * 12);
@@ -1170,7 +1246,7 @@ public final class Gl {
                     MemoryUtil.memPutInt(base, in.location());
                     MemoryUtil.memPutInt(base + 4, VERTEX_SLOT_BASE + slot);
                     MemoryUtil.memPutInt(base + 8, (int) a.offset);
-                    MemoryUtil.memPutInt(base + 12, (int) vertexFormat(vertexFormatName(a)));
+                    MemoryUtil.memPutInt(base + 12, (int) vertexFormat(vertexFormatName(a, in.baseType())));
                 }
                 n++;
             }
@@ -1201,7 +1277,7 @@ public final class Gl {
             long bias = stack.nmalloc(4, 8);
             MemoryUtil.memPutFloat(bias, polygonOffset ? offsetUnits : 0f);
             MemoryUtil.memPutFloat(bias + 4, polygonOffset ? offsetFactor : 0f);
-            long err = stack.nmalloc(1, 1024);
+            long err = stack.nmalloc(1, 4096);
             MemoryUtil.memPutByte(err, (byte) 0);
             long t0 = System.nanoTime();
             ByteBuffer vsSrc = MemoryUtil.memUTF8(vs.msl), fsSrc = MemoryUtil.memUTF8(fs.msl);
@@ -1210,7 +1286,7 @@ public final class Gl {
                 pso = NeoNative.pipelineCreate(ctx, MemoryUtil.memAddress(stack.UTF8("gl-program-" + currentProgram)),
                     MemoryUtil.memAddress(vsSrc), MemoryUtil.memAddress(stack.UTF8(vs.entryPoint)),
                     MemoryUtil.memAddress(fsSrc), MemoryUtil.memAddress(stack.UTF8(fs.entryPoint)),
-                    layouts, layoutCount, attribs, attribCount, targets, targetCount, raster, bias, A_DEPTH[0] != 0L ? 1 : 0, err, 1024);
+                    layouts, layoutCount, attribs, attribCount, targets, targetCount, raster, bias, A_DEPTH[0] != 0L ? 1 : 0, err, 4096);
             } finally {
                 MemoryUtil.memFree(vsSrc);
                 MemoryUtil.memFree(fsSrc);
@@ -1228,6 +1304,41 @@ public final class Gl {
     }
 
     private static final StringBuilder KEY = new StringBuilder(256);
+    private static long[] SAMPLER_HANDLES = new long[64];
+
+    /**
+     * Metal has 16 sampler-state slots per stage. Programs with more combined samplers get an MSL variant in which
+     * samplers with the same state share a slot. Returns false if this draw needs more than 16 distinct states.
+     */
+    private static boolean planSamplers(Program p, long[] handles, int n) {
+        if (n <= GlProgramCompiler.MAX_SAMPLER_STATES) return true;
+        HashMap<Long, Integer> ids = new HashMap<>();
+        int[] map = new int[n];
+        for (int i = 0; i < n; i++) {
+            Integer existing = ids.get(handles[i]);
+            int slot = existing != null ? existing : ids.size();
+            if (existing == null) ids.put(handles[i], slot);
+            if (slot >= GlProgramCompiler.MAX_SAMPLER_STATES) return false;
+            map[i] = slot;
+        }
+        String key = java.util.Arrays.toString(map);
+        if (key.equals(p.samplerKey) && p.active != null) return true;
+        GlProgramCompiler.Result variant = p.samplerVariants.get(key);
+        if (variant == null) {
+            try {
+                variant = GlProgramCompiler.compile("program" + currentProgram + " samplers" + key, p.vsSrc, p.fsSrc, map);
+            } catch (ShaderCompileException | RuntimeException e) {
+                LOG.error("[MineMetal GL] sampler variant of program {} failed: {}", currentProgram, e.getMessage());
+                return false;
+            }
+            p.samplerVariants.put(key, variant);
+        }
+        p.active = variant;
+        p.samplerSlots = map;
+        p.samplerKey = key;
+        dirty();
+        return true;
+    }
     private static final Set<Integer> TRACED = new HashSet<>();
     private static final int TRACE_DRAWS = Integer.getInteger("minemetal.traceDraws", 0);
 
@@ -1452,6 +1563,17 @@ public final class Gl {
             try {
                 int colorCount = 0;
                 for (int i = 0; i < 8; i++) if (A_COLORS[i] != 0L) colorCount = i + 1;
+                int ns = p.samplerUnits.length;
+                if (SAMPLER_HANDLES.length < ns) SAMPLER_HANDLES = new long[ns * 2];
+                for (int i = 0; i < ns; i++) {
+                    int unit = p.samplerUnits[i];
+                    Tex t = unit >= 0 && unit < units.length ? TEXTURES.get(units[unit]) : null;
+                    SAMPLER_HANDLES[i] = t != null && t.mtl != 0L ? samplerFor(t, unit) : defaultSampler;
+                }
+                if (!planSamplers(p, SAMPLER_HANDLES, ns)) {
+                    warnOnce("smp" + currentProgram, "program " + currentProgram + " needs more than 16 distinct sampler states");
+                    return;
+                }
                 long pso = pipeline(p, va, mode, KEY, colorCount);
                 if (pso == 0L || !NeoNative.passSetPipeline(ctx, pso)) {
                     warnOnce("pso" + currentProgram, "pipeline unusable for program " + currentProgram);
@@ -1491,9 +1613,8 @@ public final class Gl {
                         continue;
                     }
                     long tex = t != null && t.mtl != 0L ? t.mtl : dummyTexture;
-                    long smp = t != null && t.mtl != 0L ? sampler(t) : defaultSampler;
                     NeoNative.passSetTexture(ctx, 3, tex, i);
-                    NeoNative.passSetSampler(ctx, 3, smp, i % 16);
+                    NeoNative.passSetSampler(ctx, 3, SAMPLER_HANDLES[i], p.samplerSlots != null ? p.samplerSlots[i] : i);
                 }
                 if (indexed && multiCount > 0) {
                     boolean is32 = indexType == 0x1405;

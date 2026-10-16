@@ -50,8 +50,9 @@ final class GlEntry {
             case 0x0D33, 0x84E8, 0x851C -> 16384; // MAX_TEXTURE_SIZE, MAX_RENDERBUFFER_SIZE, MAX_CUBE_MAP_TEXTURE_SIZE
             case 0x8073 -> 2048;         // MAX_3D_TEXTURE_SIZE
             case 0x88FF -> 2048;         // MAX_ARRAY_TEXTURE_LAYERS
-            case 0x8872, 0x8B4C -> 16;   // MAX_TEXTURE_IMAGE_UNITS, MAX_VERTEX_TEXTURE_IMAGE_UNITS
-            case 0x8B4D -> 32;           // MAX_COMBINED_TEXTURE_IMAGE_UNITS
+            // Metal allows 31+ textures per stage; sampler *states* are shared (16 slots) by the program compiler.
+            case 0x8872, 0x8B4C -> 32;   // MAX_TEXTURE_IMAGE_UNITS, MAX_VERTEX_TEXTURE_IMAGE_UNITS
+            case 0x8B4D -> 48;           // MAX_COMBINED_TEXTURE_IMAGE_UNITS
             case 0x8869 -> 16;           // MAX_VERTEX_ATTRIBS
             case 0x8824, 0x8CDF -> 8;    // MAX_DRAW_BUFFERS, MAX_COLOR_ATTACHMENTS
             case 0x8D57 -> 4;            // MAX_SAMPLES
@@ -488,6 +489,30 @@ final class GlEntry {
 
     static void glTexBufferRange(int target, int ifmt, int buffer, long offset, long size) {
         Gl.texBuffer(ifmt, buffer, offset, size);
+    }
+
+    static void glTexParameteriv(int target, int pname, long ptr) {
+        if (ptr != 0L) Gl.texParameter(target, pname, MemoryUtil.memGetInt(ptr));
+    }
+
+    static void glCopyTexSubImage2D(int target, int level, int xoff, int yoff, int x, int y, int w, int h) {
+        Gl.copyTexSubImage(level, xoff, yoff, x, y, w, h);
+    }
+
+    static void glCopyTexImage2D(int target, int level, int ifmt, int x, int y, int w, int h, int border) {
+        Gl.copyTexImage(level, ifmt, x, y, w, h);
+    }
+
+    static void glBindSampler(int unit, int sampler) {
+        if (unit >= 0 && unit < Gl.boundSamplerObjs.length) Gl.boundSamplerObjs[unit] = sampler;
+    }
+
+    static void glSamplerParameteri(int sampler, int pname, int value) {
+        Gl.samplerParameter(sampler, pname, value);
+    }
+
+    static void glSamplerParameterf(int sampler, int pname, float value) {
+        Gl.samplerParameter(sampler, pname, value);
     }
 
     static void glVertexAttribDivisor(int index, int divisor) {
