@@ -183,7 +183,21 @@ public final class NeoGL {
         reg("glGetProgramInfoLog", v(I, I, J, J));
         reg("glGetUniformLocation", f(I, I, J));
         reg("glGetAttribLocation", f(I, I, J));
-        reg("glGetUniformBlockIndex", f(I, I, J), "minusOneIJ");
+        reg("glGetUniformBlockIndex", f(I, I, J));
+        reg("glUniformBlockBinding", v(I, I, I));
+        reg("glBindBufferBase", v(I, I, I));
+        reg("glBindBufferRange", v(I, I, I, J, J));
+        reg("glTexBuffer", v(I, I, I));
+        reg("glTexBufferRange", v(I, I, I, J, J));
+        reg("glVertexAttribDivisor", v(I, I));
+        reg("glDrawArraysInstanced", v(I, I, I, I));
+        reg("glDrawElementsInstanced", v(I, I, I, J, I));
+        reg("glDrawElementsInstancedBaseVertex", v(I, I, I, J, I, I));
+        reg("glGetActiveUniformBlockiv", v(I, I, I, J), "writeZero4");
+        for (int n = 1; n <= 4; n++) {
+            reg("glUniform" + n + "ui", v(withFirstInt(n, I)), "uniform" + n + "i");
+            reg("glUniform" + n + "uiv", v(I, I, J), "uniform" + n + "iv");
+        }
         for (int n = 1; n <= 4; n++) {
             reg("glUniform" + n + "f", v(withFirstInt(n, F)), "uniform" + n + "f");
             reg("glUniform" + n + "i", v(withFirstInt(n, I)), "uniform" + n + "i");

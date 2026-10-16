@@ -98,7 +98,7 @@ public final class Gl {
     /** Bumped on every state change that affects pipeline selection (see Program.memo*). */
     static int stateVersion;
 
-    static long memoHits, memoMisses, hashHits, frames;
+    static long memoHits, memoMisses, hashHits, frames, midFrameSubmits, fenceWaits;
 
     private static long mix(long h, long v) {
         h ^= v + 0x9E3779B97F4A7C15L + (h << 6) + (h >>> 2);
@@ -121,13 +121,14 @@ public final class Gl {
             }
             int stride = a.stride > 0 ? a.stride : a.size * typeBytes(a.type);
             int slot = -1;
-            for (int s = 0; s < slots; s++) if (SLOT_BUFFERS[s] == a.buffer && SLOT_STRIDES[s] == stride) slot = s;
+            for (int s = 0; s < slots; s++) if (SLOT_BUFFERS[s] == a.buffer && SLOT_STRIDES[s] == stride && SLOT_DIVISOR[s] == a.divisor) slot = s;
             if (slot < 0 && slots < 8) {
                 slot = slots++;
                 SLOT_BUFFERS[slot] = a.buffer;
                 SLOT_STRIDES[slot] = stride;
+                SLOT_DIVISOR[slot] = a.divisor;
             }
-            h = mix(h, slot | (long) stride << 8 | a.offset << 24);
+            h = mix(h, (long) a.divisor << 40 ^ slot | (long) stride << 8 | a.offset << 24);
             h = mix(h, a.type | (long) a.size << 16 | (a.normalized ? 1L << 20 : 0) | (a.integer ? 1L << 21 : 0));
         }
         h = mix(h, blend ? blendSrcRgb | (long) blendDstRgb << 16 | (long) blendSrcA << 32 | (long) blendDstA << 48 : 7);
@@ -152,6 +153,9 @@ public final class Gl {
         float aniso = 1f;
         long sampler;
         final Int2ObjectOpenHashMap<Long> views = new Int2ObjectOpenHashMap<>();
+        // GL_TEXTURE_BUFFER: a view of a buffer object
+        int texBuffer = -1, texBufferBpp;
+        long texBufferFormat, texBufferOffset, texBufferSize = -1;
     }
 
     static final class Fbo {
@@ -188,15 +192,17 @@ public final class Gl {
         final it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap pipelinesByHash = new it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap();
         // last pipeline used, valid while nothing that feeds the pipeline key changed
         int[] inputLocs = new int[0];
+        final List<String> blockNames = new ArrayList<>();
+        int[] blockBindings = new int[0];
         int memoVersion = -1, memoVao = -1, memoMode = -1, memoFbo = -1, memoSlots;
         long memoPso;
-        final int[] memoSlotBuffers = new int[8], memoSlotStrides = new int[8];
+        final int[] memoSlotBuffers = new int[8], memoSlotStrides = new int[8], memoSlotDivisors = new int[8];
         boolean failedLogged;
     }
 
     static final class Attrib {
         boolean enabled, normalized, integer;
-        int buffer, size = 4, type = 0x1406, stride;
+        int buffer, size = 4, type = 0x1406, stride, divisor;
         long offset;
     }
 
@@ -315,9 +321,10 @@ public final class Gl {
         while (!RETIRED.isEmpty() && RETIRED.peekFirst()[0] <= done) NeoNative.release(RETIRED.pollFirst()[1]);
         POOL.collect(done);
         if (++frames % 1200 == 0) {
-            LOG.info("[MineMetal GL] frame {}: {} draws/frame, pipeline memo {}% / hash {}% hits, buffers created {} / reused {}", frames,
-                frameDraws, memoHits * 100 / Math.max(1, memoHits + memoMisses), hashHits * 100 / Math.max(1, memoMisses), POOL.created, POOL.reused);
+            LOG.info("[MineMetal GL] frame {}: {} draws/frame, pipeline memo {}% / hash {}% hits, buffers created {} / reused {}, fence waits {} (mid-frame submits {})", frames,
+                frameDraws, memoHits * 100 / Math.max(1, memoHits + memoMisses), hashHits * 100 / Math.max(1, memoMisses), POOL.created, POOL.reused, fenceWaits, midFrameSubmits);
             memoHits = memoMisses = hashHits = 0;
+            fenceWaits = midFrameSubmits = 0;
         }
         frameDraws = 0;
     }
@@ -799,6 +806,7 @@ public final class Gl {
         p.pipelines.clear();
         p.uniforms.clear();
         p.locations.clear();
+        p.blockNames.clear();
         p.result = null;
         p.error = null;
         if (vs == null || fs == null) {
@@ -817,6 +825,10 @@ public final class Gl {
         p.fsBlock = block(f.blockSize);
         for (GlProgramCompiler.BlockMember m : v.members) uniform(p, m.name()).vs = m;
         for (GlProgramCompiler.BlockMember m : f.members) uniform(p, m.name()).fs = m;
+        for (String b : v.extraBlocks.keySet()) if (!p.blockNames.contains(b)) p.blockNames.add(b);
+        for (String b : f.extraBlocks.keySet()) if (!p.blockNames.contains(b)) p.blockNames.add(b);
+        p.blockBindings = new int[p.blockNames.size()];
+        for (int i = 0; i < p.blockBindings.length; i++) p.blockBindings[i] = i;
         List<GlProgramCompiler.Interface> ins = v.inputs;
         p.inputLocs = new int[ins.size()];
         for (int i = 0; i < ins.size(); i++) {
@@ -1044,11 +1056,13 @@ public final class Gl {
     private static final int[] SLOT_BUFFERS = new int[8];
     private static final int[] SLOT_STRIDES = new int[8];
     private static final long[] SLOT_BASE_OFFSET = new long[8];
+    private static final int[] SLOT_DIVISOR = new int[8];
 
     private static long pipeline(Program p, Vao va, int mode, StringBuilder key, int colorCount) {
         if (p.memoPso != 0L && p.memoVersion == stateVersion && p.memoVao == vao && p.memoMode == mode && p.memoFbo == drawFbo) {
             System.arraycopy(p.memoSlotBuffers, 0, SLOT_BUFFERS, 0, 8);
             System.arraycopy(p.memoSlotStrides, 0, SLOT_STRIDES, 0, 8);
+            System.arraycopy(p.memoSlotDivisors, 0, SLOT_DIVISOR, 0, 8);
             memoHits++;
             return p.memoPso;
         }
@@ -1070,6 +1084,7 @@ public final class Gl {
         p.memoPso = pso;
         System.arraycopy(SLOT_BUFFERS, 0, p.memoSlotBuffers, 0, 8);
         System.arraycopy(SLOT_STRIDES, 0, p.memoSlotStrides, 0, 8);
+        System.arraycopy(SLOT_DIVISOR, 0, p.memoSlotDivisors, 0, 8);
         return pso;
     }
 
@@ -1091,11 +1106,12 @@ public final class Gl {
             }
             int stride = a.stride > 0 ? a.stride : a.size * typeBytes(a.type);
             int slot = -1;
-            for (int s = 0; s < slots; s++) if (SLOT_BUFFERS[s] == a.buffer && SLOT_STRIDES[s] == stride) slot = s;
+            for (int s = 0; s < slots; s++) if (SLOT_BUFFERS[s] == a.buffer && SLOT_STRIDES[s] == stride && SLOT_DIVISOR[s] == a.divisor) slot = s;
             if (slot < 0 && slots < 8) {
                 slot = slots++;
                 SLOT_BUFFERS[slot] = a.buffer;
                 SLOT_STRIDES[slot] = stride;
+                SLOT_DIVISOR[slot] = a.divisor;
                 SLOT_BASE_OFFSET[slot] = 0;
             }
             if (slot < 0) continue;
@@ -1125,7 +1141,7 @@ public final class Gl {
             for (int s = 0; s < slots; s++) {
                 MemoryUtil.memPutInt(layouts + s * 12L, VERTEX_SLOT_BASE + s);
                 MemoryUtil.memPutInt(layouts + s * 12L + 4, SLOT_STRIDES[s]);
-                MemoryUtil.memPutInt(layouts + s * 12L + 8, 0);
+                MemoryUtil.memPutInt(layouts + s * 12L + 8, SLOT_DIVISOR[s]);
             }
             if (needZero) {
                 MemoryUtil.memPutInt(layouts + slots * 12L, ZERO_SLOT);
@@ -1150,7 +1166,7 @@ public final class Gl {
                 } else {
                     int stride = a.stride > 0 ? a.stride : a.size * typeBytes(a.type);
                     int slot = 0;
-                    for (int s = 0; s < slots; s++) if (SLOT_BUFFERS[s] == a.buffer && SLOT_STRIDES[s] == stride) slot = s;
+                    for (int s = 0; s < slots; s++) if (SLOT_BUFFERS[s] == a.buffer && SLOT_STRIDES[s] == stride && SLOT_DIVISOR[s] == a.divisor) slot = s;
                     MemoryUtil.memPutInt(base, in.location());
                     MemoryUtil.memPutInt(base + 4, VERTEX_SLOT_BASE + slot);
                     MemoryUtil.memPutInt(base + 8, (int) a.offset);
@@ -1294,6 +1310,85 @@ public final class Gl {
         NeoNative.copyBuffer(ctx, src.mtl, readOffset, dst.mtl, writeOffset, size);
     }
 
+    // ---- uniform buffers, texture buffers, instancing ------------------------------------------------------------------
+
+    static final int[] UBO_BUFFER = new int[32];
+    static final long[] UBO_OFFSET = new long[32], UBO_SIZE = new long[32];
+
+    static void bindBufferRange(int target, int index, int buffer, long offset, long size) {
+        bindBuffer(target, buffer);
+        if (target == 0x8A11 && index >= 0 && index < 32) { // GL_UNIFORM_BUFFER
+            UBO_BUFFER[index] = buffer;
+            UBO_OFFSET[index] = offset;
+            UBO_SIZE[index] = size;
+        }
+    }
+
+    static int uniformBlockIndex(int program, String name) {
+        Program p = PROGRAMS.get(program);
+        return p == null ? -1 : p.blockNames.indexOf(name);
+    }
+
+    static void uniformBlockBinding(int program, int index, int binding) {
+        Program p = PROGRAMS.get(program);
+        if (p != null && index >= 0 && index < p.blockBindings.length) p.blockBindings[index] = binding;
+    }
+
+    private static void bindBlocks(Program p, GlProgramCompiler.StageResult stage, int stageBit) {
+        if (stage == null) return;
+        for (Map.Entry<String, Integer> e : stage.extraBlocks.entrySet()) {
+            int bi = p.blockNames.indexOf(e.getKey());
+            int binding = bi >= 0 ? p.blockBindings[bi] : -1;
+            if (binding < 0 || binding >= 32) continue;
+            Buf b = BUFFERS.get(UBO_BUFFER[binding]);
+            if (b == null || b.mtl == 0L) continue;
+            NeoNative.passSetBuffer(ctx, stageBit, b.mtl, UBO_OFFSET[binding], e.getValue());
+        }
+    }
+
+    /** glTexBuffer(Range): the bound GL_TEXTURE_BUFFER texture reads from {@code buffer}. */
+    static void texBuffer(int ifmt, int buffer, long offset, long size) {
+        Tex t = boundTexture();
+        if (t == null) return;
+        t.texBuffer = buffer;
+        t.texBufferOffset = offset;
+        t.texBufferSize = size;
+        String fmt;
+        switch (ifmt) {
+            case 0x8D70 -> { fmt = "RGBA32_UINT"; t.texBufferBpp = 16; }
+            case 0x823C -> { fmt = "RG32_UINT"; t.texBufferBpp = 8; }
+            case 0x8236 -> { fmt = "R32_UINT"; t.texBufferBpp = 4; }
+            case 0x8D82 -> { fmt = "RGBA32_SINT"; t.texBufferBpp = 16; }
+            case 0x8235 -> { fmt = "R32_SINT"; t.texBufferBpp = 4; }
+            case 0x8814 -> { fmt = "RGBA32_FLOAT"; t.texBufferBpp = 16; }
+            case 0x8230 -> { fmt = "RG32_FLOAT"; t.texBufferBpp = 8; }
+            case 0x822E -> { fmt = "R32_FLOAT"; t.texBufferBpp = 4; }
+            case 0x881A -> { fmt = "RGBA16_FLOAT"; t.texBufferBpp = 8; }
+            default -> { fmt = "RGBA8_UNORM"; t.texBufferBpp = 4; }
+        }
+        t.texBufferFormat = NeoNative.enumValue("pixel", fmt);
+    }
+
+    static void attribDivisor(int index, int divisor) {
+        if (index < 0 || index >= 16) return;
+        VAOS.get(vao).attribs[index].divisor = divisor;
+        dirty();
+    }
+
+    static int instances = 1;
+
+    static void drawInstanced(int mode, int count, int type, long indices, int base, int instanceCount, boolean indexed, int first) {
+        if (instanceCount <= 0) return;
+        instances = instanceCount;
+        baseVertex = base;
+        try {
+            draw(mode, count, type, indices, first, indexed);
+        } finally {
+            instances = 1;
+            baseVertex = 0;
+        }
+    }
+
     // ---- fences ----------------------------------------------------------------------------------------------------
 
     private static final it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap FENCES = new it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap();
@@ -1316,7 +1411,11 @@ public final class Gl {
         long idx = FENCES.get(sync);
         if (idx == 0L || NeoNative.completedIndex(ctx) >= idx) return 0x911A; // ALREADY_SIGNALED
         if (timeoutNs <= 0L && (flags & 1) == 0) return 0x911B;           // TIMEOUT_EXPIRED
-        if (NeoNative.currentSubmitIndex(ctx) <= idx) NeoNative.submit(ctx);
+        if (NeoNative.currentSubmitIndex(ctx) <= idx) {
+            NeoNative.submit(ctx);
+            midFrameSubmits++;
+        }
+        fenceWaits++;
         if (timeoutNs <= 0L) return 0x911B;
         return NeoNative.waitFor(ctx, idx, timeoutNs) ? 0x911C : 0x911B; // CONDITION_SATISFIED / TIMEOUT_EXPIRED
     }
@@ -1365,26 +1464,32 @@ public final class Gl {
                     if (SLOT_STRIDES[s] == 0) break;
                     slots = s + 1;
                 }
-                for (int loc : p.inputLocs) {
-                    Attrib a = loc >= 0 && loc < 16 ? va.attribs[loc] : null;
-                    if (a == null || !a.enabled) continue;
-                    Buf b = BUFFERS.get(a.buffer);
+                for (int s = 0; s < 8 && SLOT_STRIDES[s] != 0; s++) {
+                    Buf b = BUFFERS.get(SLOT_BUFFERS[s]);
                     if (b == null || b.mtl == 0L) return;
-                    for (int s = 0; s < 8; s++) {
-                        if (SLOT_BUFFERS[s] == a.buffer) {
-                            NeoNative.passSetVertexBuffer(ctx, b.mtl, 0, VERTEX_SLOT_BASE + s);
-                            break;
-                        }
-                    }
+                    NeoNative.passSetVertexBuffer(ctx, b.mtl, 0, VERTEX_SLOT_BASE + s);
                 }
                 NeoNative.passSetVertexBuffer(ctx, zeroBuffer, 0, ZERO_SLOT);
                 // uniforms
                 if (p.vsBlock != null) NeoNative.passSetBytes(ctx, 1, MemoryUtil.memAddress(p.vsBlock), p.vsBlock.capacity(), 0);
                 if (p.fsBlock != null) NeoNative.passSetBytes(ctx, 2, MemoryUtil.memAddress(p.fsBlock), p.fsBlock.capacity(), 0);
+                // uniform blocks
+                if (!p.blockNames.isEmpty()) {
+                    bindBlocks(p, p.result.vertex(), 1);
+                    bindBlocks(p, p.result.fragment(), 2);
+                }
                 // textures
                 for (int i = 0; i < p.samplerUnits.length; i++) {
                     int unit = p.samplerUnits[i];
                     Tex t = unit >= 0 && unit < units.length ? TEXTURES.get(units[unit]) : null;
+                    if (t != null && t.texBuffer >= 0) {
+                        Buf tb = BUFFERS.get(t.texBuffer);
+                        if (tb != null && tb.mtl != 0L) {
+                            long len = t.texBufferSize >= 0 ? t.texBufferSize : tb.size - t.texBufferOffset;
+                            NeoNative.passSetTexelBuffer(ctx, 3, tb.mtl, t.texBufferOffset, len, t.texBufferFormat, t.texBufferBpp, i);
+                        }
+                        continue;
+                    }
                     long tex = t != null && t.mtl != 0L ? t.mtl : dummyTexture;
                     long smp = t != null && t.mtl != 0L ? sampler(t) : defaultSampler;
                     NeoNative.passSetTexture(ctx, 3, tex, i);
@@ -1405,9 +1510,9 @@ public final class Gl {
                 } else if (indexed) {
                     boolean is32 = indexType == 0x1405;
                     NeoNative.passSetIndexBuffer(ctx, ebo.mtl, is32);
-                    NeoNative.passDrawIndexed(ctx, count, 1, (int) (indexOffset / (is32 ? 4 : 2)), baseVertex, 0);
+                    NeoNative.passDrawIndexed(ctx, count, instances, (int) (indexOffset / (is32 ? 4 : 2)), baseVertex, 0);
                 } else {
-                    NeoNative.passDraw(ctx, count, 1, first, 0);
+                    NeoNative.passDraw(ctx, count, instances, first, 0);
                 }
                 draws++;
                 frameDraws++;

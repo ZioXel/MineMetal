@@ -32,7 +32,7 @@ public final class NeoNative {
     private static MethodHandle COPY_BUFFER_TO_TEXTURE, COPY_TEXTURE_TO_TEXTURE, COPY_TEXTURE_TO_BUFFER;
     private static MethodHandle PASS_BEGIN, PASS_END, PASS_SET_VIEWPORT, PASS_SET_SCISSOR, PASS_SET_PIPELINE, PASS_SET_VERTEX_BUFFER;
     private static MethodHandle PASS_SET_BYTES, PASS_SET_TEXTURE, PASS_SET_SAMPLER, PASS_SET_INDEX_BUFFER, PASS_DRAW, PASS_DRAW_INDEXED;
-    private static MethodHandle PIPELINE_CREATE, SURFACE_ACQUIRE, SURFACE_BLIT, MULTI_DRAW_INDEXED, COPY_BUFFER, WAIT;
+    private static MethodHandle PIPELINE_CREATE, SURFACE_ACQUIRE, SURFACE_BLIT, MULTI_DRAW_INDEXED, COPY_BUFFER, WAIT, PASS_SET_BUFFER, PASS_SET_TEXEL_BUFFER;
 
     private NeoNative() {
     }
@@ -93,6 +93,8 @@ public final class NeoNative {
         PASS_DRAW_INDEXED = hc("mm_pass_draw_indexed", FunctionDescriptor.ofVoid(P, I, I, I, I, I));
         PIPELINE_CREATE = h("mm_pipeline_create", FunctionDescriptor.of(P, P, P, P, P, P, P, P, I, P, I, P, I, P, P, I, P, I));
         MULTI_DRAW_INDEXED = hc("mm_pass_multi_draw_indexed", FunctionDescriptor.ofVoid(P, P, I, I, I));
+        PASS_SET_BUFFER = hc("mm_pass_set_buffer", FunctionDescriptor.ofVoid(P, I, P, J, I));
+        PASS_SET_TEXEL_BUFFER = hc("mm_pass_set_texel_buffer", FunctionDescriptor.ofVoid(P, I, P, J, J, J, I, I));
         COPY_BUFFER = h("mm_copy_buffer", FunctionDescriptor.ofVoid(P, P, J, P, J, J));
         WAIT = h("mm_wait", FunctionDescriptor.of(I, P, J, J));
         SURFACE_ACQUIRE = h("mm_surface_acquire", FunctionDescriptor.of(I, P));
@@ -297,5 +299,15 @@ public final class NeoNative {
     /** Waits until submit {@code index} completed; returns true if it did within the timeout. */
     public static boolean waitFor(long ctx, long index, long timeoutNs) {
         try { return (int) WAIT.invokeExact(ctx, index, timeoutNs) != 0; } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    public static void passSetBuffer(long ctx, int stages, long buf, long offset, int index) {
+        try { PASS_SET_BUFFER.invokeExact(ctx, stages, buf, offset, index); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    public static void passSetTexelBuffer(long ctx, int stages, long buf, long offset, long length, long pixelFormat, int bytesPerTexel, int index) {
+        try {
+            PASS_SET_TEXEL_BUFFER.invokeExact(ctx, stages, buf, offset, length, pixelFormat, bytesPerTexel, index);
+        } catch (Throwable t) { throw rethrow(t); }
     }
 }

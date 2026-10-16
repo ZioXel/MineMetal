@@ -466,6 +466,46 @@ final class GlEntry {
         return Gl.attribLocation(program, MemoryUtil.memUTF8(name));
     }
 
+    static int glGetUniformBlockIndex(int program, long name) {
+        return Gl.uniformBlockIndex(program, MemoryUtil.memUTF8(name));
+    }
+
+    static void glUniformBlockBinding(int program, int index, int binding) {
+        Gl.uniformBlockBinding(program, index, binding);
+    }
+
+    static void glBindBufferBase(int target, int index, int buffer) {
+        Gl.bindBufferRange(target, index, buffer, 0L, -1L);
+    }
+
+    static void glBindBufferRange(int target, int index, int buffer, long offset, long size) {
+        Gl.bindBufferRange(target, index, buffer, offset, size);
+    }
+
+    static void glTexBuffer(int target, int ifmt, int buffer) {
+        Gl.texBuffer(ifmt, buffer, 0L, -1L);
+    }
+
+    static void glTexBufferRange(int target, int ifmt, int buffer, long offset, long size) {
+        Gl.texBuffer(ifmt, buffer, offset, size);
+    }
+
+    static void glVertexAttribDivisor(int index, int divisor) {
+        Gl.attribDivisor(index, divisor);
+    }
+
+    static void glDrawArraysInstanced(int mode, int first, int count, int instances) {
+        Gl.drawInstanced(mode, count, 0, 0L, 0, instances, false, first);
+    }
+
+    static void glDrawElementsInstanced(int mode, int count, int type, long indices, int instances) {
+        Gl.drawInstanced(mode, count, type, indices, 0, instances, true, 0);
+    }
+
+    static void glDrawElementsInstancedBaseVertex(int mode, int count, int type, long indices, int instances, int base) {
+        Gl.drawInstanced(mode, count, type, indices, base, instances, true, 0);
+    }
+
     static int minusOneIJ(int a, long b) {
         return -1;
     }
