@@ -49,3 +49,4 @@ neoforge/build/
 neoforge/run/
 neoforge/.gradle/
 neoforge/run.log
+run.log
