@@ -66,12 +66,12 @@ public final class NeoNative {
         ENUM = h("mm_enum", FunctionDescriptor.of(J, P, P));
         RELEASE = h("mm_release", FunctionDescriptor.ofVoid(P));
         SUBMIT = h("mm_submit", FunctionDescriptor.of(J, P));
-        COMPLETED_INDEX = h("mm_completed_index", FunctionDescriptor.of(J, P));
-        CURRENT_SUBMIT_INDEX = h("mm_current_submit_index", FunctionDescriptor.of(J, P));
+        COMPLETED_INDEX = hc("mm_completed_index", FunctionDescriptor.of(J, P));
+        CURRENT_SUBMIT_INDEX = hc("mm_current_submit_index", FunctionDescriptor.of(J, P));
         SET_DEPTH_FLIP = h("mm_set_depth_flip", FunctionDescriptor.ofVoid(P, I));
         WAIT_IDLE = h("mm_wait_idle", FunctionDescriptor.ofVoid(P));
         BUFFER_CREATE = h("mm_buffer_create", FunctionDescriptor.of(P, P, J));
-        BUFFER_CONTENTS = h("mm_buffer_contents", FunctionDescriptor.of(P, P));
+        BUFFER_CONTENTS = hc("mm_buffer_contents", FunctionDescriptor.of(P, P));
         TEXTURE_CREATE = h("mm_texture_create", FunctionDescriptor.of(P, P, J, I, I, I, I, I));
         TEXTURE_VIEW = h("mm_texture_view", FunctionDescriptor.of(P, P, I, I));
         GENERATE_MIPMAPS = h("mm_generate_mipmaps", FunctionDescriptor.ofVoid(P, P));
@@ -79,21 +79,26 @@ public final class NeoNative {
         COPY_BUFFER_TO_TEXTURE = h("mm_copy_buffer_to_texture", FunctionDescriptor.ofVoid(P, P, J, J, J, P, I, I, I, I, I, I));
         COPY_TEXTURE_TO_TEXTURE = h("mm_copy_texture_to_texture", FunctionDescriptor.ofVoid(P, P, P, I, I, I, I, I, I, I));
         COPY_TEXTURE_TO_BUFFER = h("mm_copy_texture_to_buffer", FunctionDescriptor.ofVoid(P, P, I, I, I, I, I, I, P, J, J, J));
-        PASS_BEGIN = h("mm_pass_begin", FunctionDescriptor.of(I, P, P, I, I, P, P, D, I, I, I, I, P));
-        PASS_END = h("mm_pass_end", FunctionDescriptor.ofVoid(P));
-        PASS_SET_VIEWPORT = h("mm_pass_set_viewport", FunctionDescriptor.ofVoid(P, D, D, D, D, D, D));
-        PASS_SET_SCISSOR = h("mm_pass_set_scissor", FunctionDescriptor.ofVoid(P, I, I, I, I));
+        PASS_BEGIN = hc("mm_pass_begin", FunctionDescriptor.of(I, P, P, I, I, P, P, D, I, I, I, I, P));
+        PASS_END = hc("mm_pass_end", FunctionDescriptor.ofVoid(P));
+        PASS_SET_VIEWPORT = hc("mm_pass_set_viewport", FunctionDescriptor.ofVoid(P, D, D, D, D, D, D));
+        PASS_SET_SCISSOR = hc("mm_pass_set_scissor", FunctionDescriptor.ofVoid(P, I, I, I, I));
         PASS_SET_PIPELINE = h("mm_pass_set_pipeline", FunctionDescriptor.of(I, P, P));
-        PASS_SET_VERTEX_BUFFER = h("mm_pass_set_vertex_buffer", FunctionDescriptor.ofVoid(P, P, J, I));
-        PASS_SET_BYTES = h("mm_pass_set_bytes", FunctionDescriptor.ofVoid(P, I, P, J, I));
-        PASS_SET_TEXTURE = h("mm_pass_set_texture", FunctionDescriptor.ofVoid(P, I, P, I));
-        PASS_SET_SAMPLER = h("mm_pass_set_sampler", FunctionDescriptor.ofVoid(P, I, P, I));
-        PASS_SET_INDEX_BUFFER = h("mm_pass_set_index_buffer", FunctionDescriptor.ofVoid(P, P, I));
-        PASS_DRAW = h("mm_pass_draw", FunctionDescriptor.ofVoid(P, I, I, I, I));
-        PASS_DRAW_INDEXED = h("mm_pass_draw_indexed", FunctionDescriptor.ofVoid(P, I, I, I, I, I));
+        PASS_SET_VERTEX_BUFFER = hc("mm_pass_set_vertex_buffer", FunctionDescriptor.ofVoid(P, P, J, I));
+        PASS_SET_BYTES = hc("mm_pass_set_bytes", FunctionDescriptor.ofVoid(P, I, P, J, I));
+        PASS_SET_TEXTURE = hc("mm_pass_set_texture", FunctionDescriptor.ofVoid(P, I, P, I));
+        PASS_SET_SAMPLER = hc("mm_pass_set_sampler", FunctionDescriptor.ofVoid(P, I, P, I));
+        PASS_SET_INDEX_BUFFER = hc("mm_pass_set_index_buffer", FunctionDescriptor.ofVoid(P, P, I));
+        PASS_DRAW = hc("mm_pass_draw", FunctionDescriptor.ofVoid(P, I, I, I, I));
+        PASS_DRAW_INDEXED = hc("mm_pass_draw_indexed", FunctionDescriptor.ofVoid(P, I, I, I, I, I));
         PIPELINE_CREATE = h("mm_pipeline_create", FunctionDescriptor.of(P, P, P, P, P, P, P, P, I, P, I, P, I, P, P, I, P, I));
         SURFACE_ACQUIRE = h("mm_surface_acquire", FunctionDescriptor.of(I, P));
         SURFACE_BLIT = h("mm_surface_blit", FunctionDescriptor.ofVoid(P, P, P, I, I));
+    }
+
+    /** Short, non-blocking calls on the per-draw path: skip the Java thread-state transition. */
+    private static MethodHandle hc(String name, FunctionDescriptor fd) {
+        return LINKER.downcallHandle(lib.find(name).orElseThrow(() -> new UnsatisfiedLinkError(name)), fd, Linker.Option.critical(false));
     }
 
     private static MethodHandle h(String name, FunctionDescriptor fd) {

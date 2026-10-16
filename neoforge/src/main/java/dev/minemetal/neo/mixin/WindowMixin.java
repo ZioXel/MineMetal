@@ -17,22 +17,24 @@ public abstract class WindowMixin {
 
     @Redirect(method = "<init>", at = @At(value = "INVOKE", target = "Lorg/lwjgl/glfw/GLFW;glfwWindowHint(II)V", remap = false))
     private void minemetal$windowHint(int hint, int value) {
-        if (hint == GLFW.GLFW_CLIENT_API) value = GLFW.GLFW_NO_API;
+        if (hint == GLFW.GLFW_CLIENT_API && MetalBootstrap.ENABLED) value = GLFW.GLFW_NO_API;
         GLFW.glfwWindowHint(hint, value);
     }
 
     @Redirect(method = "<init>", at = @At(value = "INVOKE", target = "Lorg/lwjgl/glfw/GLFW;glfwMakeContextCurrent(J)V", remap = false))
     private void minemetal$noContext(long handle) {
+        if (!MetalBootstrap.ENABLED) GLFW.glfwMakeContextCurrent(handle);
     }
 
     @Redirect(method = "<init>", at = @At(value = "INVOKE",
         target = "Lorg/lwjgl/opengl/GL;createCapabilities()Lorg/lwjgl/opengl/GLCapabilities;", remap = false))
     private GLCapabilities minemetal$bootstrap() {
-        return MetalBootstrap.init(this.window);
+        return MetalBootstrap.ENABLED ? MetalBootstrap.init(this.window) : org.lwjgl.opengl.GL.createCapabilities();
     }
 
     @Redirect(method = "updateVsync", at = @At(value = "INVOKE", target = "Lorg/lwjgl/glfw/GLFW;glfwSwapInterval(I)V", remap = false))
     private void minemetal$vsync(int interval) {
-        MetalBootstrap.setVsync(interval != 0);
+        if (MetalBootstrap.ENABLED) MetalBootstrap.setVsync(interval != 0);
+        else GLFW.glfwSwapInterval(interval);
     }
 }

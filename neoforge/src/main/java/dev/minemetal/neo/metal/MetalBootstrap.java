@@ -17,6 +17,8 @@ import java.nio.IntBuffer;
  */
 public final class MetalBootstrap {
     private static final Logger LOG = LogUtils.getLogger();
+    /** MM_OPENGL=1: run the game on Apple's OpenGL (for A/B comparisons). */
+    public static final boolean ENABLED = !"1".equals(System.getenv("MM_OPENGL"));
     private static long ctx;
     private static long surface;
     private static boolean vsync = true;

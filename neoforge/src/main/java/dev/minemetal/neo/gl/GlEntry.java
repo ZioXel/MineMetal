@@ -186,11 +186,13 @@ final class GlEntry {
     }
 
     static void glBlendFunc(int src, int dst) {
+        Gl.dirty();
         Gl.blendSrcRgb = Gl.blendSrcA = src;
         Gl.blendDstRgb = Gl.blendDstA = dst;
     }
 
     static void glBlendFuncSeparate(int srcRgb, int dstRgb, int srcA, int dstA) {
+        Gl.dirty();
         Gl.blendSrcRgb = srcRgb;
         Gl.blendDstRgb = dstRgb;
         Gl.blendSrcA = srcA;
@@ -198,35 +200,43 @@ final class GlEntry {
     }
 
     static void glBlendEquation(int mode) {
+        Gl.dirty();
         Gl.blendOpRgb = Gl.blendOpA = mode;
     }
 
     static void glBlendEquationSeparate(int rgb, int a) {
+        Gl.dirty();
         Gl.blendOpRgb = rgb;
         Gl.blendOpA = a;
     }
 
     static void glDepthFunc(int f) {
+        Gl.dirty();
         Gl.depthFunc = f;
     }
 
     static void glDepthMask(byte flag) {
+        Gl.dirty();
         Gl.depthMask = flag != 0;
     }
 
     static void glColorMask(byte r, byte g, byte b, byte a) {
+        Gl.dirty();
         Gl.colorMask = (r != 0 ? 1 : 0) | (g != 0 ? 2 : 0) | (b != 0 ? 4 : 0) | (a != 0 ? 8 : 0);
     }
 
     static void glCullFace(int mode) {
+        Gl.dirty();
         Gl.cullMode = mode;
     }
 
     static void glFrontFace(int mode) {
+        Gl.dirty();
         Gl.frontFace = mode;
     }
 
     static void glPolygonOffset(float factor, float units) {
+        Gl.dirty();
         Gl.offsetFactor = factor;
         Gl.offsetUnits = units;
     }

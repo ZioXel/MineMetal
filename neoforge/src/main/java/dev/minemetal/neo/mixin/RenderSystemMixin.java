@@ -11,6 +11,7 @@ import org.spongepowered.asm.mixin.injection.Redirect;
 public abstract class RenderSystemMixin {
     @Redirect(method = "flipFrame", at = @At(value = "INVOKE", target = "Lorg/lwjgl/glfw/GLFW;glfwSwapBuffers(J)V", remap = false))
     private static void minemetal$present(long window) {
-        MetalBootstrap.present(window);
+        if (MetalBootstrap.ENABLED) MetalBootstrap.present(window);
+        else org.lwjgl.glfw.GLFW.glfwSwapBuffers(window);
     }
 }

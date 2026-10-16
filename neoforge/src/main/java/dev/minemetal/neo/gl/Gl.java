@@ -47,7 +47,101 @@ public final class Gl {
     // ---- objects ---------------------------------------------------------------------------------------------------
 
     static final class Buf {
-        long mtl, size, contents;
+        long mtl, size, contents, cap;
+    }
+
+    /**
+     * Recycles MTLBuffers by power-of-two size class: a buffer handed back is reused once the GPU has finished the
+     * command buffer that was recording when it was released. Creating MTLBuffers is the expensive part of glBufferData.
+     */
+    static final class BufferPool {
+        private final Map<Long, ArrayDeque<Long>> free = new HashMap<>();
+        private final ArrayDeque<long[]> pending = new ArrayDeque<>(); // {submitIndex, buffer, capacity}
+        private long freeBytes;
+        private static final long MAX_FREE_BYTES = 512L << 20;
+        long created, reused;
+
+        static long sizeClass(long size) {
+            long s = Math.max(size, 256);
+            return s > (64L << 20) ? (s + 4095) & ~4095L : Long.highestOneBit(s - 1) << 1;
+        }
+
+        long obtain(long cap) {
+            ArrayDeque<Long> q = free.get(cap);
+            if (q != null && !q.isEmpty()) {
+                freeBytes -= cap;
+                reused++;
+                return q.pollLast();
+            }
+            created++;
+            return NeoNative.bufferCreate(ctx, cap);
+        }
+
+        void release(long buf, long cap) {
+            if (buf != 0L) pending.add(new long[]{NeoNative.currentSubmitIndex(ctx), buf, cap});
+        }
+
+        void collect(long completed) {
+            while (!pending.isEmpty() && pending.peekFirst()[0] <= completed) {
+                long[] e = pending.pollFirst();
+                if (freeBytes + e[2] > MAX_FREE_BYTES) {
+                    NeoNative.release(e[1]);
+                } else {
+                    free.computeIfAbsent(e[2], k -> new ArrayDeque<>()).add(e[1]);
+                    freeBytes += e[2];
+                }
+            }
+        }
+    }
+
+    static final BufferPool POOL = new BufferPool();
+    /** Bumped on every state change that affects pipeline selection (see Program.memo*). */
+    static int stateVersion;
+
+    static long memoHits, memoMisses, hashHits, frames;
+
+    private static long mix(long h, long v) {
+        h ^= v + 0x9E3779B97F4A7C15L + (h << 6) + (h >>> 2);
+        return h;
+    }
+
+    /**
+     * Allocation-free pipeline identity: vertex layout (per input: slot, stride, offset, type, size, flags) plus all
+     * fixed-function state and attachment formats. Also fills the vertex slot plan (SLOT_BUFFERS / SLOT_STRIDES).
+     */
+    private static long stateHash(Program p, Vao va, int mode, int colorCount) {
+        long h = mode;
+        int slots = 0;
+        java.util.Arrays.fill(SLOT_STRIDES, 0);
+        for (int loc : p.inputLocs) {
+            Attrib a = loc >= 0 && loc < 16 ? va.attribs[loc] : null;
+            if (a == null || !a.enabled || BUFFERS.get(a.buffer) == null) {
+                h = mix(h, -1);
+                continue;
+            }
+            int stride = a.stride > 0 ? a.stride : a.size * typeBytes(a.type);
+            int slot = -1;
+            for (int s = 0; s < slots; s++) if (SLOT_BUFFERS[s] == a.buffer && SLOT_STRIDES[s] == stride) slot = s;
+            if (slot < 0 && slots < 8) {
+                slot = slots++;
+                SLOT_BUFFERS[slot] = a.buffer;
+                SLOT_STRIDES[slot] = stride;
+            }
+            h = mix(h, slot | (long) stride << 8 | a.offset << 24);
+            h = mix(h, a.type | (long) a.size << 16 | (a.normalized ? 1L << 20 : 0) | (a.integer ? 1L << 21 : 0));
+        }
+        h = mix(h, blend ? blendSrcRgb | (long) blendDstRgb << 16 | (long) blendSrcA << 32 | (long) blendDstA << 48 : 7);
+        h = mix(h, blend ? blendOpRgb | (long) blendOpA << 16 : 7);
+        h = mix(h, colorMask | (depthTest ? (long) depthFunc << 8 | (depthMask ? 1L << 24 : 0) : 0) | (cullFace ? (long) cullMode << 32 : 0)
+            | (long) frontFace << 48);
+        h = mix(h, polygonOffset ? Float.floatToIntBits(offsetFactor) | (long) Float.floatToIntBits(offsetUnits) << 32 : 3);
+        for (int i = 0; i < colorCount; i++) h = mix(h, A_FORMATS[i]);
+        h = mix(h, A_DEPTH[0] != 0L ? 1 : 2);
+        return h;
+    }
+
+    static void dirty() {
+        stateVersion++;
     }
 
     static final class Tex {
@@ -91,6 +185,12 @@ public final class Gl {
         ByteBuffer vsBlock, fsBlock;
         int[] samplerUnits = new int[0];
         final Map<String, Long> pipelines = new HashMap<>();
+        final it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap pipelinesByHash = new it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap();
+        // last pipeline used, valid while nothing that feeds the pipeline key changed
+        int[] inputLocs = new int[0];
+        int memoVersion = -1, memoVao = -1, memoMode = -1, memoFbo = -1, memoSlots;
+        long memoPso;
+        final int[] memoSlotBuffers = new int[8], memoSlotStrides = new int[8];
         boolean failedLogged;
     }
 
@@ -213,6 +313,12 @@ public final class Gl {
         NeoNative.submit(ctx);
         long done = NeoNative.completedIndex(ctx);
         while (!RETIRED.isEmpty() && RETIRED.peekFirst()[0] <= done) NeoNative.release(RETIRED.pollFirst()[1]);
+        POOL.collect(done);
+        if (++frames % 1200 == 0) {
+            LOG.info("[MineMetal GL] frame {}: {} draws/frame, pipeline memo {}% / hash {}% hits, buffers created {} / reused {}", frames,
+                frameDraws, memoHits * 100 / Math.max(1, memoHits + memoMisses), hashHits * 100 / Math.max(1, memoMisses), POOL.created, POOL.reused);
+            memoHits = memoMisses = hashHits = 0;
+        }
         frameDraws = 0;
     }
 
@@ -236,7 +342,10 @@ public final class Gl {
             case 0x8893 -> VAOS.get(vao).ebo = buffer;
             default -> otherBuffers.put(target, buffer);
         }
-        if (buffer != 0) BUFFERS.computeIfAbsent(buffer, k -> new Buf());
+        if (buffer != 0 && !BUFFERS.containsKey(buffer)) {
+            BUFFERS.put(buffer, new Buf());
+            dirty();
+        }
     }
 
     static Buf buffer(int target) {
@@ -247,9 +356,11 @@ public final class Gl {
     static void bufferData(int target, long size, long data) {
         Buf b = buffer(target);
         if (b == null) return;
-        retire(b.mtl);
         b.size = Math.max(size, 0);
-        b.mtl = NeoNative.bufferCreate(ctx, Math.max(size, 16));
+        long cap = BufferPool.sizeClass(b.size);
+        POOL.release(b.mtl, b.cap);
+        b.mtl = POOL.obtain(cap);
+        b.cap = cap;
         b.contents = NeoNative.bufferContents(b.mtl);
         if (data != 0L && size > 0) MemoryUtil.memCopy(data, b.contents, size);
     }
@@ -274,7 +385,7 @@ public final class Gl {
 
     static void deleteBuffer(int id) {
         Buf b = BUFFERS.remove(id);
-        if (b != null) retire(b.mtl);
+        if (b != null) POOL.release(b.mtl, b.cap);
         if (arrayBuffer == id) arrayBuffer = 0;
     }
 
@@ -324,6 +435,7 @@ public final class Gl {
     }
 
     static void allocate(Tex t, int ifmt, int w, int h, int mips) {
+        dirty();
         long[] f = internalFormat(ifmt);
         freeTexture(t);
         t.pf = f[0];
@@ -391,7 +503,8 @@ public final class Gl {
         long src = pixels + unpackSkipRows * srcRow + (long) unpackSkipPixels * srcBpp;
         int dstBpp = t.bpp;
         long dstRow = (long) w * dstBpp;
-        long staging = NeoNative.bufferCreate(ctx, dstRow * h);
+        long stagingCap = BufferPool.sizeClass(dstRow * h);
+        long staging = POOL.obtain(stagingCap);
         long dst = NeoNative.bufferContents(staging);
         boolean expandRgb = comps == 3 && ts == 1 && dstBpp == 4;
         boolean swapBgra = format == 0x80E1 && ts == 1 && dstBpp == 4;
@@ -415,7 +528,7 @@ public final class Gl {
             }
         }
         NeoNative.copyBufferToTexture(ctx, staging, 0, dstRow, dstRow * h, t.mtl, 0, level, x, y, w, h);
-        retire(staging);
+        POOL.release(staging, stagingCap);
     }
 
     static void texParameter(int target, int pname, int value) {
@@ -503,6 +616,7 @@ public final class Gl {
     // ---- framebuffers ----------------------------------------------------------------------------------------------
 
     static void bindFramebuffer(int target, int id) {
+        dirty();
         if (id != 0) FBOS.computeIfAbsent(id, k -> new Fbo());
         if (target == 0x8D40 || target == 0x8CA9) drawFbo = id;
         if (target == 0x8D40 || target == 0x8CA8) readFbo = id;
@@ -514,6 +628,7 @@ public final class Gl {
     }
 
     static void framebufferTexture(int target, int attachment, int texture, int level) {
+        dirty();
         Fbo f = fbo(target);
         if (f == null) return;
         if (attachment == 0x8D00 || attachment == 0x821A) { // DEPTH, DEPTH_STENCIL
@@ -670,6 +785,7 @@ public final class Gl {
     }
 
     static void linkProgram(int program) {
+        dirty();
         Program p = PROGRAMS.get(program);
         if (p == null) return;
         String vs = null, fs = null;
@@ -701,6 +817,12 @@ public final class Gl {
         p.fsBlock = block(f.blockSize);
         for (GlProgramCompiler.BlockMember m : v.members) uniform(p, m.name()).vs = m;
         for (GlProgramCompiler.BlockMember m : f.members) uniform(p, m.name()).fs = m;
+        List<GlProgramCompiler.Interface> ins = v.inputs;
+        p.inputLocs = new int[ins.size()];
+        for (int i = 0; i < ins.size(); i++) {
+            Integer b = p.attribBindings.get(ins.get(i).name());
+            p.inputLocs[i] = b != null ? b : ins.get(i).location();
+        }
         List<String> samplers = p.result.samplers();
         p.samplerUnits = new int[samplers.size()];
         for (int i = 0; i < samplers.size(); i++) uniform(p, samplers.get(i)).samplerIndex = i;
@@ -816,6 +938,7 @@ public final class Gl {
     // ---- vertex arrays ---------------------------------------------------------------------------------------------
 
     static void bindVertexArray(int id) {
+        dirty();
         vao = id;
         VAOS.computeIfAbsent(id, k -> new Vao());
     }
@@ -826,10 +949,12 @@ public final class Gl {
     }
 
     static void enableAttrib(int index, boolean on) {
+        dirty();
         if (index >= 0 && index < 16) VAOS.get(vao).attribs[index].enabled = on;
     }
 
     static void attribPointer(int index, int size, int type, boolean normalized, boolean integer, int stride, long offset) {
+        dirty();
         if (index < 0 || index >= 16) return;
         Attrib a = VAOS.get(vao).attribs[index];
         a.buffer = arrayBuffer;
@@ -921,6 +1046,34 @@ public final class Gl {
     private static final long[] SLOT_BASE_OFFSET = new long[8];
 
     private static long pipeline(Program p, Vao va, int mode, StringBuilder key, int colorCount) {
+        if (p.memoPso != 0L && p.memoVersion == stateVersion && p.memoVao == vao && p.memoMode == mode && p.memoFbo == drawFbo) {
+            System.arraycopy(p.memoSlotBuffers, 0, SLOT_BUFFERS, 0, 8);
+            System.arraycopy(p.memoSlotStrides, 0, SLOT_STRIDES, 0, 8);
+            memoHits++;
+            return p.memoPso;
+        }
+        memoMisses++;
+        long h = stateHash(p, va, mode, colorCount);
+        long cached = p.pipelinesByHash.get(h);
+        long pso;
+        if (cached != 0L) {
+            pso = cached;
+            hashHits++;
+        } else {
+            pso = pipelineSlow(p, va, mode, key, colorCount);
+            p.pipelinesByHash.put(h, pso);
+        }
+        p.memoVersion = stateVersion;
+        p.memoVao = vao;
+        p.memoMode = mode;
+        p.memoFbo = drawFbo;
+        p.memoPso = pso;
+        System.arraycopy(SLOT_BUFFERS, 0, p.memoSlotBuffers, 0, 8);
+        System.arraycopy(SLOT_STRIDES, 0, p.memoSlotStrides, 0, 8);
+        return pso;
+    }
+
+    private static long pipelineSlow(Program p, Vao va, int mode, StringBuilder key, int colorCount) {
         GlProgramCompiler.StageResult vs = p.result.vertex();
         // vertex layout
         int slots = 0;
@@ -1140,9 +1293,7 @@ public final class Gl {
                     if (SLOT_STRIDES[s] == 0) break;
                     slots = s + 1;
                 }
-                for (GlProgramCompiler.Interface in : p.result.vertex().inputs) {
-                    Integer glLoc = p.attribBindings.get(in.name());
-                    int loc = glLoc != null ? glLoc : in.location();
+                for (int loc : p.inputLocs) {
                     Attrib a = loc >= 0 && loc < 16 ? va.attribs[loc] : null;
                     if (a == null || !a.enabled) continue;
                     Buf b = BUFFERS.get(a.buffer);
@@ -1220,6 +1371,7 @@ public final class Gl {
     }
 
     static void enable(int cap, boolean on) {
+        dirty();
         switch (cap) {
             case 0x0BE2 -> blend = on;
             case 0x0B71 -> depthTest = on;
