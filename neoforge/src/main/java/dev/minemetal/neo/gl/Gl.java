@@ -98,7 +98,9 @@ public final class Gl {
     /** Bumped on every state change that affects pipeline selection (see Program.memo*). */
     static int stateVersion;
 
-    static long memoHits, memoMisses, hashHits, frames, midFrameSubmits, fenceWaits;
+    static long memoHits, memoMisses, hashHits, frames, midFrameSubmits, fenceWaits, gpuWaitNs;
+    private static final int FRAMES_IN_FLIGHT = Math.max(1, Integer.getInteger("minemetal.framesInFlight", 2));
+    private static final long[] FRAME_SUBMITS = new long[FRAMES_IN_FLIGHT];
 
     private static long mix(long h, long v) {
         h ^= v + 0x9E3779B97F4A7C15L + (h << 6) + (h >>> 2);
@@ -324,17 +326,37 @@ public final class Gl {
     public static void present(long surface, boolean blocking) {
         if (blocking) NeoNative.surfaceAcquire(surface);
         NeoNative.surfaceBlit(ctx, surface, backColor, backW, backH);
-        NeoNative.submit(ctx);
+        long submitted = NeoNative.submit(ctx);
+        // Frame throttle: never more than FRAMES_IN_FLIGHT frames queued on the GPU. Without it (VSync off, GPU-bound
+        // shader packs) the CPU runs ahead, the queue grows every second and input lag with it.
+        long waitFor = FRAME_SUBMITS[(int) (frames % FRAMES_IN_FLIGHT)];
+        if (waitFor > 0 && NeoNative.completedIndex(ctx) < waitFor) {
+            long t0 = System.nanoTime();
+            NeoNative.waitFor(ctx, waitFor, 250_000_000L);
+            gpuWaitNs += System.nanoTime() - t0;
+        }
+        FRAME_SUBMITS[(int) (frames % FRAMES_IN_FLIGHT)] = submitted;
         long done = NeoNative.completedIndex(ctx);
         while (!RETIRED.isEmpty() && RETIRED.peekFirst()[0] <= done) NeoNative.release(RETIRED.pollFirst()[1]);
         POOL.collect(done);
         if (++frames % 1200 == 0) {
-            LOG.info("[MineMetal GL] frame {}: {} draws/frame, pipeline memo {}% / hash {}% hits, buffers created {} / reused {}, fence waits {} (mid-frame submits {})", frames,
-                frameDraws, memoHits * 100 / Math.max(1, memoHits + memoMisses), hashHits * 100 / Math.max(1, memoMisses), POOL.created, POOL.reused, fenceWaits, midFrameSubmits);
+            LOG.info("[MineMetal GL] frame {}: {} draws/frame, pipeline memo {}% / hash {}% hits, buffers created {} / reused {}, fence waits {} (mid-frame submits {}), gpu-wait {} ms/frame", frames,
+                frameDraws, memoHits * 100 / Math.max(1, memoHits + memoMisses), hashHits * 100 / Math.max(1, memoMisses), POOL.created, POOL.reused, fenceWaits, midFrameSubmits, String.format("%.2f", gpuWaitNs / 1e6 / 1200));
             memoHits = memoMisses = hashHits = 0;
             fenceWaits = midFrameSubmits = 0;
+            gpuWaitNs = 0;
         }
         frameDraws = 0;
+    }
+
+    /** The MTLTexture behind a GL texture name (0 if none). */
+    public static long metalTexture(int glTexture) {
+        Tex t = TEXTURES.get(glTexture);
+        return t == null ? 0L : t.mtl;
+    }
+
+    public static long context() {
+        return ctx;
     }
 
     static int gen() {
@@ -716,6 +738,8 @@ public final class Gl {
             java.util.Arrays.fill(formats, 0L);
             colors[0] = backColor;
             formats[0] = PF_RGBA8;
+            attachW = backW;
+            attachH = backH;
             depth[0] = backDepth;
             return backColor == 0L ? -1 : 1;
         }
@@ -726,6 +750,10 @@ public final class Gl {
             Tex t = f.color[i] != 0 ? TEXTURES.get(f.color[i]) : null;
             if (t != null && t.mtl != 0L && !t.depth) {
                 colors[i] = view(t, f.colorLevel[i]);
+                if (count == 0) {
+                    attachW = Math.max(t.w >> f.colorLevel[i], 1);
+                    attachH = Math.max(t.h >> f.colorLevel[i], 1);
+                }
                 formats[i] = t.pf;
                 count = i + 1;
             } else {
@@ -735,10 +763,20 @@ public final class Gl {
         }
         Tex d = f.depth != 0 ? TEXTURES.get(f.depth) : null;
         depth[0] = d != null && d.mtl != 0L && d.depth ? d.mtl : 0L;
+        if (count == 0 && d != null) {
+            attachW = d.w;
+            attachH = d.h;
+        }
         return count == 0 && depth[0] == 0L ? -1 : count;
     }
 
     private static final long[] A_COLORS = new long[8], A_FORMATS = new long[8], A_DEPTH = new long[1];
+    static int attachW, attachH;
+    /**
+     * Set while the world renders into the reduced upscaling target: code that sizes its viewport from the window
+     * (instead of the bound framebuffer) would draw too large, so such viewports are scaled to the framebuffer.
+     */
+    public static int upscaleFullW, upscaleFullH;
 
     private static boolean beginPass(int clearMask, MemoryStack stack) {
         int count = attachments(drawFbo, A_COLORS, A_FORMATS, A_DEPTH);
@@ -1579,7 +1617,14 @@ public final class Gl {
                     warnOnce("pso" + currentProgram, "pipeline unusable for program " + currentProgram);
                     return;
                 }
-                NeoNative.passSetViewport(ctx, viewport[0], viewport[1], viewport[2], viewport[3]);
+                if (upscaleFullW > 0 && (viewport[0] + viewport[2] > attachW || viewport[1] + viewport[3] > attachH)) {
+                    double sx = attachW / (double) upscaleFullW, sy = attachH / (double) upscaleFullH;
+                    warnOnce("vp" + currentProgram, "upscaling: program " + currentProgram + " used a window-sized viewport "
+                        + java.util.Arrays.toString(viewport) + " on a " + attachW + "x" + attachH + " target; scaled");
+                    NeoNative.passSetViewport(ctx, viewport[0] * sx, viewport[1] * sy, viewport[2] * sx, viewport[3] * sy);
+                } else {
+                    NeoNative.passSetViewport(ctx, viewport[0], viewport[1], viewport[2], viewport[3]);
+                }
                 // vertex buffers (slots computed by pipeline())
                 int slots = 0;
                 for (int s = 0; s < 8; s++) {

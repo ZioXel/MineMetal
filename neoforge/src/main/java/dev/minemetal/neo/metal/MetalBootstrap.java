@@ -83,8 +83,12 @@ public final class MetalBootstrap {
             w = Math.max(pw.get(0), 1);
             h = Math.max(ph.get(0), 1);
         }
-        // VSync off: paced by default; MM_PRESENT=immediate presents whenever a drawable is free.
-        int m = vsync ? NeoNative.PRESENT_FIFO : "immediate".equals(System.getenv("MM_PRESENT")) ? NeoNative.PRESENT_IMMEDIATE : NeoNative.PRESENT_PACED;
+        // VSync off: "smooth" by default (paced + evenly spaced frames, ProMotion-friendly, as on the 26.3 mod);
+        // MM_PRESENT=paced|immediate for comparison.
+        String pm = System.getenv("MM_PRESENT");
+        int m = vsync ? NeoNative.PRESENT_FIFO
+            : "immediate".equals(pm) ? NeoNative.PRESENT_IMMEDIATE
+            : "paced".equals(pm) ? NeoNative.PRESENT_PACED : NeoNative.PRESENT_SMOOTH;
         if (w != width || h != height || m != mode) {
             width = w;
             height = h;

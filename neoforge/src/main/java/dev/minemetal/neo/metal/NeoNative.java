@@ -22,6 +22,7 @@ public final class NeoNative {
     public static final int PRESENT_FIFO = 0;
     public static final int PRESENT_PACED = 1;
     public static final int PRESENT_IMMEDIATE = 2;
+    public static final int PRESENT_SMOOTH = 3;
 
     private static final String RESOURCE = "/natives/macos/libminemetal.dylib";
     private static final Linker LINKER = Linker.nativeLinker();
@@ -32,7 +33,7 @@ public final class NeoNative {
     private static MethodHandle COPY_BUFFER_TO_TEXTURE, COPY_TEXTURE_TO_TEXTURE, COPY_TEXTURE_TO_BUFFER;
     private static MethodHandle PASS_BEGIN, PASS_END, PASS_SET_VIEWPORT, PASS_SET_SCISSOR, PASS_SET_PIPELINE, PASS_SET_VERTEX_BUFFER;
     private static MethodHandle PASS_SET_BYTES, PASS_SET_TEXTURE, PASS_SET_SAMPLER, PASS_SET_INDEX_BUFFER, PASS_DRAW, PASS_DRAW_INDEXED;
-    private static MethodHandle PIPELINE_CREATE, SURFACE_ACQUIRE, SURFACE_BLIT, MULTI_DRAW_INDEXED, COPY_BUFFER, WAIT, PASS_SET_BUFFER, PASS_SET_TEXEL_BUFFER;
+    private static MethodHandle PIPELINE_CREATE, SURFACE_ACQUIRE, SURFACE_BLIT, MULTI_DRAW_INDEXED, COPY_BUFFER, WAIT, PASS_SET_BUFFER, PASS_SET_TEXEL_BUFFER, UPSCALE;
 
     private NeoNative() {
     }
@@ -95,6 +96,7 @@ public final class NeoNative {
         MULTI_DRAW_INDEXED = hc("mm_pass_multi_draw_indexed", FunctionDescriptor.ofVoid(P, P, I, I, I));
         PASS_SET_BUFFER = hc("mm_pass_set_buffer", FunctionDescriptor.ofVoid(P, I, P, J, I));
         PASS_SET_TEXEL_BUFFER = hc("mm_pass_set_texel_buffer", FunctionDescriptor.ofVoid(P, I, P, J, J, J, I, I));
+        UPSCALE = h("mm_upscale", FunctionDescriptor.of(I, P, P, P, I, F));
         COPY_BUFFER = h("mm_copy_buffer", FunctionDescriptor.ofVoid(P, P, J, P, J, J));
         WAIT = h("mm_wait", FunctionDescriptor.of(I, P, J, J));
         SURFACE_ACQUIRE = h("mm_surface_acquire", FunctionDescriptor.of(I, P));
@@ -309,5 +311,10 @@ public final class NeoNative {
         try {
             PASS_SET_TEXEL_BUFFER.invokeExact(ctx, stages, buf, offset, length, pixelFormat, bytesPerTexel, index);
         } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    /** Scales src into dst (1 bilinear, 2 FSR 1, 3 MetalFX Spatial); returns the mode actually used. */
+    public static int upscale(long ctx, long src, long dst, int mode, float sharpness) {
+        try { return (int) UPSCALE.invokeExact(ctx, src, dst, mode, sharpness); } catch (Throwable t) { throw rethrow(t); }
     }
 }
