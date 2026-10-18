@@ -281,14 +281,15 @@ final class GlEntry {
     }
 
     static long glMapBufferRange(int target, long offset, long length, int access) {
-        return Gl.mapBuffer(target, offset);
+        return Gl.mapBuffer(target, offset, length, access);
     }
 
     static long glMapBuffer(int target, int access) {
-        return Gl.mapBuffer(target, 0);
+        return Gl.mapBuffer(target, 0, -1);
     }
 
     static byte glUnmapBuffer(int target) {
+        Gl.unmapBuffer(target);
         return 1;
     }
 

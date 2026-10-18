@@ -48,7 +48,38 @@ public final class Gl {
 
     static final class Buf {
         long mtl, size, contents, cap;
+        /** Submit index of the last command buffer that reads this buffer (0 = never used by the GPU). */
+        long lastUse;
+        // pending staged map (large buffers): written by the CPU, copied in GPU order at unmap
+        long mapStaging, mapStagingCap, mapOffset, mapLength;
     }
+
+    /** Index of the command buffer currently being recorded (refreshed after every submit). */
+    static long recording = 1;
+
+    static void markUsed(Buf b) {
+        b.lastUse = recording;
+    }
+
+    static boolean gpuMayRead(Buf b) {
+        return b.lastUse != 0L && b.lastUse > NeoNative.completedIndex(ctx);
+    }
+
+    /**
+     * GL ordering for CPU writes: draws queued before a glBufferSubData / glMapBuffer must still see the old contents.
+     * If the GPU may still read the buffer, it gets fresh storage (contents copied unless the caller replaces them).
+     */
+    static void rename(Buf b, boolean keepContents) {
+        long old = b.mtl, oldContents = b.contents;
+        b.mtl = POOL.obtain(b.cap);
+        b.contents = NeoNative.bufferContents(b.mtl);
+        if (keepContents && b.size > 0) MemoryUtil.memCopy(oldContents, b.contents, b.size);
+        POOL.release(old, b.cap);
+        b.lastUse = 0L;
+        renames++;
+    }
+
+    static long renames;
 
     /**
      * Recycles MTLBuffers by power-of-two size class: a buffer handed back is reused once the GPU has finished the
@@ -95,6 +126,59 @@ public final class Gl {
     }
 
     static final BufferPool POOL = new BufferPool();
+
+    /**
+     * Linear staging arena for texture uploads and staged buffer writes: 16 MB blocks filled front to back, a block is
+     * reused once the GPU finished the command buffer that read it. Replaces one temporary MTLBuffer per upload
+     * (hundreds of thousands while a big modpack loads).
+     */
+    static final class Staging {
+        static final long BLOCK = 16L << 20;
+        private final ArrayDeque<long[]> free = new ArrayDeque<>();     // {buffer, contents}
+        private final ArrayDeque<long[]> pending = new ArrayDeque<>();  // {submitIndex, buffer, contents}
+        private long cur, curContents, curUsed = BLOCK;
+        long blocks;
+
+        /** Returns {buffer, offset, contentsAddress} for {@code size} bytes (16-byte aligned), or null if too large. */
+        long[] alloc(long size) {
+            if (size > BLOCK) return null;
+            if (curUsed + size > BLOCK) {
+                if (cur != 0L) pending.add(new long[]{recording, cur, curContents});
+                reclaim(NeoNative.completedIndex(ctx));
+                long[] b = free.pollFirst();
+                if (b == null) {
+                    long buf = NeoNative.bufferCreate(ctx, BLOCK);
+                    b = new long[]{buf, NeoNative.bufferContents(buf)};
+                    blocks++;
+                }
+                cur = b[0];
+                curContents = b[1];
+                curUsed = 0;
+            }
+            long off = curUsed;
+            curUsed = (curUsed + size + 255) & ~255L;
+            return new long[]{cur, off, curContents + off};
+        }
+
+        /** At frame end: the current block is closed so its space is reclaimed only after the GPU used it. */
+        void endFrame(long completed) {
+            if (cur != 0L && curUsed > 0) {
+                pending.add(new long[]{recording, cur, curContents});
+                cur = 0L;
+                curUsed = BLOCK;
+            }
+            reclaim(completed);
+        }
+
+        private void reclaim(long completed) {
+            while (!pending.isEmpty() && pending.peekFirst()[0] <= completed) {
+                long[] e = pending.pollFirst();
+                free.add(new long[]{e[1], e[2]});
+            }
+        }
+    }
+
+    static final Staging STAGING = new Staging();
     /** Bumped on every state change that affects pipeline selection (see Program.memo*). */
     static int stateVersion;
 
@@ -274,6 +358,7 @@ public final class Gl {
     public static void init(long context) {
         ctx = context;
         NeoNative.setDepthFlip(ctx, false);
+        recording = NeoNative.currentSubmitIndex(ctx);
         PF_RGBA8 = NeoNative.enumValue("pixel", "RGBA8_UNORM");
         PF_BGRA8 = NeoNative.enumValue("pixel", "BGRA8_UNORM");
         PF_R8 = NeoNative.enumValue("pixel", "R8_UNORM");
@@ -327,6 +412,7 @@ public final class Gl {
         if (blocking) NeoNative.surfaceAcquire(surface);
         NeoNative.surfaceBlit(ctx, surface, backColor, backW, backH);
         long submitted = NeoNative.submit(ctx);
+        recording = NeoNative.currentSubmitIndex(ctx);
         // Frame throttle: never more than FRAMES_IN_FLIGHT frames queued on the GPU. Without it (VSync off, GPU-bound
         // shader packs) the CPU runs ahead, the queue grows every second and input lag with it.
         long waitFor = FRAME_SUBMITS[(int) (frames % FRAMES_IN_FLIGHT)];
@@ -339,9 +425,10 @@ public final class Gl {
         long done = NeoNative.completedIndex(ctx);
         while (!RETIRED.isEmpty() && RETIRED.peekFirst()[0] <= done) NeoNative.release(RETIRED.pollFirst()[1]);
         POOL.collect(done);
+        STAGING.endFrame(done);
         if (++frames % 1200 == 0) {
-            LOG.info("[MineMetal GL] frame {}: {} draws/frame, pipeline memo {}% / hash {}% hits, buffers created {} / reused {}, fence waits {} (mid-frame submits {}), gpu-wait {} ms/frame", frames,
-                frameDraws, memoHits * 100 / Math.max(1, memoHits + memoMisses), hashHits * 100 / Math.max(1, memoMisses), POOL.created, POOL.reused, fenceWaits, midFrameSubmits, String.format("%.2f", gpuWaitNs / 1e6 / 1200));
+            LOG.info("[MineMetal GL] frame {}: {} draws/frame, pipeline memo {}% / hash {}% hits, buffers created {} / reused {} / renamed {} / staged {}, staging blocks {}, fence waits {} (mid-frame submits {}), gpu-wait {} ms/frame", frames,
+                frameDraws, memoHits * 100 / Math.max(1, memoHits + memoMisses), hashHits * 100 / Math.max(1, memoMisses), POOL.created, POOL.reused, renames, stagedWrites, STAGING.blocks, fenceWaits, midFrameSubmits, String.format("%.2f", gpuWaitNs / 1e6 / 1200));
             memoHits = memoMisses = hashHits = 0;
             fenceWaits = midFrameSubmits = 0;
             gpuWaitNs = 0;
@@ -405,14 +492,75 @@ public final class Gl {
     static void bufferSubData(int target, long offset, long size, long data) {
         Buf b = buffer(target);
         if (b == null || b.contents == 0L || data == 0L || offset + size > b.size) return;
+        if (gpuMayRead(b)) {
+            if (offset == 0 && size >= b.size) {
+                rename(b, false);                        // full replace: fresh storage, no copy
+            } else if (b.size <= RENAME_LIMIT) {
+                rename(b, true);                         // small: copy-on-write is cheapest
+            } else {
+                stagedWrite(b, offset, size, data);      // large: GPU-ordered copy of just this range
+                return;
+            }
+        }
         MemoryUtil.memCopy(data, b.contents + offset, size);
     }
 
-    static long mapBuffer(int target, long offset) {
+    /** access: GL_MAP_* bits (0x8 invalidate buffer, 0x20 unsynchronized); -1 = glMapBuffer. */
+    static long mapBuffer(int target, long offset, int access) {
+        return mapBuffer(target, offset, -1L, access);
+    }
+
+    static long mapBuffer(int target, long offset, long length, int access) {
         Buf b = buffer(target);
         if (b == null) return 0L;
         if (b.mtl == 0L) bufferData(target, Math.max(b.size, 16), 0L);
+        if (access == -1 || (access & 0x20) == 0) {
+            if (gpuMayRead(b)) {
+                boolean keep = access == -1 || (access & 0x8) == 0;
+                if (!keep || b.size <= RENAME_LIMIT || length <= 0) {
+                    rename(b, keep);
+                } else {
+                    // large buffer, partial map: hand out a staging range, copied into place (in GPU order) at unmap
+                    long cap = BufferPool.sizeClass(length);
+                    b.mapStaging = POOL.obtain(cap);
+                    b.mapStagingCap = cap;
+                    b.mapOffset = offset;
+                    b.mapLength = length;
+                    long p = NeoNative.bufferContents(b.mapStaging);
+                    if ((access & 0x4) == 0) MemoryUtil.memCopy(b.contents + offset, p, length); // not INVALIDATE_RANGE
+                    return p;
+                }
+            }
+        }
         return b.contents + offset;
+    }
+
+    static void unmapBuffer(int target) {
+        Buf b = buffer(target);
+        if (b == null || b.mapStaging == 0L) return;
+        NeoNative.copyBuffer(ctx, b.mapStaging, 0, b.mtl, b.mapOffset, b.mapLength);
+        POOL.release(b.mapStaging, b.mapStagingCap);
+        b.mapStaging = 0L;
+        stagedWrites++;
+    }
+
+    /** Copy-on-write threshold: above this a write is staged and copied by the GPU instead of duplicating the buffer. */
+    private static final long RENAME_LIMIT = 256 * 1024;
+    static long stagedWrites;
+
+    private static void stagedWrite(Buf b, long offset, long size, long data) {
+        long[] a = STAGING.alloc(size);
+        if (a != null) {
+            MemoryUtil.memCopy(data, a[2], size);
+            NeoNative.copyBuffer(ctx, a[0], a[1], b.mtl, offset, size);
+        } else {
+            long cap = BufferPool.sizeClass(size);
+            long st = POOL.obtain(cap);
+            MemoryUtil.memCopy(data, NeoNative.bufferContents(st), size);
+            NeoNative.copyBuffer(ctx, st, 0, b.mtl, offset, size);
+            POOL.release(st, cap);
+        }
+        stagedWrites++;
     }
 
     static long bufferSize(int target) {
@@ -540,9 +688,11 @@ public final class Gl {
         long src = pixels + unpackSkipRows * srcRow + (long) unpackSkipPixels * srcBpp;
         int dstBpp = t.bpp;
         long dstRow = (long) w * dstBpp;
-        long stagingCap = BufferPool.sizeClass(dstRow * h);
-        long staging = POOL.obtain(stagingCap);
-        long dst = NeoNative.bufferContents(staging);
+        long[] arena = STAGING.alloc(dstRow * h);
+        long stagingCap = arena == null ? BufferPool.sizeClass(dstRow * h) : 0L;
+        long staging = arena != null ? arena[0] : POOL.obtain(stagingCap);
+        long stagingOffset = arena != null ? arena[1] : 0L;
+        long dst = arena != null ? arena[2] : NeoNative.bufferContents(staging);
         boolean expandRgb = comps == 3 && ts == 1 && dstBpp == 4;
         boolean swapBgra = format == 0x80E1 && ts == 1 && dstBpp == 4;
         for (int row = 0; row < h; row++) {
@@ -564,8 +714,8 @@ public final class Gl {
                 MemoryUtil.memCopy(s, d, Math.min(dstRow, (long) w * srcBpp));
             }
         }
-        NeoNative.copyBufferToTexture(ctx, staging, 0, dstRow, dstRow * h, t.mtl, 0, level, x, y, w, h);
-        POOL.release(staging, stagingCap);
+        NeoNative.copyBufferToTexture(ctx, staging, stagingOffset, dstRow, dstRow * h, t.mtl, 0, level, x, y, w, h);
+        if (arena == null) POOL.release(staging, stagingCap);
     }
 
     static void texParameter(int target, int pname, int value) {
@@ -1456,6 +1606,8 @@ public final class Gl {
         Buf src = buffer(readTarget), dst = buffer(writeTarget);
         if (src == null || dst == null || src.mtl == 0L || dst.mtl == 0L || size <= 0) return;
         if (readOffset + size > src.size || writeOffset + size > dst.size) return;
+        // Only the source is protected: renaming the destination would drop the pending GPU copy into it.
+        markUsed(src);
         NeoNative.copyBuffer(ctx, src.mtl, readOffset, dst.mtl, writeOffset, size);
     }
 
@@ -1491,6 +1643,7 @@ public final class Gl {
             if (binding < 0 || binding >= 32) continue;
             Buf b = BUFFERS.get(UBO_BUFFER[binding]);
             if (b == null || b.mtl == 0L) continue;
+            markUsed(b);
             NeoNative.passSetBuffer(ctx, stageBit, b.mtl, UBO_OFFSET[binding], e.getValue());
         }
     }
@@ -1562,6 +1715,7 @@ public final class Gl {
         if (timeoutNs <= 0L && (flags & 1) == 0) return 0x911B;           // TIMEOUT_EXPIRED
         if (NeoNative.currentSubmitIndex(ctx) <= idx) {
             NeoNative.submit(ctx);
+            recording = NeoNative.currentSubmitIndex(ctx);
             midFrameSubmits++;
         }
         fenceWaits++;
@@ -1634,6 +1788,7 @@ public final class Gl {
                 for (int s = 0; s < 8 && SLOT_STRIDES[s] != 0; s++) {
                     Buf b = BUFFERS.get(SLOT_BUFFERS[s]);
                     if (b == null || b.mtl == 0L) return;
+                    markUsed(b);
                     NeoNative.passSetVertexBuffer(ctx, b.mtl, 0, VERTEX_SLOT_BASE + s);
                 }
                 NeoNative.passSetVertexBuffer(ctx, zeroBuffer, 0, ZERO_SLOT);
@@ -1652,6 +1807,7 @@ public final class Gl {
                     if (t != null && t.texBuffer >= 0) {
                         Buf tb = BUFFERS.get(t.texBuffer);
                         if (tb != null && tb.mtl != 0L) {
+                            markUsed(tb);
                             long len = t.texBufferSize >= 0 ? t.texBufferSize : tb.size - t.texBufferOffset;
                             NeoNative.passSetTexelBuffer(ctx, 3, tb.mtl, t.texBufferOffset, len, t.texBufferFormat, t.texBufferBpp, i);
                         }
@@ -1661,6 +1817,7 @@ public final class Gl {
                     NeoNative.passSetTexture(ctx, 3, tex, i);
                     NeoNative.passSetSampler(ctx, 3, SAMPLER_HANDLES[i], p.samplerSlots != null ? p.samplerSlots[i] : i);
                 }
+                if (indexed) markUsed(ebo);
                 if (indexed && multiCount > 0) {
                     boolean is32 = indexType == 0x1405;
                     int isz = is32 ? 4 : 2;
