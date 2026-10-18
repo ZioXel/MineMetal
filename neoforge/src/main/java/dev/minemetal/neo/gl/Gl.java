@@ -206,15 +206,17 @@ public final class Gl {
                 continue;
             }
             int stride = a.stride > 0 ? a.stride : a.size * typeBytes(a.type);
+            long vbase = slotBase(a, stride);
             int slot = -1;
-            for (int s = 0; s < slots; s++) if (SLOT_BUFFERS[s] == a.buffer && SLOT_STRIDES[s] == stride && SLOT_DIVISOR[s] == a.divisor) slot = s;
+            for (int s = 0; s < slots; s++) if (SLOT_BUFFERS[s] == a.buffer && SLOT_STRIDES[s] == stride && SLOT_DIVISOR[s] == a.divisor && SLOT_BASE_OFFSET[s] == vbase) slot = s;
             if (slot < 0 && slots < 8) {
                 slot = slots++;
                 SLOT_BUFFERS[slot] = a.buffer;
                 SLOT_STRIDES[slot] = stride;
                 SLOT_DIVISOR[slot] = a.divisor;
+                SLOT_BASE_OFFSET[slot] = vbase;
             }
-            h = mix(h, (long) a.divisor << 40 ^ slot | (long) stride << 8 | a.offset << 24);
+            h = mix(h, (long) a.divisor << 40 ^ slot | (long) stride << 8 | (a.offset - vbase) << 24);
             h = mix(h, a.type | (long) a.size << 16 | (a.normalized ? 1L << 20 : 0) | (a.integer ? 1L << 21 : 0));
         }
         h = mix(h, blendBits != 0 ? blendSrcRgb | (long) blendDstRgb << 16 | (long) blendSrcA << 32 | (long) blendDstA << 48 : 7);
@@ -280,6 +282,8 @@ public final class Gl {
         final Map<String, Integer> locations = new HashMap<>();
         ByteBuffer vsBlock, fsBlock;
         int[] samplerUnits = new int[0];
+        /** Per sampler: which texture target it reads (TARGET_2D / TARGET_CUBE / TARGET_BUFFER), from the MSL. */
+        int[] samplerTargets = new int[0];
         final Map<String, Long> pipelines = new HashMap<>();
         final it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap pipelinesByHash = new it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap();
         // last pipeline used, valid while nothing that feeds the pipeline key changed
@@ -294,6 +298,7 @@ public final class Gl {
         int memoVersion = -1, memoVao = -1, memoMode = -1, memoFbo = -1, memoSlots;
         long memoPso;
         final int[] memoSlotBuffers = new int[8], memoSlotStrides = new int[8], memoSlotDivisors = new int[8];
+        final long[] memoSlotBases = new long[8];
         boolean failedLogged;
     }
 
@@ -369,6 +374,13 @@ public final class Gl {
     static final float[] clearColor = new float[4];
     static double clearDepth = 1.0;
     static int unpackRowLength, unpackSkipRows, unpackSkipPixels, unpackAlignment = 4;
+    static int packRowLength, packAlignment = 4;
+
+    /** Buffer bound to GL_PIXEL_UNPACK_BUFFER (texture uploads then read from it; the pointer is an offset), or null. */
+    private static Buf unpackBuffer() {
+        Integer id = otherBuffers.get(0x88EC);
+        return id == null || id == 0 ? null : BUFFERS.get((int) id);
+    }
 
     // default framebuffer
     static long backColor, backDepth;
@@ -461,6 +473,7 @@ public final class Gl {
         while (!RETIRED.isEmpty() && RETIRED.peekFirst()[0] <= done) NeoNative.release(RETIRED.pollFirst()[1]);
         POOL.collect(done);
         STAGING.endFrame(done);
+        updateFrameTrace();
         if (++frames % 1200 == 0) {
             LOG.info("[MineMetal GL] frame {}: {} draws/frame, pipeline memo {}% / hash {}% hits, buffers created {} / reused {} / renamed {} / staged {}, staging blocks {}, fence waits {} (mid-frame submits {}), gpu-wait {} ms/frame", frames,
                 frameDraws, memoHits * 100 / Math.max(1, memoHits + memoMisses), hashHits * 100 / Math.max(1, memoMisses), POOL.created, POOL.reused, renames, stagedWrites, STAGING.blocks, fenceWaits, midFrameSubmits, String.format("%.2f", gpuWaitNs / 1e6 / 1200));
@@ -612,12 +625,58 @@ public final class Gl {
     // ---- textures --------------------------------------------------------------------------------------------------
 
     static Tex boundTexture() {
-        int id = units[activeUnit];
+        return boundTexture(0x0DE1);
+    }
+
+    /**
+     * GL keeps one binding per texture target on every unit: a cube map or buffer texture bound to unit 0 does not
+     * replace the 2D texture there. 26.3 relies on it (GlStateManager caches only 2D bindings, so after the clouds' buffer
+     * texture used unit 0 the lightmap was not re-bound and the first-person hand sampled the cloud buffer: black items).
+     */
+    static final int TARGET_2D = 0, TARGET_CUBE = 1, TARGET_BUFFER = 2;
+    static final int[] cubeUnits = new int[32], bufferUnits = new int[32];
+
+    private static int targetKind(int target) {
+        if (target == 0x8513 || (target >= 0x8515 && target <= 0x851A)) return TARGET_CUBE;
+        return target == 0x8C2A ? TARGET_BUFFER : TARGET_2D;
+    }
+
+    private static int[] unitTable(int kind) {
+        return kind == TARGET_CUBE ? cubeUnits : kind == TARGET_BUFFER ? bufferUnits : units;
+    }
+
+    static Tex boundTexture(int target) {
+        int id = unitTable(targetKind(target))[activeUnit];
         return id == 0 ? null : TEXTURES.computeIfAbsent(id, k -> new Tex());
     }
 
+    /** Texture name a sampler of program {@code p} reads from on {@code unit}. */
+    private static int samplerTexture(Program p, int sampler, int unit) {
+        if (unit < 0 || unit >= units.length) return 0;
+        int kind = sampler < p.samplerTargets.length ? p.samplerTargets[sampler] : TARGET_2D;
+        return unitTable(kind)[unit];
+    }
+
+    private static final java.util.regex.Pattern MSL_TEXTURE =
+        java.util.regex.Pattern.compile("(texture_buffer|texturecube|depthcube|texture2d|depth2d|texture3d|texture2d_array|texture1d)\\s*<[^>]*>\\s+\\w+\\s*\\[\\[texture\\((\\d+)\\)\\]\\]");
+
+    private static int[] samplerTargets(int count, String vs, String fs) {
+        int[] kinds = new int[count];
+        for (String msl : new String[]{vs, fs}) {
+            if (msl == null) continue;
+            java.util.regex.Matcher m = MSL_TEXTURE.matcher(msl);
+            while (m.find()) {
+                int slot = Integer.parseInt(m.group(2));
+                if (slot < 0 || slot >= count) continue;
+                String type = m.group(1);
+                kinds[slot] = type.equals("texture_buffer") ? TARGET_BUFFER : type.endsWith("cube") ? TARGET_CUBE : TARGET_2D;
+            }
+        }
+        return kinds;
+    }
+
     static void bindTexture(int target, int id) {
-        units[activeUnit] = id;
+        unitTable(targetKind(target))[activeUnit] = id;
         if (id != 0) {
             Tex t = TEXTURES.computeIfAbsent(id, k -> new Tex());
             if (target == 0x8513 && t.mtl == 0L) t.cube = true; // GL_TEXTURE_CUBE_MAP, not allocated yet
@@ -627,7 +686,7 @@ public final class Gl {
     static void deleteTexture(int id) {
         Tex t = TEXTURES.remove(id);
         if (t != null) freeTexture(t);
-        for (int i = 0; i < units.length; i++) if (units[i] == id) units[i] = 0;
+        for (int[] table : new int[][]{units, cubeUnits, bufferUnits}) for (int i = 0; i < table.length; i++) if (table[i] == id) table[i] = 0;
     }
 
     private static void freeTexture(Tex t) {
@@ -688,7 +747,7 @@ public final class Gl {
             proxyWidth = w <= MAX_TEXTURE_SIZE && h <= MAX_TEXTURE_SIZE ? w : 0;
             return;
         }
-        Tex t = boundTexture();
+        Tex t = boundTexture(target);
         if (t == null) return;
         int face = cubeFace(target);
         if (face >= 0) {
@@ -701,7 +760,8 @@ public final class Gl {
         } else if (t.mtl == 0L || level >= t.mips) {
             allocate(t, ifmt, Math.max(w << level, 1), Math.max(h << level, 1), level + 1);
         }
-        if (pixels != 0L) upload(t, level, 0, 0, w, h, format, type, pixels);
+        Buf pbo = unpackBuffer();
+        if (pixels != 0L || pbo != null) upload(t, 0, level, 0, 0, w, h, format, type, pixels, pbo);
         if (texLogs++ < 0) {
             LOG.info("[MineMetal GL] texImage2D tex={} level={} ifmt=0x{} {}x{} fmt=0x{} type=0x{} data={} -> mips={} pf={}", units[activeUnit],
                 level, Integer.toHexString(ifmt), w, h, Integer.toHexString(format), Integer.toHexString(type), pixels != 0L, t.mips, t.pf);
@@ -720,13 +780,15 @@ public final class Gl {
         } else if (t.mtl == 0L || level >= t.mips) {
             allocate(t, ifmt, Math.max(w << level, 1), Math.max(h << level, 1), level + 1);
         }
-        if (pixels != 0L) upload(t, face, level, 0, 0, w, h, format, type, pixels);
+        Buf pbo = unpackBuffer();
+        if (pixels != 0L || pbo != null) upload(t, face, level, 0, 0, w, h, format, type, pixels, pbo);
     }
 
     static void texSubImage2D(int target, int level, int x, int y, int w, int h, int format, int type, long pixels) {
-        Tex t = boundTexture();
-        if (t == null || t.mtl == 0L || pixels == 0L || level >= t.mips) return;
-        upload(t, Math.max(cubeFace(target), 0), level, x, y, w, h, format, type, pixels);
+        Tex t = boundTexture(target);
+        Buf pbo = unpackBuffer();
+        if (t == null || t.mtl == 0L || (pixels == 0L && pbo == null) || level >= t.mips) return;
+        upload(t, Math.max(cubeFace(target), 0), level, x, y, w, h, format, type, pixels, pbo);
     }
 
     private static int components(int format) {
@@ -748,10 +810,14 @@ public final class Gl {
     }
 
     private static void upload(Tex t, int level, int x, int y, int w, int h, int format, int type, long pixels) {
-        upload(t, 0, level, x, y, w, h, format, type, pixels);
+        upload(t, 0, level, x, y, w, h, format, type, pixels, null);
     }
 
-    private static void upload(Tex t, int slice, int level, int x, int y, int w, int h, int format, int type, long pixels) {
+    /**
+     * {@code pbo} != null: GL_PIXEL_UNPACK_BUFFER is bound and {@code pixels} is an offset into it (26.3 uploads textures
+     * this way). Layout-compatible data is copied by the GPU straight from that buffer, in command order.
+     */
+    private static void upload(Tex t, int slice, int level, int x, int y, int w, int h, int format, int type, long pixels, Buf pbo) {
         if (w <= 0 || h <= 0) return;
         int ts = typeSize(type);
         int comps = components(format);
@@ -759,7 +825,21 @@ public final class Gl {
         int rowPixels = unpackRowLength > 0 ? unpackRowLength : w;
         int align = Math.max(unpackAlignment, 1);
         long srcRow = ((long) rowPixels * srcBpp + align - 1) / align * align;
-        long src = pixels + unpackSkipRows * srcRow + (long) unpackSkipPixels * srcBpp;
+        long skip = unpackSkipRows * srcRow + (long) unpackSkipPixels * srcBpp;
+        if (pbo != null) {
+            if (pbo.mtl == 0L || pixels + skip + srcRow * (h - 1) + (long) w * srcBpp > pbo.size) {
+                warnOnce("pbo-range", "texture upload outside its GL_PIXEL_UNPACK_BUFFER ignored");
+                return;
+            }
+            boolean direct = srcBpp == t.bpp && format != 0x80E1 && (pixels + skip) % srcBpp == 0 && srcRow % srcBpp == 0;
+            if (direct) {
+                NeoNative.copyBufferToTexture(ctx, pbo.mtl, pixels + skip, srcRow, srcRow * h, t.mtl, slice, level, x, y, w, h);
+                markUsed(pbo);
+                return;
+            }
+            pixels = pbo.contents + pixels; // conversion needed: read the buffer on the CPU
+        }
+        long src = pixels + skip;
         int dstBpp = t.bpp;
         long dstRow = (long) w * dstBpp;
         long[] arena = STAGING.alloc(dstRow * h);
@@ -793,7 +873,7 @@ public final class Gl {
     }
 
     static void texParameter(int target, int pname, int value) {
-        Tex t = boundTexture();
+        Tex t = boundTexture(target);
         if (t == null) return;
         switch (pname) {
             case 0x2801 -> t.minFilter = value;
@@ -815,7 +895,7 @@ public final class Gl {
     }
 
     static void texParameterf(int target, int pname, float value) {
-        Tex t = boundTexture();
+        Tex t = boundTexture(target);
         if (t == null) return;
         if (pname == 0x84FE) {
             t.aniso = value;
@@ -1033,20 +1113,93 @@ public final class Gl {
     }
 
     static void clear(int mask) {
+        if (tracingFrame) traceClear("glClear mask=0x" + Integer.toHexString(mask) + " depth=" + clearDepth + " color=" + java.util.Arrays.toString(clearColor));
+        if (scissoredClear(mask & (0x4000 | 0x100), -1)) return;
         try (MemoryStack stack = MemoryStack.stackPush()) {
             if (beginPass(mask & (0x4000 | 0x100), stack)) NeoNative.passEnd(ctx);
         }
     }
 
+    /**
+     * GL clears only the scissor box; a Metal load-action clear always covers the whole attachment. 26.3 clears single
+     * slots of the GUI item atlas with a scissored glClear (a full clear erased every other item icon), so a partial box
+     * is cleared with a scissored quad instead. Returns false when the box covers the attachment (use a normal clear).
+     */
+    private static boolean scissoredClear(int clearMask, int colorFilter) {
+        if (!scissorTest || clearMask == 0) return false;
+        int count = attachments(drawFbo, A_COLORS, A_FORMATS, A_DEPTH);
+        if (count < 0) return false;
+        int x0 = Math.max(scissor[0], 0), y0 = Math.max(scissor[1], 0);
+        int x1 = Math.min(scissor[0] + scissor[2], attachW), y1 = Math.min(scissor[1] + scissor[3], attachH);
+        if (x0 <= 0 && y0 <= 0 && x1 >= attachW && y1 >= attachH) return false;
+        if (x1 <= x0 || y1 <= y0) return true; // empty box: nothing to clear
+        boolean depthPending = (clearMask & 0x100) != 0 && A_DEPTH[0] != 0L;
+        if ((clearMask & 0x4000) != 0) {
+            for (int i = 0; i < count; i++) {
+                if (A_COLORS[i] == 0L || (colorFilter >> i & 1) == 0) continue;
+                NeoNative.clearRegion(ctx, A_COLORS[i], depthPending ? A_DEPTH[0] : 0L, 0, clearColor[0], clearColor[1], clearColor[2],
+                    clearColor[3], clearDepth, x0, y0, x1 - x0, y1 - y0);
+                depthPending = false;
+            }
+        }
+        if (depthPending) {
+            warnOnce("scissor-depth-clear", "scissored depth-only clear is not supported yet; clearing the whole depth attachment");
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * glReadPixels into the buffer bound to GL_PIXEL_PACK_BUFFER (how 26.3 reads textures back, e.g. screenshots): a GPU
+     * copy in command order; the caller waits on a fence before mapping. Rows stay in GL's bottom-up order, like every
+     * texture here. Reading into client memory is not supported.
+     */
+    static void readPixels(int x, int y, int w, int h, int format, int type, long offset) {
+        if (w <= 0 || h <= 0) return;
+        Integer packId = otherBuffers.get(0x88EB);
+        Buf b = packId == null || packId == 0 ? null : BUFFERS.get((int) packId);
+        if (b == null || b.mtl == 0L) {
+            warnOnce("readpixels-client", "glReadPixels into client memory is not supported yet (ignored)");
+            return;
+        }
+        boolean depth = format == 0x1902;
+        long tex;
+        int texBpp, level = 0;
+        if (readFbo == 0) {
+            tex = depth ? backDepth : backColor;
+            texBpp = 4;
+        } else {
+            Fbo f = FBOS.get(readFbo);
+            Tex t = f == null ? null : TEXTURES.get(depth ? f.depth : f.color[0]);
+            if (t == null || t.mtl == 0L) return;
+            tex = t.mtl;
+            texBpp = t.bpp;
+            if (!depth) level = f.colorLevel[0];
+        }
+        int ts = typeSize(type);
+        int bpp = ts < 0 ? -ts : ts * components(format);
+        if (bpp != texBpp || format == 0x80E1) {
+            warnOnce("readpixels-fmt", "glReadPixels with a format conversion is not supported yet (ignored)");
+            return;
+        }
+        int rowPixels = packRowLength > 0 ? packRowLength : w;
+        int align = Math.max(packAlignment, 1);
+        long row = ((long) rowPixels * bpp + align - 1) / align * align;
+        if (offset + row * (h - 1) + (long) w * bpp > b.size) return;
+        NeoNative.copyTextureToBuffer(ctx, tex, 0, level, x, y, w, h, b.mtl, offset, row, row * h);
+        markUsed(b);
+    }
+
     /** glClearBufferfv: GL_COLOR clears one draw buffer (identity draw-buffer mapping), GL_DEPTH the depth attachment. */
     static void clearBuffer(int buffer, int drawBuffer, long value) {
         if (value == 0L) return;
+        if (tracingFrame) traceClear("glClearBufferfv buffer=0x" + Integer.toHexString(buffer) + " drawBuffer=" + drawBuffer + " value0=" + MemoryUtil.memGetFloat(value));
         try (MemoryStack stack = MemoryStack.stackPush()) {
             if (buffer == 0x1800 && drawBuffer >= 0 && drawBuffer < 8) {
                 float r = clearColor[0], g = clearColor[1], b = clearColor[2], a = clearColor[3];
                 for (int c = 0; c < 4; c++) clearColor[c] = MemoryUtil.memGetFloat(value + c * 4L);
                 try {
-                    if (beginPass(0x4000, 1 << drawBuffer, stack)) NeoNative.passEnd(ctx);
+                    if (!scissoredClear(0x4000, 1 << drawBuffer) && beginPass(0x4000, 1 << drawBuffer, stack)) NeoNative.passEnd(ctx);
                 } finally {
                     clearColor[0] = r;
                     clearColor[1] = g;
@@ -1057,7 +1210,7 @@ public final class Gl {
                 double saved = clearDepth;
                 clearDepth = MemoryUtil.memGetFloat(value);
                 try {
-                    if (beginPass(0x100, 0, stack)) NeoNative.passEnd(ctx);
+                    if (!scissoredClear(0x100, 0) && beginPass(0x100, 0, stack)) NeoNative.passEnd(ctx);
                 } finally {
                     clearDepth = saved;
                 }
@@ -1203,6 +1356,8 @@ public final class Gl {
         }
         List<String> samplers = p.result.samplers();
         p.samplerUnits = new int[samplers.size()];
+        p.samplerTargets = samplerTargets(samplers.size(), p.result.vertex() == null ? null : p.result.vertex().msl,
+            p.result.fragment() == null ? null : p.result.fragment().msl);
         for (int i = 0; i < samplers.size(); i++) uniform(p, samplers.get(i)).samplerIndex = i;
     }
 
@@ -1432,11 +1587,22 @@ public final class Gl {
     private static final long[] SLOT_BASE_OFFSET = new long[8];
     private static final int[] SLOT_DIVISOR = new int[8];
 
+    /**
+     * Where a vertex buffer slot starts: the attribute offset rounded down to a multiple of the stride. The Metal
+     * vertex buffer is bound at that offset and the pipeline only sees the remainder (< stride). 26.3 points
+     * attributes deep into large transient buffers (offsets of megabytes); Metal requires attribute offsets within the
+     * stride, and keeping the absolute offset out of the pipeline also lets one pipeline serve every draw.
+     */
+    private static long slotBase(Attrib a, int stride) {
+        return stride > 0 ? a.offset - a.offset % stride : 0L;
+    }
+
     private static long pipeline(Program p, Vao va, int mode, StringBuilder key, int colorCount) {
         if (p.memoPso != 0L && p.memoVersion == stateVersion && p.memoVao == vao && p.memoMode == mode && p.memoFbo == drawFbo) {
             System.arraycopy(p.memoSlotBuffers, 0, SLOT_BUFFERS, 0, 8);
             System.arraycopy(p.memoSlotStrides, 0, SLOT_STRIDES, 0, 8);
             System.arraycopy(p.memoSlotDivisors, 0, SLOT_DIVISOR, 0, 8);
+            System.arraycopy(p.memoSlotBases, 0, SLOT_BASE_OFFSET, 0, 8);
             memoHits++;
             return p.memoPso;
         }
@@ -1459,6 +1625,7 @@ public final class Gl {
         System.arraycopy(SLOT_BUFFERS, 0, p.memoSlotBuffers, 0, 8);
         System.arraycopy(SLOT_STRIDES, 0, p.memoSlotStrides, 0, 8);
         System.arraycopy(SLOT_DIVISOR, 0, p.memoSlotDivisors, 0, 8);
+        System.arraycopy(SLOT_BASE_OFFSET, 0, p.memoSlotBases, 0, 8);
         return pso;
     }
 
@@ -1479,17 +1646,18 @@ public final class Gl {
                 continue;
             }
             int stride = a.stride > 0 ? a.stride : a.size * typeBytes(a.type);
+            long vbase = slotBase(a, stride);
             int slot = -1;
-            for (int s = 0; s < slots; s++) if (SLOT_BUFFERS[s] == a.buffer && SLOT_STRIDES[s] == stride && SLOT_DIVISOR[s] == a.divisor) slot = s;
+            for (int s = 0; s < slots; s++) if (SLOT_BUFFERS[s] == a.buffer && SLOT_STRIDES[s] == stride && SLOT_DIVISOR[s] == a.divisor && SLOT_BASE_OFFSET[s] == vbase) slot = s;
             if (slot < 0 && slots < 8) {
                 slot = slots++;
                 SLOT_BUFFERS[slot] = a.buffer;
                 SLOT_STRIDES[slot] = stride;
                 SLOT_DIVISOR[slot] = a.divisor;
-                SLOT_BASE_OFFSET[slot] = 0;
+                SLOT_BASE_OFFSET[slot] = vbase;
             }
             if (slot < 0) continue;
-            key.append(in.location()).append(':').append(slot).append(':').append(stride).append(':').append(a.offset).append(':')
+            key.append(in.location()).append(':').append(slot).append(':').append(stride).append(':').append(a.offset - vbase).append(':')
                 .append(vertexFormatName(a, in.baseType())).append(',');
         }
         // fixed-function state + attachment formats
@@ -1540,11 +1708,12 @@ public final class Gl {
                     MemoryUtil.memPutInt(base + 12, (int) vertexFormat(f));
                 } else {
                     int stride = a.stride > 0 ? a.stride : a.size * typeBytes(a.type);
+                    long vbase = slotBase(a, stride);
                     int slot = 0;
-                    for (int s = 0; s < slots; s++) if (SLOT_BUFFERS[s] == a.buffer && SLOT_STRIDES[s] == stride && SLOT_DIVISOR[s] == a.divisor) slot = s;
+                    for (int s = 0; s < slots; s++) if (SLOT_BUFFERS[s] == a.buffer && SLOT_STRIDES[s] == stride && SLOT_DIVISOR[s] == a.divisor && SLOT_BASE_OFFSET[s] == vbase) slot = s;
                     MemoryUtil.memPutInt(base, in.location());
                     MemoryUtil.memPutInt(base + 4, VERTEX_SLOT_BASE + slot);
-                    MemoryUtil.memPutInt(base + 8, (int) a.offset);
+                    MemoryUtil.memPutInt(base + 8, (int) (a.offset - vbase));
                     MemoryUtil.memPutInt(base + 12, (int) vertexFormat(vertexFormatName(a, in.baseType())));
                 }
                 n++;
@@ -1640,6 +1809,77 @@ public final class Gl {
     }
     private static final Set<Integer> TRACED = new HashSet<>();
     private static final int TRACE_DRAWS = Integer.getInteger("minemetal.traceDraws", 0);
+
+    // ---- one-frame trace: `touch minemetal-trace` in the game directory dumps every clear and draw of the next frame ----
+
+    static boolean tracingFrame;
+    private static boolean traceNext;
+    private static int tracedDraws;
+
+    private static void updateFrameTrace() {
+        if (tracingFrame) {
+            tracingFrame = false;
+            LOG.info("[MineMetal GL] ==== frame trace end ({} draws) ====", tracedDraws);
+        }
+        if (traceNext) {
+            traceNext = false;
+            tracingFrame = true;
+            tracedDraws = 0;
+            LOG.info("[MineMetal GL] ==== frame trace begin (frame {}) ====", frames + 1);
+        } else if (frames % 30 == 0) {
+            try {
+                java.nio.file.Path f = dev.minemetal.neo.gl.compile.GameDir.get().resolve("minemetal-trace");
+                if (java.nio.file.Files.deleteIfExists(f)) traceNext = true;
+            } catch (java.io.IOException | RuntimeException ignored) {
+            }
+        }
+    }
+
+    private static void traceClear(String what) {
+        int count = attachments(drawFbo, A_COLORS, A_FORMATS, A_DEPTH);
+        LOG.info("[MineMetal GL] T clear {} fbo={} {}x{} colors={} depthAtt={} scissor={} {}", what, drawFbo, attachW, attachH, count,
+            A_DEPTH[0] != 0L, scissorTest, java.util.Arrays.toString(scissor));
+    }
+
+    private static void traceFrameDraw(Program p, Vao va, int mode, int count, boolean indexed, long indexOffset, int colorCount) {
+        tracedDraws++;
+        StringBuilder sb = new StringBuilder("[MineMetal GL] T draw prog=").append(currentProgram).append(" mode=").append(mode)
+            .append(" count=").append(count).append(" inst=").append(instances).append(" baseV=").append(baseVertex)
+            .append(indexed ? " idxOff=" + indexOffset : " first").append(" multi=").append(multiCount)
+            .append(" fbo=").append(drawFbo).append(' ').append(attachW).append('x').append(attachH).append(" colors=").append(colorCount)
+            .append(" depthAtt=").append(A_DEPTH[0] != 0L)
+            .append(" vp=").append(java.util.Arrays.toString(viewport)).append(" sc=").append(scissorTest ? java.util.Arrays.toString(scissor) : "off")
+            .append(" depth=").append(depthTest ? "0x" + Integer.toHexString(depthFunc) + (depthMask ? "w" : "r") : "off")
+            .append(" cull=").append(cullFace ? "0x" + Integer.toHexString(cullMode) : "off").append(" front=0x").append(Integer.toHexString(frontFace))
+            .append(" blend=").append(blendBits).append(" masks=").append(Long.toHexString(packedColorMasks()));
+        sb.append("\n     slots:");
+        for (int s = 0; s < 8 && SLOT_STRIDES[s] != 0; s++) {
+            sb.append(" [buf=").append(SLOT_BUFFERS[s]).append(" stride=").append(SLOT_STRIDES[s]).append(" base=").append(SLOT_BASE_OFFSET[s])
+                .append(" div=").append(SLOT_DIVISOR[s]).append(']');
+        }
+        for (int i = 0; i < p.blockNames.size(); i++) {
+            int binding = i < p.blockBindings.length ? p.blockBindings[i] : -1;
+            sb.append("\n     ubo ").append(p.blockNames.get(i)).append(" binding=").append(binding);
+            if (binding < 0 || binding >= 32) continue;
+            Buf b = BUFFERS.get(UBO_BUFFER[binding]);
+            sb.append(" buf=").append(UBO_BUFFER[binding]).append(" off=").append(UBO_OFFSET[binding]).append(" size=").append(UBO_SIZE[binding]);
+            if (b != null && b.contents != 0L) {
+                sb.append(" data=[");
+                int n = (int) Math.min(16, Math.max(0, (b.size - UBO_OFFSET[binding]) / 4));
+                for (int k = 0; k < n; k++) sb.append(String.format("%.4g", MemoryUtil.memGetFloat(b.contents + UBO_OFFSET[binding] + k * 4L))).append(k + 1 < n ? "," : "");
+                sb.append(']');
+            }
+        }
+        sb.append("\n     samplers=").append(p.result.samplers()).append(" units=").append(java.util.Arrays.toString(p.samplerUnits)).append(" tex=[");
+        for (int i = 0; i < p.samplerUnits.length; i++) {
+            int unit = p.samplerUnits[i];
+            int id = samplerTexture(p, i, unit);
+            Tex t = TEXTURES.get(id);
+            sb.append(id).append(t == null ? "" : "(" + t.w + "x" + t.h + " base=" + t.baseLevel + ")").append(i + 1 < p.samplerUnits.length ? "," : "");
+        }
+        sb.append(']');
+        LOG.info(sb.toString());
+    }
 
     private static void trace(Program p, Vao va, int mode, int count, boolean indexed, int indexType, int colorCount) {
         StringBuilder sb = new StringBuilder("[MineMetal GL] draw#").append(draws).append(" prog=").append(currentProgram)
@@ -1761,7 +2001,7 @@ public final class Gl {
 
     /** glTexBuffer(Range): the bound GL_TEXTURE_BUFFER texture reads from {@code buffer}. */
     static void texBuffer(int ifmt, int buffer, long offset, long size) {
-        Tex t = boundTexture();
+        Tex t = boundTexture(0x8C2A);
         if (t == null) return;
         t.texBuffer = buffer;
         t.texBufferOffset = offset;
@@ -1819,19 +2059,23 @@ public final class Gl {
         return idx == 0L || NeoNative.completedIndex(ctx) >= idx;
     }
 
-    /** glClientWaitSync: flushes (submits) the fence's command buffer if needed, then waits. */
+    /**
+     * glClientWaitSync: flushes (submits) the fence's command buffer if needed, then waits. The timeout is a GLuint64:
+     * as a Java long, negative values are huge (GL_TIMEOUT_IGNORED = all bits set, used by 26.3 every frame) and mean
+     * "wait until signaled", which the native wait treats as the same.
+     */
     static int clientWaitSync(long sync, int flags, long timeoutNs) {
         long idx = FENCES.get(sync);
         if (idx == 0L || NeoNative.completedIndex(ctx) >= idx) return 0x911A; // ALREADY_SIGNALED
-        if (timeoutNs <= 0L && (flags & 1) == 0) return 0x911B;           // TIMEOUT_EXPIRED
+        if (timeoutNs == 0L && (flags & 1) == 0) return 0x911B;           // TIMEOUT_EXPIRED
         if (NeoNative.currentSubmitIndex(ctx) <= idx) {
             NeoNative.submit(ctx);
             recording = NeoNative.currentSubmitIndex(ctx);
             midFrameSubmits++;
         }
         fenceWaits++;
-        if (timeoutNs <= 0L) return 0x911B;
-        return NeoNative.waitFor(ctx, idx, timeoutNs) ? 0x911C : 0x911B; // CONDITION_SATISFIED / TIMEOUT_EXPIRED
+        if (timeoutNs == 0L) return 0x911B;
+        return NeoNative.waitFor(ctx, idx, timeoutNs < 0L ? -1L : timeoutNs) ? 0x911C : 0x911B; // CONDITION_SATISFIED / TIMEOUT_EXPIRED
     }
 
     static void deleteSync(long sync) {
@@ -1870,7 +2114,7 @@ public final class Gl {
                 if (SAMPLER_HANDLES.length < ns) SAMPLER_HANDLES = new long[ns * 2];
                 for (int i = 0; i < ns; i++) {
                     int unit = p.samplerUnits[i];
-                    Tex t = unit >= 0 && unit < units.length ? TEXTURES.get(units[unit]) : null;
+                    Tex t = TEXTURES.get(samplerTexture(p, i, unit));
                     SAMPLER_HANDLES[i] = t != null && t.mtl != 0L ? samplerFor(t, unit) : defaultSampler;
                 }
                 if (!planSamplers(p, SAMPLER_HANDLES, ns)) {
@@ -1900,7 +2144,7 @@ public final class Gl {
                     Buf b = BUFFERS.get(SLOT_BUFFERS[s]);
                     if (b == null || b.mtl == 0L) return;
                     markUsed(b);
-                    NeoNative.passSetVertexBuffer(ctx, b.mtl, 0, VERTEX_SLOT_BASE + s);
+                    NeoNative.passSetVertexBuffer(ctx, b.mtl, SLOT_BASE_OFFSET[s], VERTEX_SLOT_BASE + s);
                 }
                 NeoNative.passSetVertexBuffer(ctx, zeroBuffer, 0, ZERO_SLOT);
                 // uniforms
@@ -1914,7 +2158,7 @@ public final class Gl {
                 // textures
                 for (int i = 0; i < p.samplerUnits.length; i++) {
                     int unit = p.samplerUnits[i];
-                    Tex t = unit >= 0 && unit < units.length ? TEXTURES.get(units[unit]) : null;
+                    Tex t = TEXTURES.get(samplerTexture(p, i, unit));
                     if (t != null && t.texBuffer >= 0) {
                         Buf tb = BUFFERS.get(t.texBuffer);
                         if (tb != null && tb.mtl != 0L) {
@@ -1952,6 +2196,7 @@ public final class Gl {
                 draws++;
                 frameDraws++;
                 if (draws <= TRACE_DRAWS) trace(p, va, mode, count, indexed, indexType, colorCount);
+                if (tracingFrame) traceFrameDraw(p, va, mode, count, indexed, indexOffset, colorCount);
             } finally {
                 NeoNative.passEnd(ctx);
                 java.util.Arrays.fill(SLOT_STRIDES, 0);
@@ -1965,6 +2210,8 @@ public final class Gl {
     static Integer stateInteger(int pname) {
         return switch (pname) {
             case 0x8069 -> units[activeUnit];       // TEXTURE_BINDING_2D
+            case 0x8514 -> cubeUnits[activeUnit];   // TEXTURE_BINDING_CUBE_MAP
+            case 0x8C2C -> bufferUnits[activeUnit]; // TEXTURE_BINDING_BUFFER
             case 0x84E0 -> 0x84C0 + activeUnit;     // ACTIVE_TEXTURE
             case 0x8CA6 -> drawFbo;                 // DRAW_FRAMEBUFFER_BINDING
             case 0x8CAA -> readFbo;                 // READ_FRAMEBUFFER_BINDING

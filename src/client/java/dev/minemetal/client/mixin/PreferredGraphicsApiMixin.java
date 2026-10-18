@@ -26,7 +26,13 @@ public abstract class PreferredGraphicsApiMixin {
     @Inject(method = "getBackendsToTry", at = @At("RETURN"), cancellable = true)
     private void minemetal$preferMetal(final CallbackInfoReturnable<GpuBackend[]> cir) {
         // "Default" = Metal; choosing OpenGL or Vulkan explicitly gives exactly that backend.
-        if ((Object) this != PreferredGraphicsApi.DEFAULT || !MineMetalClient.isMetalEnabled()) {
+        if (!MineMetalClient.isMetalEnabled()) {
+            return;
+        }
+        if ((Object) this != PreferredGraphicsApi.DEFAULT) {
+            // e.g. Minecraft forced OpenGL after a crashed startup: say so, otherwise this looks like a MineMetal run
+            MineMetalClient.LOG.warn("[MineMetal] Graphics API is set to {}, not Default: MineMetal is NOT used this run"
+                + " (Video Settings -> Graphics API -> Default)", this);
             return;
         }
         GpuBackend[] vanilla = cir.getReturnValue();

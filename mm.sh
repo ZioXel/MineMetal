@@ -10,6 +10,8 @@ case "$cmd" in
   build)
     ./gradlew --no-configuration-cache copyReferenceLibs build "${@:2}" 2>&1 | tee .reference/build.log ;;
   run)
+    # Minecraft forces OpenGL after a crashed startup; undo it so the run really uses MineMetal (Default = Metal).
+    [ -f run/options.txt ] && sed -i '' 's/^preferredGraphicsBackend:"opengl"/preferredGraphicsBackend:"default"/' run/options.txt
     mkdir -p .reference/logs
     stamp=$(date +%Y%m%d-%H%M%S)
     ./gradlew --no-configuration-cache runClient "${@:2}" 2>&1 | tee .reference/run.log ".reference/logs/run-$stamp.log" ;;

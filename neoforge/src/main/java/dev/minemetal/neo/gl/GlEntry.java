@@ -63,7 +63,7 @@ final class GlEntry {
             case 0x8A34 -> 256;          // UNIFORM_BUFFER_OFFSET_ALIGNMENT
             case 0x8B4A, 0x8B49 -> 4096; // MAX_VERTEX/FRAGMENT_UNIFORM_COMPONENTS
             case 0x0CF5 -> Gl.unpackAlignment;
-            case 0x0D05 -> 4;            // PACK_ALIGNMENT
+            case 0x0D05 -> Gl.packAlignment; // PACK_ALIGNMENT
             case 0x84FF -> 16;           // MAX_TEXTURE_MAX_ANISOTROPY
             default -> 0;
         };
@@ -265,6 +265,8 @@ final class GlEntry {
             case 0x0CF3 -> Gl.unpackSkipRows = value;
             case 0x0CF4 -> Gl.unpackSkipPixels = value;
             case 0x0CF5 -> Gl.unpackAlignment = value;
+            case 0x0D02 -> Gl.packRowLength = value;
+            case 0x0D05 -> Gl.packAlignment = value;
             default -> {
             }
         }
@@ -371,7 +373,7 @@ final class GlEntry {
     }
 
     static void glReadPixels(int x, int y, int w, int h, int format, int type, long ptr) {
-        // TODO: GPU readback (screenshots). Leaves the caller's memory untouched for now.
+        Gl.readPixels(x, y, w, h, format, type, ptr);
     }
 
     static void glGetTexImage(int target, int level, int format, int type, long ptr) {

@@ -33,6 +33,7 @@ public final class NeoNative {
     private static MethodHandle COPY_BUFFER_TO_TEXTURE, COPY_TEXTURE_TO_TEXTURE, COPY_TEXTURE_TO_BUFFER;
     private static MethodHandle PASS_BEGIN, PASS_END, PASS_SET_VIEWPORT, PASS_SET_SCISSOR, PASS_SET_PIPELINE, PASS_SET_VERTEX_BUFFER;
     private static MethodHandle PASS_SET_BYTES, PASS_SET_TEXTURE, PASS_SET_SAMPLER, PASS_SET_INDEX_BUFFER, PASS_DRAW, PASS_DRAW_INDEXED;
+    private static MethodHandle CLEAR_REGION;
     private static MethodHandle PIPELINE_CREATE, SURFACE_ACQUIRE, SURFACE_BLIT, MULTI_DRAW_INDEXED, COPY_BUFFER, WAIT, PASS_SET_BUFFER, PASS_SET_TEXEL_BUFFER, UPSCALE;
 
     private NeoNative() {
@@ -98,6 +99,7 @@ public final class NeoNative {
         PASS_SET_TEXEL_BUFFER = hc("mm_pass_set_texel_buffer", FunctionDescriptor.ofVoid(P, I, P, J, J, J, I, I));
         UPSCALE = h("mm_upscale", FunctionDescriptor.of(I, P, P, P, I, F));
         COPY_BUFFER = h("mm_copy_buffer", FunctionDescriptor.ofVoid(P, P, J, P, J, J));
+        CLEAR_REGION = h("mm_clear_region", FunctionDescriptor.ofVoid(P, P, P, I, F, F, F, F, D, I, I, I, I));
         WAIT = h("mm_wait", FunctionDescriptor.of(I, P, J, J));
         SURFACE_ACQUIRE = h("mm_surface_acquire", FunctionDescriptor.of(I, P));
         SURFACE_BLIT = h("mm_surface_blit", FunctionDescriptor.ofVoid(P, P, P, I, I));
@@ -292,6 +294,14 @@ public final class NeoNative {
     /** params: drawCount triples (firstIndex, indexCount, vertexOffset). */
     public static void passMultiDrawIndexed(long ctx, long params, int instances, int firstInstance, int drawCount) {
         try { MULTI_DRAW_INDEXED.invokeExact(ctx, params, instances, firstInstance, drawCount); } catch (Throwable t) { throw rethrow(t); }
+    }
+
+    /** Clears a rectangle (top-left origin, like scissors) of a color texture and optionally a depth texture (0 = none). */
+    public static void clearRegion(long ctx, long color, long depth, int mip, float r, float g, float b, float a, double clearDepth,
+                                   int x, int y, int w, int h) {
+        try {
+            CLEAR_REGION.invokeExact(ctx, color, depth, mip, r, g, b, a, clearDepth, x, y, w, h);
+        } catch (Throwable t) { throw rethrow(t); }
     }
 
     public static void copyBuffer(long ctx, long src, long srcOffset, long dst, long dstOffset, long size) {
