@@ -14,7 +14,21 @@ final class GlEntry {
     private static final long STR_GLSL = MemoryUtil.memAddress(MemoryUtil.memASCII("4.10"));
     private static final long STR_EMPTY = MemoryUtil.memAddress(MemoryUtil.memASCII(""));
     /** Extensions MineMetal really implements (glGetStringi(GL_EXTENSIONS, i)); everything else takes the GL 4.1 core path. */
-    private static final long[] EXTENSIONS = {MemoryUtil.memAddress(MemoryUtil.memASCII("GL_EXT_texture_filter_anisotropic"))};
+    private static final long[] EXTENSIONS = extensions();
+
+    /**
+     * GL_ARB_buffer_storage lets 26.3 map its transient buffers persistently instead of pushing every frame's vertices and
+     * uniforms through glBufferSubData (which costs GPU copies that split render passes). On by default in the 26.3 GL
+     * translation mode (MetalGl sets it), off for the NeoForge 1.21.1 port until tested there; -Dminemetal.gl.bufferStorage
+     * =true/false overrides.
+     */
+    private static long[] extensions() {
+        java.util.List<String> names = new java.util.ArrayList<>(java.util.List.of("GL_EXT_texture_filter_anisotropic"));
+        if ("true".equals(System.getProperty("minemetal.gl.bufferStorage"))) names.add("GL_ARB_buffer_storage");
+        long[] out = new long[names.size()];
+        for (int i = 0; i < out.length; i++) out[i] = MemoryUtil.memAddress(MemoryUtil.memASCII(names.get(i)));
+        return out;
+    }
     private static final long SCRATCH = MemoryUtil.nmemAlloc(64);
 
     private GlEntry() {
@@ -281,6 +295,10 @@ final class GlEntry {
 
     static void glBindBuffer(int target, int buffer) {
         Gl.bindBuffer(target, buffer);
+    }
+
+    static void glBufferStorage(int target, long size, long data, int flags) {
+        Gl.bufferStorage(target, size, data);
     }
 
     static void glBufferData(int target, long size, long data, int usage) {

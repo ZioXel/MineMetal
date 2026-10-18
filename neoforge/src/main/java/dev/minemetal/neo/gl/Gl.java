@@ -52,6 +52,12 @@ public final class Gl {
         long lastUse;
         // pending staged map (large buffers): written by the CPU, copied in GPU order at unmap
         long mapStaging, mapStagingCap, mapOffset, mapLength;
+        /**
+         * glBufferStorage (GL_ARB_buffer_storage): the storage, and so its address, never changes. 26.3 maps such buffers
+         * persistently and writes through the pointer, synchronising with fences itself, so they are never renamed;
+         * GL-ordered writes to them go through GPU copies instead.
+         */
+        boolean immutable;
     }
 
     /** Index of the command buffer currently being recorded (refreshed after every submit). */
@@ -525,9 +531,25 @@ public final class Gl {
         return id == 0 ? null : BUFFERS.computeIfAbsent(id, k -> new Buf());
     }
 
+    /** glBufferStorage: like glBufferData, but the storage is immutable (see {@link Buf#immutable}). */
+    static void bufferStorage(int target, long size, long data) {
+        Buf b = buffer(target);
+        if (b == null) return;
+        if (b.immutable) {
+            warnOnce("bufferstorage-twice", "glBufferStorage on a buffer that already has immutable storage ignored");
+            return;
+        }
+        bufferData(target, size, data);
+        b.immutable = true;
+    }
+
     static void bufferData(int target, long size, long data) {
         Buf b = buffer(target);
         if (b == null) return;
+        if (b.immutable) {
+            warnOnce("bufferdata-immutable", "glBufferData on immutable (glBufferStorage) buffer ignored");
+            return;
+        }
         b.size = Math.max(size, 0);
         long cap = BufferPool.sizeClass(b.size);
         POOL.release(b.mtl, b.cap);
@@ -541,6 +563,10 @@ public final class Gl {
         Buf b = buffer(target);
         if (b == null || b.contents == 0L || data == 0L || offset + size > b.size) return;
         if (gpuMayRead(b)) {
+            if (b.immutable) {
+                stagedWrite(b, offset, size, data);      // fixed address: GPU-ordered copy
+                return;
+            }
             if (offset == 0 && size >= b.size) {
                 rename(b, false);                        // full replace: fresh storage, no copy
             } else if (b.size <= RENAME_LIMIT) {
@@ -562,20 +588,23 @@ public final class Gl {
         Buf b = buffer(target);
         if (b == null) return 0L;
         if (b.mtl == 0L) bufferData(target, Math.max(b.size, 16), 0L);
+        // GL_MAP_PERSISTENT_BIT (immutable buffers): the caller synchronises with fences; hand out the real memory
+        if (access != -1 && (access & 0x40) != 0) return b.contents + offset;
         if (access == -1 || (access & 0x20) == 0) {
             if (gpuMayRead(b)) {
                 boolean keep = access == -1 || (access & 0x8) == 0;
-                if (!keep || b.size <= RENAME_LIMIT || length <= 0) {
+                long len = length > 0 ? length : b.size - offset;
+                if (!b.immutable && (!keep || b.size <= RENAME_LIMIT || length <= 0)) {
                     rename(b, keep);
-                } else {
-                    // large buffer, partial map: hand out a staging range, copied into place (in GPU order) at unmap
-                    long cap = BufferPool.sizeClass(length);
+                } else if (len > 0) {
+                    // large or immutable buffer: hand out a staging range, copied into place (in GPU order) at unmap
+                    long cap = BufferPool.sizeClass(len);
                     b.mapStaging = POOL.obtain(cap);
                     b.mapStagingCap = cap;
                     b.mapOffset = offset;
-                    b.mapLength = length;
+                    b.mapLength = len;
                     long p = NeoNative.bufferContents(b.mapStaging);
-                    if ((access & 0x4) == 0) MemoryUtil.memCopy(b.contents + offset, p, length); // not INVALIDATE_RANGE
+                    if (keep && (access & 0x4) == 0) MemoryUtil.memCopy(b.contents + offset, p, len); // not INVALIDATE_*
                     return p;
                 }
             }
@@ -1219,6 +1248,8 @@ public final class Gl {
     }
 
     static void blitFramebuffer(int sx0, int sy0, int sx1, int sy1, int dx0, int dy0, int dx1, int dy1, int mask) {
+        if (tracingFrame) LOG.info("[MineMetal GL] T blit mask=0x{} read={}{} draw={}{} src=[{},{},{},{}] dst=[{},{},{},{}]", Integer.toHexString(mask),
+            readFbo, fboDesc(readFbo), drawFbo, fboDesc(drawFbo), sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1);
         long[] sc = new long[8], sf = new long[8], sd = new long[1], dc = new long[8], df = new long[8], dd = new long[1];
         if (attachments(readFbo, sc, sf, sd) < 0 || attachments(drawFbo, dc, df, dd) < 0) return;
         int w = sx1 - sx0, h = sy1 - sy0;
@@ -1237,6 +1268,8 @@ public final class Gl {
     /** glCopyTexSubImage2D: read framebuffer's first color attachment → bound texture (same pixel format only). */
     static void copyTexSubImage(int level, int dx, int dy, int sx, int sy, int w, int h) {
         Tex t = boundTexture();
+        if (tracingFrame) LOG.info("[MineMetal GL] T copyTexSubImage tex={} level={} from read={}{} [{},{} {}x{}]", units[activeUnit], level,
+            readFbo, fboDesc(readFbo), sx, sy, w, h);
         if (t == null || t.mtl == 0L || w <= 0 || h <= 0) return;
         long[] sc = new long[8], sf = new long[8], sd = new long[1];
         if (attachments(readFbo, sc, sf, sd) < 0) return;
@@ -1835,9 +1868,19 @@ public final class Gl {
         }
     }
 
+    /** "{c0,c1,..|d}" texture names attached to a framebuffer (trace output). */
+    private static String fboDesc(int id) {
+        if (id == 0) return "{default}";
+        Fbo f = FBOS.get(id);
+        if (f == null) return "{?}";
+        StringBuilder sb = new StringBuilder("{");
+        for (int i = 0; i < 8; i++) if (f.color[i] != 0) sb.append(f.color[i]).append(f.colorLevel[i] != 0 ? "@" + f.colorLevel[i] : "").append(',');
+        return sb.append("|d").append(f.depth).append('}').toString();
+    }
+
     private static void traceClear(String what) {
         int count = attachments(drawFbo, A_COLORS, A_FORMATS, A_DEPTH);
-        LOG.info("[MineMetal GL] T clear {} fbo={} {}x{} colors={} depthAtt={} scissor={} {}", what, drawFbo, attachW, attachH, count,
+        LOG.info("[MineMetal GL] T clear {} fbo={}{} {}x{} colors={} depthAtt={} scissor={} {}", what, drawFbo, fboDesc(drawFbo), attachW, attachH, count,
             A_DEPTH[0] != 0L, scissorTest, java.util.Arrays.toString(scissor));
     }
 
@@ -1846,7 +1889,7 @@ public final class Gl {
         StringBuilder sb = new StringBuilder("[MineMetal GL] T draw prog=").append(currentProgram).append(" mode=").append(mode)
             .append(" count=").append(count).append(" inst=").append(instances).append(" baseV=").append(baseVertex)
             .append(indexed ? " idxOff=" + indexOffset : " first").append(" multi=").append(multiCount)
-            .append(" fbo=").append(drawFbo).append(' ').append(attachW).append('x').append(attachH).append(" colors=").append(colorCount)
+            .append(" fbo=").append(drawFbo).append(fboDesc(drawFbo)).append(' ').append(attachW).append('x').append(attachH).append(" colors=").append(colorCount)
             .append(" depthAtt=").append(A_DEPTH[0] != 0L)
             .append(" vp=").append(java.util.Arrays.toString(viewport)).append(" sc=").append(scissorTest ? java.util.Arrays.toString(scissor) : "off")
             .append(" depth=").append(depthTest ? "0x" + Integer.toHexString(depthFunc) + (depthMask ? "w" : "r") : "off")

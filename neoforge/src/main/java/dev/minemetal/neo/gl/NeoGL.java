@@ -133,6 +133,7 @@ public final class NeoGL {
         // buffers
         reg("glBindBuffer", v(I, I));
         reg("glBufferData", v(I, J, J, I));
+        reg("glBufferStorage", v(I, J, J, I));
         reg("glBufferSubData", v(I, J, J, J));
         reg("glGetBufferParameteriv", v(I, I, J));
         reg("glGetBufferParameteri64v", v(I, I, J));

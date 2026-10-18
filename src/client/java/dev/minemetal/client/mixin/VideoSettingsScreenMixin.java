@@ -27,7 +27,7 @@ public abstract class VideoSettingsScreenMixin extends OptionsSubScreen {
 
     @Inject(method = "addOptions", at = @At("TAIL"))
     private void minemetal$addOptions(final CallbackInfo ci) {
-        if (MetalDevice.current() == null || this.list == null) {
+        if ((MetalDevice.current() == null && !dev.minemetal.client.gltranslate.MetalGl.isActive()) || this.list == null) {
             return;
         }
         OptionInstance<UpscaleMode> upscaler = new OptionInstance<>(

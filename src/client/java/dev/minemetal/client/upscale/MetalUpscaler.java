@@ -193,7 +193,16 @@ public final class MetalUpscaler {
     /** True when the world should be rendered at a reduced resolution this frame. */
     public static boolean active() {
         load();
-        return mode != UpscaleMode.OFF && (scalePercent < MAX_SCALE || mode.temporal()) && MetalDevice.current() != null;
+        return mode != UpscaleMode.OFF && (scalePercent < MAX_SCALE || mode.temporal()) && (MetalDevice.current() != null || glMode());
+    }
+
+    /**
+     * GL translation mode (-Dminemetal.backend=gl): the same render-target swap works there; the final scale goes through
+     * the OpenGL-on-Metal layer's textures. MetalFX Temporal needs the native backend's depth/motion hooks, so it falls
+     * back to MetalFX Spatial in this mode.
+     */
+    private static boolean glMode() {
+        return dev.minemetal.client.gltranslate.MetalGl.isActive();
     }
 
     /**
@@ -203,6 +212,8 @@ public final class MetalUpscaler {
     public static @Nullable RenderTarget beginWorld(final RenderTarget main, final CameraRenderState camera) {
         temporalThisFrame = false;
         depthCaptured = false;
+        dev.minemetal.neo.gl.Gl.upscaleFullW = 0;
+        dev.minemetal.neo.gl.Gl.upscaleFullH = 0;
         if (!active()) {
             lastUsed = UpscaleMode.OFF;
             releaseIfIdle();
@@ -225,7 +236,12 @@ public final class MetalUpscaler {
                 return null;
             }
             RenderSystem.getDevice().createCommandEncoder().clearColorAndDepthTextures(color, new Vector4f(0.0F, 0.0F, 0.0F, 1.0F), depth, 0.0);
-            if (mode.temporal() && camera.initialized) {
+            if (glMode()) {
+                // code that sizes its viewport from the window instead of the bound framebuffer gets scaled down
+                dev.minemetal.neo.gl.Gl.upscaleFullW = main.width;
+                dev.minemetal.neo.gl.Gl.upscaleFullH = main.height;
+            }
+            if (mode.temporal() && camera.initialized && !glMode()) {
                 TEMPORAL.jitter(camera.projectionMatrix, w, h);
                 if (VIEW_MODE.equals("extract") || VIEW_MODE.equals("bob")) {
                     TEMPORAL.captureView(camera.viewRotationMatrix);  // as extracted, before anything adds view bobbing
@@ -286,6 +302,10 @@ public final class MetalUpscaler {
 
     /** Scales the low-resolution world image up into the real main target. */
     public static void finishWorld(final RenderTarget low, final RenderTarget main, final CameraRenderState camera) {
+        if (glMode()) {
+            finishWorldGl(low, main);
+            return;
+        }
         MetalDevice device = MetalDevice.current();
         GpuTexture src = low.getColorTexture();
         GpuTexture dst = main.getColorTexture();
@@ -317,6 +337,35 @@ public final class MetalUpscaler {
             default -> UpscaleMode.OFF;
         };
         MetalProfiler.phase("gui");
+    }
+
+    private static boolean warnedGlTexture;
+
+    private static void finishWorldGl(final RenderTarget low, final RenderTarget main) {
+        dev.minemetal.neo.gl.Gl.upscaleFullW = 0;
+        dev.minemetal.neo.gl.Gl.upscaleFullH = 0;
+        if (!(low.getColorTexture() instanceof com.mojang.renderpearl.backend.opengl.GlTexture s)
+                || !(main.getColorTexture() instanceof com.mojang.renderpearl.backend.opengl.GlTexture d)) {
+            if (!warnedGlTexture) {
+                warnedGlTexture = true;
+                LOGGER.warn("[MineMetal] GL translation upscaling: render targets are not GL textures ({}), skipped",
+                    low.getColorTexture() == null ? null : low.getColorTexture().getClass().getName());
+            }
+            return;
+        }
+        long src = dev.minemetal.neo.gl.Gl.metalTexture(s.glId());
+        long dst = dev.minemetal.neo.gl.Gl.metalTexture(d.glId());
+        if (src == 0L || dst == 0L) {
+            return;
+        }
+        int used = dev.minemetal.neo.metal.NeoNative.upscale(dev.minemetal.neo.gl.Gl.context(), src, dst,
+            mode.temporal() ? UpscaleMode.METALFX.nativeId : mode.nativeId, sharpnessPercent / 100.0F);
+        lastUsed = switch (used) {
+            case 3 -> UpscaleMode.METALFX;
+            case 2 -> UpscaleMode.FSR1;
+            case 1 -> UpscaleMode.BILINEAR;
+            default -> UpscaleMode.OFF;
+        };
     }
 
     /** Iris API lookup without a compile-time dependency (shader packs write standard depth, vanilla reversed Z). */

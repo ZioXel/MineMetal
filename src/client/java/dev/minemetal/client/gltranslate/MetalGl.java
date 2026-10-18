@@ -43,6 +43,8 @@ public final class MetalGl {
 
     /** Loads libminemetal + the shader tools, creates the Metal context and swaps LWJGL's GL provider. */
     static void activate() throws Exception {
+        // persistent buffer mapping for Mojang's GL backend (see GlEntry.extensions); -Dminemetal.gl.bufferStorage=false to compare
+        if (System.getProperty("minemetal.gl.bufferStorage") == null) System.setProperty("minemetal.gl.bufferStorage", "true");
         if (ctx == 0L) {
             NeoNative.load();
             ctx = NeoNative.createContext();
