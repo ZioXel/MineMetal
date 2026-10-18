@@ -1,6 +1,5 @@
 package dev.minemetal.neo.gl.compile;
 
-import net.neoforged.fml.loading.FMLPaths;
 import org.lwjgl.system.MemoryUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -50,7 +49,7 @@ final class SpirvCache {
         }
         if (dir == null) {
             try {
-                dir = FMLPaths.GAMEDIR.get().resolve("minemetal-cache").resolve("spirv");
+                dir = GameDir.get().resolve("minemetal-cache").resolve("spirv");
                 Files.createDirectories(dir);
             } catch (IOException | RuntimeException e) {
                 LOGGER.warn("[MineMetal] shader cache disabled: {}", e.toString());

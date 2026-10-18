@@ -9,6 +9,18 @@ Complementary's colored lighting, which Apple's OpenGL driver cannot do at all.
 
 > ⚠️ Experimental, personal project. Apple Silicon + macOS 14 or newer only. Expect rough edges.
 
+## Versions
+
+| Edition | Minecraft | Loader | Version | Release tag | Status |
+|---|---|---|---|---|---|
+| MineMetal (Fabric) | 26.3 | Fabric 0.19.5+ | 0.1.3 | `fabric-v0.1.3` | ✅ released |
+| MineMetal (NeoForge) | 1.21.1 | NeoForge 21.1.x (ATM10) | 0.1.0-neo-experimental | `neoforge-v0.1.0-exp` | 🧪 work in progress, see [neoforge/README.md](neoforge/README.md) |
+| Iris (MineMetal fork) | 26.3 | Fabric | 1.11.6-minemetal.2 | [MineMetal-Iris](https://github.com/ZioXel/MineMetal-Iris/releases) | ✅ released (Fabric edition only) |
+
+The NeoForge edition is a separate jar (`minemetal-neoforge-1.21.1-*.jar`). It translates every OpenGL call to Metal,
+so modpacks like All the Mods 10 run without changes to their mods. It needs Java 25 and runs regular Iris/Sodium
+(Embeddium) builds, no fork needed.
+
 ## What's in it
 
 - **Metal backend:** Minecraft's own rendering layer (renderpearl) implemented on Metal through a small Objective-C
@@ -52,6 +64,21 @@ Fullscreen on an M2 Pro (3600×2260), Complementary Reimagined (Medium) with Met
 Heavy packs are GPU-bound at full Retina resolution. Upscaling fixes most of that, e.g. Complementary Unbound
 (VERYHIGH) fullscreen at 3600×2260 on an M2 Pro: **~17 fps native → ~40 fps with MetalFX at 50 % render scale**,
 GUI still at full resolution (see below).
+
+## GL translation mode (experimental, A/B)
+
+`-Dminemetal.backend=gl` runs Minecraft's **own OpenGL backend** unchanged and answers every OpenGL call with
+MineMetal's OpenGL-on-Metal layer (the one the NeoForge 1.21.1 port uses, `neoforge/src/main/java/dev/minemetal/neo/gl`)
+instead of Apple's OpenGL driver. Windows get a CAMetalLayer, buffer swaps present through Metal. The default
+(`native`) is the renderpearl Metal backend described above. Both run from the same jar, so fps can be compared on the
+same Minecraft version:
+
+```sh
+./mm.sh run -PmmArgs="-Dminemetal.backend=gl"      # GL translation
+./mm.sh run                                         # native Metal backend
+```
+
+Not wired up in GL mode yet: the MineMetal upscaler / Video Settings page, and the Iris fork's Metal hooks.
 
 ## Upscaling (MetalFX / AMD FSR 1)
 

@@ -2,6 +2,8 @@ package dev.minemetal.client.mixin;
 
 import com.mojang.renderpearl.api.device.GpuBackend;
 import dev.minemetal.client.MineMetalClient;
+import dev.minemetal.client.gltranslate.MetalGl;
+import dev.minemetal.client.gltranslate.MetalGlBackend;
 import dev.minemetal.client.metal.MetalBackend;
 import dev.minemetal.client.metal.MetalDevice;
 import net.minecraft.network.chat.Component;
@@ -29,7 +31,8 @@ public abstract class PreferredGraphicsApiMixin {
         }
         GpuBackend[] vanilla = cir.getReturnValue();
         GpuBackend[] withMetal = new GpuBackend[vanilla.length + 1];
-        withMetal[0] = new MetalBackend();
+        // -Dminemetal.backend=gl: Minecraft's OpenGL backend on MineMetal's OpenGL-on-Metal layer (A/B comparison)
+        withMetal[0] = MineMetalClient.useGlTranslation() ? new MetalGlBackend() : new MetalBackend();
         System.arraycopy(vanilla, 0, withMetal, 1, vanilla.length);
         cir.setReturnValue(withMetal);
     }
@@ -38,7 +41,7 @@ public abstract class PreferredGraphicsApiMixin {
     @Inject(method = "caption", at = @At("RETURN"), cancellable = true)
     private void minemetal$caption(final CallbackInfoReturnable<Component> cir) {
         // en_us also renames "Default" to "Default (Metal)" (that is what Sodium's settings screen shows); don't add it twice.
-        if ((Object) this == PreferredGraphicsApi.DEFAULT && MetalDevice.current() != null
+        if ((Object) this == PreferredGraphicsApi.DEFAULT && (MetalDevice.current() != null || MetalGl.isActive())
                 && !cir.getReturnValue().getString().contains("Metal")) {
             cir.setReturnValue(Component.empty().append(cir.getReturnValue()).append(" (Metal)"));
         }

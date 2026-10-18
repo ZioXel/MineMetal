@@ -13,6 +13,8 @@ final class GlEntry {
     private static final long STR_VERSION = MemoryUtil.memAddress(MemoryUtil.memASCII("4.1 MineMetal"));
     private static final long STR_GLSL = MemoryUtil.memAddress(MemoryUtil.memASCII("4.10"));
     private static final long STR_EMPTY = MemoryUtil.memAddress(MemoryUtil.memASCII(""));
+    /** Extensions MineMetal really implements (glGetStringi(GL_EXTENSIONS, i)); everything else takes the GL 4.1 core path. */
+    private static final long[] EXTENSIONS = {MemoryUtil.memAddress(MemoryUtil.memASCII("GL_EXT_texture_filter_anisotropic"))};
     private static final long SCRATCH = MemoryUtil.nmemAlloc(64);
 
     private GlEntry() {
@@ -35,7 +37,7 @@ final class GlEntry {
     }
 
     static long glGetStringi(int name, int index) {
-        return STR_EMPTY;
+        return name == 0x1F03 && index >= 0 && index < EXTENSIONS.length ? EXTENSIONS[index] : STR_EMPTY;
     }
 
     private static int integer(int pname) {
@@ -44,7 +46,7 @@ final class GlEntry {
         return switch (pname) {
             case 0x821B -> 4;            // GL_MAJOR_VERSION
             case 0x821C -> 1;            // GL_MINOR_VERSION
-            case 0x821D -> 0;            // GL_NUM_EXTENSIONS
+            case 0x821D -> EXTENSIONS.length; // GL_NUM_EXTENSIONS
             case 0x821E -> 1;            // GL_CONTEXT_FLAGS: forward compatible
             case 0x9126 -> 1;            // GL_CONTEXT_PROFILE_MASK: core
             case 0x0D33, 0x84E8, 0x851C -> 16384; // MAX_TEXTURE_SIZE, MAX_RENDERBUFFER_SIZE, MAX_CUBE_MAP_TEXTURE_SIZE
@@ -186,6 +188,22 @@ final class GlEntry {
         Gl.clear(mask);
     }
 
+    static void glClearBufferfv(int buffer, int drawBuffer, long value) {
+        Gl.clearBuffer(buffer, drawBuffer, value);
+    }
+
+    static void glEnablei(int cap, int index) {
+        if (cap == 0x0BE2) Gl.setBlend(index, true);
+    }
+
+    static void glDisablei(int cap, int index) {
+        if (cap == 0x0BE2) Gl.setBlend(index, false);
+    }
+
+    static void glColorMaski(int index, byte r, byte g, byte b, byte a) {
+        Gl.setColorMask(index, (r != 0 ? 1 : 0) | (g != 0 ? 2 : 0) | (b != 0 ? 4 : 0) | (a != 0 ? 8 : 0));
+    }
+
     static void glBlendFunc(int src, int dst) {
         Gl.dirty();
         Gl.blendSrcRgb = Gl.blendSrcA = src;
@@ -222,8 +240,7 @@ final class GlEntry {
     }
 
     static void glColorMask(byte r, byte g, byte b, byte a) {
-        Gl.dirty();
-        Gl.colorMask = (r != 0 ? 1 : 0) | (g != 0 ? 2 : 0) | (b != 0 ? 4 : 0) | (a != 0 ? 8 : 0);
+        Gl.setColorMask(-1, (r != 0 ? 1 : 0) | (g != 0 ? 2 : 0) | (b != 0 ? 4 : 0) | (a != 0 ? 8 : 0));
     }
 
     static void glCullFace(int mode) {
@@ -342,7 +359,7 @@ final class GlEntry {
     }
 
     static void glGetTexLevelParameteriv(int target, int level, int pname, long ptr) {
-        if (ptr != 0L) MemoryUtil.memPutInt(ptr, target == 0x8064 ? 0 : Gl.texLevelParameter(level, pname));
+        if (ptr != 0L) MemoryUtil.memPutInt(ptr, target == 0x8064 ? (pname == 0x1000 || pname == 0x1001 ? Gl.proxyWidth : 0) : Gl.texLevelParameter(level, pname));
     }
 
     static void writeZero3(int a, int b, long ptr) {
@@ -643,6 +660,9 @@ final class GlEntry {
     }
 
     static void ignore1(int a) {
+    }
+
+    static void ignoreIJJ(int a, long b, long c) {
     }
 
     static void ignore2(int a, int b) {

@@ -14,11 +14,16 @@ public final class MineMetalClient implements ClientModInitializer {
         return MetalBackend.isSupportedPlatform() && !Boolean.getBoolean("minemetal.disable");
     }
 
+    /** {@code -Dminemetal.backend=gl}: OpenGL translation (MetalGlBackend) instead of the native Metal backend. */
+    public static boolean useGlTranslation() {
+        return "gl".equalsIgnoreCase(System.getProperty("minemetal.backend", "native"));
+    }
+
     @Override
     public void onInitializeClient() {
         LOG.info("MineMetal loaded (os={} {}, arch={}); Metal backend {}",
             System.getProperty("os.name"), System.getProperty("os.version"), System.getProperty("os.arch"),
-            isMetalEnabled() ? "enabled" : "disabled");
+            isMetalEnabled() ? (useGlTranslation() ? "enabled (GL translation)" : "enabled") : "disabled");
         if (Boolean.getBoolean("minemetal.glSelfTest")) {
             ClientLifecycleEvents.CLIENT_STARTED.register(client -> MetalGLSelfTest.run());
         }

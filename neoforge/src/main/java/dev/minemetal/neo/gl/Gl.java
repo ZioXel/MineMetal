@@ -217,8 +217,9 @@ public final class Gl {
             h = mix(h, (long) a.divisor << 40 ^ slot | (long) stride << 8 | a.offset << 24);
             h = mix(h, a.type | (long) a.size << 16 | (a.normalized ? 1L << 20 : 0) | (a.integer ? 1L << 21 : 0));
         }
-        h = mix(h, blend ? blendSrcRgb | (long) blendDstRgb << 16 | (long) blendSrcA << 32 | (long) blendDstA << 48 : 7);
-        h = mix(h, blend ? blendOpRgb | (long) blendOpA << 16 : 7);
+        h = mix(h, blendBits != 0 ? blendSrcRgb | (long) blendDstRgb << 16 | (long) blendSrcA << 32 | (long) blendDstA << 48 : 7);
+        h = mix(h, blendBits != 0 ? blendOpRgb | (long) blendOpA << 16 | (long) blendBits << 32 : 7);
+        h = mix(h, packedColorMasks());
         h = mix(h, colorMask | (depthTest ? (long) depthFunc << 8 | (depthMask ? 1L << 24 : 0) : 0) | (cullFace ? (long) cullMode << 32 : 0)
             | (long) frontFace << 48);
         h = mix(h, polygonOffset ? Float.floatToIntBits(offsetFactor) | (long) Float.floatToIntBits(offsetUnits) << 32 : 3);
@@ -239,6 +240,10 @@ public final class Gl {
         int minFilter = 0x2702, magFilter = 0x2601, wrapS = 0x2901, wrapT = 0x2901, maxLevel = 1000, compareMode, compareFunc = 0x203;
         float aniso = 1f;
         long sampler;
+        /** GL_TEXTURE_BASE_LEVEL: sampled through a view starting at this mip (26.3 binds texture views this way). */
+        int baseLevel;
+        /** GL_TEXTURE_CUBE_MAP: the Metal texture is a cube (6 faces, uploaded per face). */
+        boolean cube;
         final Int2ObjectOpenHashMap<Long> views = new Int2ObjectOpenHashMap<>();
         // GL_TEXTURE_BUFFER: a view of a buffer object
         int texBuffer = -1, texBufferBpp;
@@ -329,6 +334,36 @@ public final class Gl {
     static boolean blend, depthTest, cullFace, scissorTest, polygonOffset;
     static int blendSrcRgb = 1, blendDstRgb = 0, blendSrcA = 1, blendDstA = 0, blendOpRgb = 0x8006, blendOpA = 0x8006;
     static int depthFunc = 0x201, cullMode = 0x405, frontFace = 0x901, colorMask = 15;
+    /** Per draw buffer state (glColorMaski, glEnablei(GL_BLEND)); {@link #colorMask} / {@link #blend} mirror draw buffer 0. */
+    static final int[] colorMasks = {15, 15, 15, 15, 15, 15, 15, 15};
+    static int blendBits;
+
+    static void setColorMask(int index, int mask) {
+        dirty();
+        if (index < 0) {
+            java.util.Arrays.fill(colorMasks, mask);
+            colorMask = mask;
+        } else if (index < 8) {
+            colorMasks[index] = mask;
+            if (index == 0) colorMask = mask;
+        }
+    }
+
+    static void setBlend(int index, boolean on) {
+        dirty();
+        if (index < 0) {
+            blendBits = on ? 0xFF : 0;
+        } else if (index < 8) {
+            blendBits = on ? blendBits | 1 << index : blendBits & ~(1 << index);
+        }
+        blend = (blendBits & 1) != 0;
+    }
+
+    private static long packedColorMasks() {
+        long m = 0;
+        for (int i = 0; i < 8; i++) m |= (long) colorMasks[i] << (i * 4);
+        return m;
+    }
     static boolean depthMask = true;
     static float offsetFactor, offsetUnits;
     static final float[] clearColor = new float[4];
@@ -583,7 +618,10 @@ public final class Gl {
 
     static void bindTexture(int target, int id) {
         units[activeUnit] = id;
-        if (id != 0) TEXTURES.computeIfAbsent(id, k -> new Tex());
+        if (id != 0) {
+            Tex t = TEXTURES.computeIfAbsent(id, k -> new Tex());
+            if (target == 0x8513 && t.mtl == 0L) t.cube = true; // GL_TEXTURE_CUBE_MAP, not allocated yet
+        }
     }
 
     static void deleteTexture(int id) {
@@ -630,14 +668,33 @@ public final class Gl {
         t.h = Math.max(h, 1);
         int full = 32 - Integer.numberOfLeadingZeros(Math.max(t.w, t.h));
         t.mips = Math.max(1, Math.min(mips, full));
-        t.mtl = NeoNative.textureCreate(ctx, t.pf, t.w, t.h, 1, t.mips, USAGE);
+        t.mtl = t.cube ? NeoNative.textureCreate(ctx, t.pf, t.w, t.h, 6, t.mips, USAGE | USAGE_CUBEMAP)
+            : NeoNative.textureCreate(ctx, t.pf, t.w, t.h, 1, t.mips, USAGE);
         t.sampler = 0L;
     }
 
+    private static final int USAGE_CUBEMAP = 16; // MM_TEX_USAGE_CUBEMAP_COMPATIBLE
+
+    /** GL_TEXTURE_CUBE_MAP_POSITIVE_X..NEGATIVE_Z -> face 0..5, otherwise -1. */
+    private static int cubeFace(int target) {
+        return target >= 0x8515 && target <= 0x851A ? target - 0x8515 : -1;
+    }
+
+    /** Width of the last GL_PROXY_TEXTURE_2D probe (0 = too large), answered by glGetTexLevelParameteriv. */
+    static int proxyWidth;
+
     static void texImage2D(int target, int level, int ifmt, int w, int h, int format, int type, long pixels) {
-        if (target == 0x8064) return; // GL_PROXY_TEXTURE_2D
+        if (target == 0x8064) { // GL_PROXY_TEXTURE_2D: 26.3 probes the maximum texture size this way
+            proxyWidth = w <= MAX_TEXTURE_SIZE && h <= MAX_TEXTURE_SIZE ? w : 0;
+            return;
+        }
         Tex t = boundTexture();
         if (t == null) return;
+        int face = cubeFace(target);
+        if (face >= 0) {
+            texImageCubeFace(t, face, level, ifmt, w, h, format, type, pixels);
+            return;
+        }
         if (level == 0) {
             int mips = t.maxLevel < 1000 ? t.maxLevel + 1 : 1;
             if (t.mtl == 0L || t.w != w || t.h != h || t.pf != internalFormat(ifmt)[0] || t.mips < mips) allocate(t, ifmt, w, h, mips);
@@ -652,11 +709,24 @@ public final class Gl {
     }
 
     private static int texLogs;
+    static final int MAX_TEXTURE_SIZE = 16384;
+
+    private static void texImageCubeFace(Tex t, int face, int level, int ifmt, int w, int h, int format, int type, long pixels) {
+        if (!t.cube && t.mtl != 0L) freeTexture(t);
+        t.cube = true;
+        if (level == 0) {
+            int mips = t.maxLevel < 1000 ? t.maxLevel + 1 : 1;
+            if (t.mtl == 0L || t.w != w || t.h != h || t.pf != internalFormat(ifmt)[0] || t.mips < mips) allocate(t, ifmt, w, h, mips);
+        } else if (t.mtl == 0L || level >= t.mips) {
+            allocate(t, ifmt, Math.max(w << level, 1), Math.max(h << level, 1), level + 1);
+        }
+        if (pixels != 0L) upload(t, face, level, 0, 0, w, h, format, type, pixels);
+    }
 
     static void texSubImage2D(int target, int level, int x, int y, int w, int h, int format, int type, long pixels) {
         Tex t = boundTexture();
         if (t == null || t.mtl == 0L || pixels == 0L || level >= t.mips) return;
-        upload(t, level, x, y, w, h, format, type, pixels);
+        upload(t, Math.max(cubeFace(target), 0), level, x, y, w, h, format, type, pixels);
     }
 
     private static int components(int format) {
@@ -678,6 +748,10 @@ public final class Gl {
     }
 
     private static void upload(Tex t, int level, int x, int y, int w, int h, int format, int type, long pixels) {
+        upload(t, 0, level, x, y, w, h, format, type, pixels);
+    }
+
+    private static void upload(Tex t, int slice, int level, int x, int y, int w, int h, int format, int type, long pixels) {
         if (w <= 0 || h <= 0) return;
         int ts = typeSize(type);
         int comps = components(format);
@@ -714,7 +788,7 @@ public final class Gl {
                 MemoryUtil.memCopy(s, d, Math.min(dstRow, (long) w * srcBpp));
             }
         }
-        NeoNative.copyBufferToTexture(ctx, staging, stagingOffset, dstRow, dstRow * h, t.mtl, 0, level, x, y, w, h);
+        NeoNative.copyBufferToTexture(ctx, staging, stagingOffset, dstRow, dstRow * h, t.mtl, slice, level, x, y, w, h);
         if (arena == null) POOL.release(staging, stagingCap);
     }
 
@@ -727,6 +801,10 @@ public final class Gl {
             case 0x2802 -> t.wrapS = value;
             case 0x2803 -> t.wrapT = value;
             case 0x813D -> t.maxLevel = value;
+            case 0x813C -> {                       // GL_TEXTURE_BASE_LEVEL (no sampler change)
+                t.baseLevel = value;
+                return;
+            }
             case 0x884C -> t.compareMode = value;
             case 0x884D -> t.compareFunc = value;
             default -> {
@@ -929,6 +1007,11 @@ public final class Gl {
     public static int upscaleFullW, upscaleFullH;
 
     private static boolean beginPass(int clearMask, MemoryStack stack) {
+        return beginPass(clearMask, -1, stack);
+    }
+
+    /** {@code colorFilter}: bit i = color attachment i may be cleared (glClearBufferfv clears a single draw buffer). */
+    private static boolean beginPass(int clearMask, int colorFilter, MemoryStack stack) {
         int count = attachments(drawFbo, A_COLORS, A_FORMATS, A_DEPTH);
         if (count < 0) return false;
         long views = stack.nmalloc(8, 8 * 8);
@@ -936,7 +1019,7 @@ public final class Gl {
         long colors = stack.nmalloc(4, 4 * 4 * 8);
         for (int i = 0; i < 8; i++) for (int c = 0; c < 4; c++) MemoryUtil.memPutFloat(colors + (i * 4L + c) * 4, clearColor[c]);
         int mask = 0;
-        if ((clearMask & 0x4000) != 0) for (int i = 0; i < count; i++) if (A_COLORS[i] != 0L) mask |= 1 << i;
+        if ((clearMask & 0x4000) != 0) for (int i = 0; i < count; i++) if (A_COLORS[i] != 0L && (colorFilter >> i & 1) != 0) mask |= 1 << i;
         if ((clearMask & 0x100) != 0 && A_DEPTH[0] != 0L) mask |= 1 << 31;
         if (clearMask != 0 && mask == 0) return false;
         int ax = 0, ay = 0, aw = 1 << 20, ah = 1 << 20;
@@ -952,6 +1035,33 @@ public final class Gl {
     static void clear(int mask) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             if (beginPass(mask & (0x4000 | 0x100), stack)) NeoNative.passEnd(ctx);
+        }
+    }
+
+    /** glClearBufferfv: GL_COLOR clears one draw buffer (identity draw-buffer mapping), GL_DEPTH the depth attachment. */
+    static void clearBuffer(int buffer, int drawBuffer, long value) {
+        if (value == 0L) return;
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            if (buffer == 0x1800 && drawBuffer >= 0 && drawBuffer < 8) {
+                float r = clearColor[0], g = clearColor[1], b = clearColor[2], a = clearColor[3];
+                for (int c = 0; c < 4; c++) clearColor[c] = MemoryUtil.memGetFloat(value + c * 4L);
+                try {
+                    if (beginPass(0x4000, 1 << drawBuffer, stack)) NeoNative.passEnd(ctx);
+                } finally {
+                    clearColor[0] = r;
+                    clearColor[1] = g;
+                    clearColor[2] = b;
+                    clearColor[3] = a;
+                }
+            } else if (buffer == 0x1801) {
+                double saved = clearDepth;
+                clearDepth = MemoryUtil.memGetFloat(value);
+                try {
+                    if (beginPass(0x100, 0, stack)) NeoNative.passEnd(ctx);
+                } finally {
+                    clearDepth = saved;
+                }
+            }
         }
     }
 
@@ -1383,7 +1493,8 @@ public final class Gl {
                 .append(vertexFormatName(a, in.baseType())).append(',');
         }
         // fixed-function state + attachment formats
-        key.append('|').append(blend ? blendSrcRgb + "," + blendDstRgb + "," + blendSrcA + "," + blendDstA + "," + blendOpRgb + "," + blendOpA : "-")
+        key.append('|').append(blendBits).append(':').append(Long.toHexString(packedColorMasks()))
+            .append('|').append(blendBits != 0 ? blendSrcRgb + "," + blendDstRgb + "," + blendSrcA + "," + blendDstA + "," + blendOpRgb + "," + blendOpA : "-")
             .append('|').append(colorMask).append('|').append(depthTest ? depthFunc + (depthMask ? "w" : "r") : "-")
             .append('|').append(cullFace ? cullMode : 0).append(frontFace).append('|')
             .append(polygonOffset ? offsetFactor + "," + offsetUnits : "-").append('|');
@@ -1443,8 +1554,8 @@ public final class Gl {
             for (int i = 0; i < targetCount; i++) {
                 long t = targets + i * 72L;
                 MemoryUtil.memPutLong(t, A_FORMATS[i]);
-                MemoryUtil.memPutLong(t + 8, colorMask);
-                MemoryUtil.memPutLong(t + 16, blend && !NO_BLEND ? 1 : 0);
+                MemoryUtil.memPutLong(t + 8, colorMasks[i]);
+                MemoryUtil.memPutLong(t + 16, (blendBits >> i & 1) != 0 && !NO_BLEND ? 1 : 0);
                 MemoryUtil.memPutLong(t + 24, blendFactor(blendSrcRgb));
                 MemoryUtil.memPutLong(t + 32, blendFactor(blendDstRgb));
                 MemoryUtil.memPutLong(t + 40, blendOp(blendOpRgb));
@@ -1813,7 +1924,8 @@ public final class Gl {
                         }
                         continue;
                     }
-                    long tex = t != null && t.mtl != 0L ? t.mtl : dummyTexture;
+                    long tex = t == null || t.mtl == 0L ? dummyTexture
+                        : t.baseLevel > 0 && t.baseLevel < t.mips ? view(t, t.baseLevel) : t.mtl;
                     NeoNative.passSetTexture(ctx, 3, tex, i);
                     NeoNative.passSetSampler(ctx, 3, SAMPLER_HANDLES[i], p.samplerSlots != null ? p.samplerSlots[i] : i);
                 }
@@ -1885,7 +1997,7 @@ public final class Gl {
     static void enable(int cap, boolean on) {
         dirty();
         switch (cap) {
-            case 0x0BE2 -> blend = on;
+            case 0x0BE2 -> setBlend(-1, on);
             case 0x0B71 -> depthTest = on;
             case 0x0B44 -> cullFace = on;
             case 0x0C11 -> scissorTest = on;

@@ -127,6 +127,15 @@ loom {
 	}
 }
 
+// OpenGL-on-Metal layer shared with the NeoForge 1.21.1 port (neoforge/src/main/java/dev/minemetal/neo/{gl,metal}).
+// Compiled into the client jar for the GL translation mode (-Dminemetal.backend=gl, see gltranslate/MetalGlBackend);
+// the NeoForge-only parts (mixins, bootstrap, upscaler, mod class) stay out.
+sourceSets.client.java {
+	srcDir 'neoforge/src/main/java'
+	exclude 'dev/minemetal/neo/mixin/**', 'dev/minemetal/neo/upscale/**', 'dev/minemetal/neo/MineMetalNeo.java',
+		'dev/minemetal/neo/metal/MetalBootstrap.java'
+}
+
 // Native Objective-C bridge (Metal) -> build/native/natives/macos/libminemetal.dylib, packed into the client jar.
 def nativeOutDir = layout.buildDirectory.dir("native")
 tasks.register('compileMetalNative', Exec) {

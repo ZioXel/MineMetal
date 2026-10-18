@@ -6,7 +6,9 @@
     "PreferredGraphicsApiMixin",
     "GameRendererUpscaleMixin",
     "VideoSettingsScreenMixin",
-    "LevelRendererUpscaleMixin"
+    "LevelRendererUpscaleMixin",
+    "GlDeviceMixin",
+    "GlSurfaceMixin"
   ],
   "injectors": {
     "defaultRequire": 1

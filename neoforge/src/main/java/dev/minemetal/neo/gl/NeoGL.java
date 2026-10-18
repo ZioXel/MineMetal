@@ -108,6 +108,8 @@ public final class NeoGL {
         // state
         reg("glEnable", v(I));
         reg("glDisable", v(I));
+        reg("glEnablei", v(I, I));
+        reg("glDisablei", v(I, I));
         reg("glViewport", v(I, I, I, I));
         reg("glScissor", v(I, I, I, I));
         reg("glClearColor", v(F, F, F, F));
@@ -121,6 +123,8 @@ public final class NeoGL {
         reg("glDepthFunc", v(I));
         reg("glDepthMask", v(B));
         reg("glColorMask", v(B, B, B, B));
+        reg("glColorMaski", v(I, B, B, B, B));
+        reg("glClearBufferfv", v(I, I, J));
         reg("glCullFace", v(I));
         reg("glFrontFace", v(I));
         reg("glPolygonOffset", v(F, F));
@@ -232,6 +236,10 @@ public final class NeoGL {
         reg("glGetQueryObjectui64v", v(I, I, J), "queryObject64");
         // harmless no-ops (logged once via the unknown path otherwise)
         for (String g : new String[]{"glFlush", "glFinish"}) reg(g, v(), "ignore0");
+        // buffers are shared CPU/GPU memory: an explicit flush of a mapped range has nothing to do
+        reg("glFlushMappedBufferRange", v(I, J, J), "ignoreIJJ");
+        // GPU timestamps (26.3 profiler): not measured, queries read back 0
+        reg("glQueryCounter", v(I, I), "ignore2");
         for (String g : new String[]{"glLineWidth"}) reg(g, v(F), "ignoreF");
         for (String g : new String[]{"glDrawBuffer", "glReadBuffer", "glLogicOp", "glProvokingVertex"}) reg(g, v(I), "ignore1");
         for (String g : new String[]{"glPolygonMode", "glBeginQuery", "glHint"}) reg(g, v(I, I), "ignore2");
